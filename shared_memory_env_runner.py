@@ -54,8 +54,6 @@ class SharedMemoryEnvRunner(EnvRunner):
         client's side (no individual action requests).
         - A copy of the RLModule is kept at all times on the env runner, but never used
         for inference, only as a data (weights) container.
-        TODO (sven): The above might be inefficient as we have to store basically two
-         models, one in this EnvRunner, one in the env (as ONNX).
         - There is no environment and no connectors on this env runner. The external env
         is responsible for generating all the data to create episodes.
         """
