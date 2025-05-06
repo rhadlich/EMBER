@@ -1,0 +1,538 @@
+import argparse
+import json
+import logging
+import os
+import shutil
+import pprint
+import random
+import re
+import time
+import gzip
+import base64
+import struct
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+
+import numpy as np
+from multiprocessing import shared_memory
+
+import ray
+from ray import tune
+from ray.air.integrations.wandb import WandbLoggerCallback, WANDB_ENV_VAR
+from ray.rllib.core import DEFAULT_MODULE_ID, Columns
+from ray.rllib.env.wrappers.atari_wrappers import is_atari, wrap_deepmind
+from ray.rllib.utils.annotations import OldAPIStack
+from ray.rllib.utils.framework import try_import_jax, try_import_tf, try_import_torch
+from ray.rllib.utils.metrics import (
+    DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY,
+    ENV_RUNNER_RESULTS,
+    EPISODE_RETURN_MEAN,
+    EVALUATION_RESULTS,
+    NUM_ENV_STEPS_TRAINED,
+    NUM_ENV_STEPS_SAMPLED_LIFETIME,
+)
+from ray.rllib.utils.typing import ResultDict
+from ray.rllib.utils.error import UnsupportedSpaceException
+from ray.tune import CLIReporter
+from ray.tune.result import TRAINING_ITERATION
+
+if TYPE_CHECKING:
+    from ray.rllib.algorithms import Algorithm, AlgorithmConfig
+    from ray.rllib.offline.dataset_reader import DatasetReader
+
+from define_args import custom_args
+from onnxruntime.tools import convert_onnx_models_to_ort as c2o
+from pathlib import Path
+
+
+# def _get_strings_related_to_policy(algo_name: str) -> List[str]:
+#     """
+#     Function that returns a list of strings that relate to policy for a particular algo.
+#     Each algo has a specific naming convention for their weights as keys in algo.get_weights(),
+#     need to find them and include them here.
+#     """
+#     if algo_name == "PPO":
+#         return ['pi', 'actor']
+#     elif algo_name == "DQN":
+#         return ['encoder', 'af']
+#     else:
+#         raise ValueError(f"Algo name not currently available: {algo_name}. "
+#                          "Please add the algo to the _get_strings_related_to_policy function.")
+#
+#
+# def _get_policy_weight_dimensions(algo: Algorithm) -> int:
+#     """
+#     Function that returns the size of the policy network in bytes for the creation of the shared memory block.
+#     """
+#     weights = algo.get_weights()["default_policy"]
+#     list_policy_str = _get_strings_related_to_policy(algo.__class__.__name__)
+#     total_bytes = 0
+#     for pol_str in list_policy_str:
+#         total_bytes += sum(arr.nbytes for n, arr in weights.items() if pol_str in n)
+#     return total_bytes
+
+def _get_current_onnx_model(algo: ray.rllib.algorithms.Algorithm,
+                            *,
+                            outdir: str = "export_torch"):
+    """
+    Function to extract the policy model converted to ort.
+    """
+    if os.path.exists(outdir):
+        shutil.rmtree(outdir)
+    algo.export_policy_model(outdir, onnx=20)
+    path = os.path.join(outdir, "model.onnx")
+    # convert .onnx to .ort (optimized for faster loading and inference in the minion)
+    styles = [c2o.OptimizationStyle.Fixed]
+    c2o.convert_onnx_models_to_ort(
+        model_path_or_dir=Path(path),  # may also be a directory
+        output_dir=None,  # None = same folder as the .onnx
+        optimization_styles=styles,
+        # target_platform="arm",  # Only in the Raspberry Pi
+    )
+    with open(os.path.join(outdir, "model.ort"), "rb") as f:
+        ort_raw = f.read()
+    return ort_raw
+
+
+def run_rllib_shared_memory(
+    base_config: "AlgorithmConfig",
+    args: Optional[argparse.Namespace] = None,
+    *,
+    stop: Optional[Dict] = None,
+    success_metric: Optional[Dict] = None,
+    trainable: Optional[Type] = None,
+    tune_callbacks: Optional[List] = None,
+    keep_config: bool = False,
+    keep_ray_up: bool = False,
+    scheduler=None,
+    progress_reporter=None,
+) -> Union[ResultDict, tune.result_grid.ResultGrid]:
+    """Given an algorithm config and some command line args, runs an experiment.
+
+    Use the custom_args function from the define_args.py script to generate "args".
+
+    The function sets up an Algorithm object from the given config (altered by the
+    contents of `args`), then runs the Algorithm via Tune (or manually, if
+    `args.no_tune` is set to True) using the stopping criteria in `stop`.
+
+    At the end of the experiment, if `args.as_test` is True, checks, whether the
+    Algorithm reached the `success_metric` (if None, use `env_runners/
+    episode_return_mean` with a minimum value of `args.stop_reward`).
+
+    See https://github.com/ray-project/ray/tree/master/rllib/examples for an overview
+    of all supported command line options.
+
+    Args:
+        base_config: The AlgorithmConfig object to use for this experiment. This base
+            config will be automatically "extended" based on some of the provided
+            `args`. For example, `args.num_env_runners` is used to set
+            `config.num_env_runners`, etc...
+        args: A argparse.Namespace object, ideally returned by calling
+            `args = add_rllib_example_script_args()`. It must have the following
+            properties defined: `stop_iters`, `stop_reward`, `stop_timesteps`,
+            `no_tune`, `verbose`, `checkpoint_freq`, `as_test`. Optionally, for WandB
+            logging: `wandb_key`, `wandb_project`, `wandb_run_name`.
+        stop: An optional dict mapping ResultDict key strings (using "/" in case of
+            nesting, e.g. "env_runners/episode_return_mean" for referring to
+            `result_dict['env_runners']['episode_return_mean']` to minimum
+            values, reaching of which will stop the experiment). Default is:
+            {
+            "env_runners/episode_return_mean": args.stop_reward,
+            "training_iteration": args.stop_iters,
+            "num_env_steps_sampled_lifetime": args.stop_timesteps,
+            }
+        success_metric: Only relevant if `args.as_test` is True.
+            A dict mapping a single(!) ResultDict key string (using "/" in
+            case of nesting, e.g. "env_runners/episode_return_mean" for referring
+            to `result_dict['env_runners']['episode_return_mean']` to a single(!)
+            minimum value to be reached in order for the experiment to count as
+            successful. If `args.as_test` is True AND this `success_metric` is not
+            reached with the bounds defined by `stop`, will raise an Exception.
+        trainable: The Trainable sub-class to run in the tune.Tuner. If None (default),
+            use the registered RLlib Algorithm class specified by args.algo.
+        tune_callbacks: A list of Tune callbacks to configure with the tune.Tuner.
+            In case `args.wandb_key` is provided, appends a WandB logger to this
+            list.
+        keep_config: Set this to True, if you don't want this utility to change the
+            given `base_config` in any way and leave it as-is. This is helpful
+            for those example scripts which demonstrate how to set config settings
+            that are otherwise taken care of automatically in this function (e.g.
+            `num_env_runners`).
+
+    Returns:
+        The last ResultDict from a --no-tune run OR the tune.Tuner.fit()
+        results.
+    """
+    if args is None:
+        parser = custom_args()
+        args = parser.parse_args()
+
+    # If run --as-release-test, --as-test must also be set.
+    if args.as_release_test:
+        args.as_test = True
+
+    # Initialize Ray.
+    ray.init(
+        num_cpus=args.num_cpus or None,
+        local_mode=args.local_mode,
+        ignore_reinit_error=True,
+        runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}},
+    )
+
+    # Define one or more stopping criteria.
+    if stop is None:
+        stop = {
+            f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
+            f"{ENV_RUNNER_RESULTS}/{NUM_ENV_STEPS_SAMPLED_LIFETIME}": (
+                args.stop_timesteps
+            ),
+            TRAINING_ITERATION: args.stop_iters,
+        }
+
+    config = base_config
+
+    # Enhance the `base_config`, based on provided `args`.
+    if not keep_config:
+        # Set the framework.
+        config.framework(args.framework)
+
+        # Add an env specifier (only if not already set in config)?
+        if args.env is not None and config.env is None:
+            config.environment(args.env)
+
+        # Disable the new API stack?
+        if not args.enable_new_api_stack:
+            config.api_stack(
+                enable_rl_module_and_learner=False,
+                enable_env_runner_and_connector_v2=False,
+            )
+
+        # Define EnvRunner scaling and behavior.
+        if args.num_env_runners is not None:
+            config.env_runners(num_env_runners=args.num_env_runners)
+        if args.num_envs_per_env_runner is not None:
+            config.env_runners(num_envs_per_env_runner=args.num_envs_per_env_runner)
+
+        # Define compute resources used automatically (only using the --num-learners
+        # and --num-gpus-per-learner args).
+        # New stack.
+        if config.enable_rl_module_and_learner:
+            if args.num_gpus is not None and args.num_gpus > 0:
+                raise ValueError(
+                    "--num-gpus is not supported on the new API stack! To train on "
+                    "GPUs, use the command line options `--num-gpus-per-learner=1` and "
+                    "`--num-learners=[your number of available GPUs]`, instead."
+                )
+
+            # Do we have GPUs available in the cluster?
+            num_gpus_available = ray.cluster_resources().get("GPU", 0)
+            # Number of actual Learner instances (including the local Learner if
+            # `num_learners=0`).
+            num_actual_learners = (
+                args.num_learners
+                if args.num_learners is not None
+                else config.num_learners
+            ) or 1  # 1: There is always a local Learner, if num_learners=0.
+            # How many were hard-requested by the user
+            # (through explicit `--num-gpus-per-learner >= 1`).
+            num_gpus_requested = (args.num_gpus_per_learner or 0) * num_actual_learners
+            # Number of GPUs needed, if `num_gpus_per_learner=None` (auto).
+            num_gpus_needed_if_available = (
+                args.num_gpus_per_learner
+                if args.num_gpus_per_learner is not None
+                else 1
+            ) * num_actual_learners
+            # Define compute resources used.
+            config.resources(num_gpus=0)  # old API stack setting
+            if args.num_learners is not None:
+                config.learners(num_learners=args.num_learners)
+
+            # User wants to use aggregator actors per Learner.
+            if args.num_aggregator_actors_per_learner is not None:
+                config.learners(
+                    num_aggregator_actors_per_learner=(
+                        args.num_aggregator_actors_per_learner
+                    )
+                )
+
+            # User wants to use GPUs if available, but doesn't hard-require them.
+            if args.num_gpus_per_learner is None:
+                if num_gpus_available >= num_gpus_needed_if_available:
+                    config.learners(num_gpus_per_learner=1)
+                else:
+                    config.learners(num_gpus_per_learner=0)
+            # User hard-requires n GPUs, but they are not available -> Error.
+            elif num_gpus_available < num_gpus_requested:
+                raise ValueError(
+                    "You are running your script with --num-learners="
+                    f"{args.num_learners} and --num-gpus-per-learner="
+                    f"{args.num_gpus_per_learner}, but your cluster only has "
+                    f"{num_gpus_available} GPUs!"
+                )
+
+            # All required GPUs are available -> Use them.
+            else:
+                config.learners(num_gpus_per_learner=args.num_gpus_per_learner)
+
+            # Set CPUs per Learner.
+            if args.num_cpus_per_learner is not None:
+                config.learners(num_cpus_per_learner=args.num_cpus_per_learner)
+
+        # Old stack (override only if arg was provided by user).
+        elif args.num_gpus is not None:
+            config.resources(num_gpus=args.num_gpus)
+
+        # Evaluation setup.
+        if args.evaluation_interval > 0:
+            config.evaluation(
+                evaluation_num_env_runners=args.evaluation_num_env_runners,
+                evaluation_interval=args.evaluation_interval,
+                evaluation_duration=args.evaluation_duration,
+                evaluation_duration_unit=args.evaluation_duration_unit,
+                evaluation_parallel_to_training=args.evaluation_parallel_to_training,
+            )
+
+        # Set the log-level (if applicable).
+        if args.log_level is not None:
+            config.debugging(log_level=args.log_level)
+
+        # Set the output dir (if applicable).
+        if args.output is not None:
+            config.offline_data(output=args.output)
+
+    # Run the experiment w/o Tune (directly operate on the RLlib Algorithm object).
+    # THIS IS WHAT WILL BE RUN ON THE RASPBERRY PI
+    if args.no_tune:
+        assert not args.as_test and not args.as_release_test
+
+        # create flag shared memory block here and set to lock to serve as a stopper for the minion
+        f_shm = shared_memory.SharedMemory(
+            create=True,
+            name=args.flag_shm_name,
+            size=2  # first byte for access control (lock flag), second byte for whether new weights are available
+        )
+        f_buf = f_shm.buf
+        f_buf[0] = 1    # set lock flag to locked
+        f_buf[1] = 0    # set weights-available flag to false
+
+        # build algorithm, EnvRunner is created in this call
+        algo = config.build()
+
+        # extract dimensions of weights in the networks
+        ort_raw = _get_current_onnx_model(algo)
+        ort_compressed = gzip.compress(ort_raw)
+        policy_nbytes = len(ort_compressed)
+
+        # create policy shared memory blocks
+        p_shm = shared_memory.SharedMemory(
+            create=True,
+            name=args.policy_shm_name,
+            size=policy_nbytes
+        )
+
+        # get reference to policy buffer
+        p_buf = p_shm.buf
+
+        # store initial weights and remove lock flags
+        p_buf[:len(ort_compressed)] = ort_compressed  # insert compressed weights
+        f_buf[0] = 0  # set lock flag to unlocked
+        f_buf[1] = 1  # set weights-available flag to 1 (true)
+
+        results = None
+
+        try:
+            # start counter
+            train_iter = 0
+            while True:
+                # perform one logical iteration of training
+                results = algo.train()
+
+                # get new model weights
+                ort_raw = _get_current_onnx_model(algo)
+                ort_compressed = gzip.compress(ort_raw)
+
+                # sanity check to make sure the size of the weights vector is the same
+                assert policy_nbytes == len(ort_compressed), (
+                    f"Expected SHM size {len(p_buf)} but got {len(ort_compressed)}."
+                )
+
+                # if lock is set to true wait until it isn't and then update the weights
+                while f_buf[0] == 1:
+                    time.sleep(0.0001)
+
+                # save new model weights to buffer
+                f_buf[0] = 1        # set lock flag to locked
+                p_buf[:len(ort_compressed)] = ort_compressed  # insert compressed weights
+                f_buf[0] = 0        # set lock flag to unlocked
+                f_buf[1] = 1        # set weights-available flag to 1 (true)
+
+                # print results
+                if ENV_RUNNER_RESULTS in results:
+                    mean_return = results[ENV_RUNNER_RESULTS].get(
+                        EPISODE_RETURN_MEAN, np.nan
+                    )
+                    print(f"iter={train_iter} R={mean_return}", end="")
+                if EVALUATION_RESULTS in results:
+                    Reval = results[EVALUATION_RESULTS][ENV_RUNNER_RESULTS][
+                        EPISODE_RETURN_MEAN
+                    ]
+                    print(f" R(eval)={Reval}", end="")
+                print()
+
+                # increment counter
+                train_iter += 1
+
+        except KeyboardInterrupt:
+            if not keep_ray_up:
+                ray.shutdown()
+
+        return results
+
+    # Run the experiment using Ray Tune.
+
+    # Log results using WandB.
+    tune_callbacks = tune_callbacks or []
+    if hasattr(args, "wandb_key") and (
+        args.wandb_key is not None or WANDB_ENV_VAR in os.environ
+    ):
+        wandb_key = args.wandb_key or os.environ[WANDB_ENV_VAR]
+        project = args.wandb_project or (
+            args.algo.lower() + "-" + re.sub("\\W+", "-", str(config.env).lower())
+        )
+        tune_callbacks.append(
+            WandbLoggerCallback(
+                api_key=wandb_key,
+                project=project,
+                upload_checkpoints=True,
+                **({"name": args.wandb_run_name} if args.wandb_run_name else {}),
+            )
+        )
+    # Auto-configure a CLIReporter (to log the results to the console).
+    # Use better ProgressReporter for multi-agent cases: List individual policy rewards.
+    if progress_reporter is None and args.num_agents > 0:
+        progress_reporter = CLIReporter(
+            metric_columns={
+                **{
+                    TRAINING_ITERATION: "iter",
+                    "time_total_s": "total time (s)",
+                    NUM_ENV_STEPS_SAMPLED_LIFETIME: "ts",
+                    f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": "combined return",
+                },
+                **{
+                    (
+                        f"{ENV_RUNNER_RESULTS}/module_episode_returns_mean/" f"{pid}"
+                    ): f"return {pid}"
+                    for pid in config.policies
+                },
+            },
+        )
+
+    # Force Tuner to use old progress output as the new one silently ignores our custom
+    # `CLIReporter`.
+    os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+
+    # Run the actual experiment (using Tune).
+    start_time = time.time()
+    results = tune.Tuner(
+        trainable or config.algo_class,
+        param_space=config,
+        run_config=tune.RunConfig(
+            stop=stop,
+            verbose=args.verbose,
+            callbacks=tune_callbacks,
+            checkpoint_config=tune.CheckpointConfig(
+                checkpoint_frequency=args.checkpoint_freq,
+                checkpoint_at_end=args.checkpoint_at_end,
+            ),
+            progress_reporter=progress_reporter,
+        ),
+        tune_config=tune.TuneConfig(
+            num_samples=args.num_samples,
+            max_concurrent_trials=args.max_concurrent_trials,
+            scheduler=scheduler,
+        ),
+    ).fit()
+    time_taken = time.time() - start_time
+
+    if not keep_ray_up:
+        ray.shutdown()
+
+    # Error out, if Tuner.fit() failed to run. Otherwise, erroneous examples might pass
+    # the CI tests w/o us knowing that they are broken (b/c some examples do not have
+    # a --as-test flag and/or any passing criteris).
+    if results.errors:
+        raise RuntimeError(
+            "Running the example script resulted in one or more errors! "
+            f"{[e.args[0].args[2] for e in results.errors]}"
+        )
+
+    # If run as a test, check whether we reached the specified success criteria.
+    test_passed = False
+    if args.as_test:
+        # Success metric not provided, try extracting it from `stop`.
+        if success_metric is None:
+            for try_it in [
+                f"{EVALUATION_RESULTS}/{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}",
+                f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}",
+            ]:
+                if try_it in stop:
+                    success_metric = {try_it: stop[try_it]}
+                    break
+            if success_metric is None:
+                success_metric = {
+                    f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
+                }
+        # TODO (sven): Make this work for more than one metric (AND-logic?).
+        # Get maximum value of `metric` over all trials
+        # (check if at least one trial achieved some learning, not just the final one).
+        success_metric_key, success_metric_value = next(iter(success_metric.items()))
+        best_value = max(
+            row[success_metric_key] for _, row in results.get_dataframe().iterrows()
+        )
+        if best_value >= success_metric_value:
+            test_passed = True
+            print(f"`{success_metric_key}` of {success_metric_value} reached! ok")
+
+        if args.as_release_test:
+            trial = results._experiment_analysis.trials[0]
+            stats = trial.last_result
+            stats.pop("config", None)
+            json_summary = {
+                "time_taken": float(time_taken),
+                "trial_states": [trial.status],
+                "last_update": float(time.time()),
+                "stats": stats,
+                "passed": [test_passed],
+                "not_passed": [not test_passed],
+                "failures": {str(trial): 1} if not test_passed else {},
+            }
+            with open(
+                os.environ.get("TEST_OUTPUT_JSON", "/tmp/learning_test.json"),
+                "wt",
+            ) as f:
+                try:
+                    json.dump(json_summary, f)
+                # Something went wrong writing json. Try again w/ simplified stats.
+                except Exception:
+                    from ray.rllib.algorithms.algorithm import Algorithm
+
+                    simplified_stats = {
+                        k: stats[k] for k in Algorithm._progress_metrics if k in stats
+                    }
+                    json_summary["stats"] = simplified_stats
+                    json.dump(json_summary, f)
+
+        if not test_passed:
+            raise ValueError(
+                f"`{success_metric_key}` of {success_metric_value} not reached!"
+            )
+
+    return results
