@@ -490,7 +490,6 @@ def run_rllib_shared_memory(
                 success_metric = {
                     f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
                 }
-        # TODO (sven): Make this work for more than one metric (AND-logic?).
         # Get maximum value of `metric` over all trials
         # (check if at least one trial achieved some learning, not just the final one).
         success_metric_key, success_metric_value = next(iter(success_metric.items()))

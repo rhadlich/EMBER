@@ -1,57 +1,42 @@
-"""Example of running against a TCP-connected external env performing its own inference.
+"""Example of running against a shared-memory-connected external env performing its own inference.
 
 How to run this script
 ----------------------
-`python [script file name].py --enable-new-api-stack --port 5555
-
-Results to expect
------------------
-You should see something like this on your terminal. Note that the dummy CartPole
-client (which runs in a thread for the purpose of this example here) might throw
-a disconnection error at the end, b/c RLlib closes the server socket when done training.
-
-+----------------------+------------+--------+------------------+
-| Trial name           | status     |   iter |   total time (s) |
-|                      |            |        |                  |
-|----------------------+------------+--------+------------------+
-| PPO_None_3358e_00000 | TERMINATED |     40 |          32.2649 |
-+----------------------+------------+--------+------------------+
-+------------------------+------------------------+
-|  episode_return_mean  |   num_env_steps_sample |
-|                       |             d_lifetime |
-|-----------------------+------------------------|
-|                458.68 |                 160000 |
-+-----------------------+------------------------+
+`python master.py --algo "algo_name (like PPO, SAC, etc)" --no-tune
 
 """
-
-from functools import partial
-import threading
 
 import gymnasium as gym
 import numpy as np
 
-from ray.rllib.core.rl_module.default_model_config import DefaultModelConfig
 from shared_memory_env_runner import SharedMemoryEnvRunner
-from ray.rllib.utils.test_utils import (
-    add_rllib_example_script_args,
-    run_rllib_example_script_experiment,
-)
+# from ray.rllib.utils.test_utils import (
+#     add_rllib_example_script_args,
+#     run_rllib_example_script_experiment,
+# )
 from ray.tune.registry import get_trainable_cls
-from multiprocessing import shared_memory
+from ray.rllib.core.rl_module import RLModuleSpec
 
-parser = add_rllib_example_script_args(
+from multiprocessing import shared_memory
+from define_args import custom_args
+from custom_run import run_rllib_shared_memory
+
+parser = custom_args(
     default_reward=450.0, default_iters=200, default_timesteps=2000000
 )
 parser.set_defaults(
     enable_new_api_stack=True,
-    num_env_runners=1,
+    num_env_runners=0,
+    num_cpus_per_env_runner=0,
+    num_learners=0,
+    num_cpus_per_learner=0,
+    num_cpus=0,  # for ray_init call inside test_utils
 )
 parser.add_argument(
-    "--weights_shm_name",
+    "--policy_shm_name",
     type=str,
-    default="weights",
-    help="Name of weights shm to use",
+    default="policy",
+    help="Name of shm for policy weights to use",
 )
 parser.add_argument(
     "--flag_shm_name",
@@ -63,29 +48,14 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    # Start weights and weights_flag shared memory blocks. Need to instantiate here.
-    weight_shape = (256, 128)  # e.g. 256×128 matrix
-    weight_dtype = np.float32
-    weight_nbytes = np.prod(weight_shape) * np.dtype(weight_dtype).itemsize
-    w_shm = shared_memory.SharedMemory(
-        create=True,
-        name=args.weights_shm_name,
-        size=weight_nbytes
-    )
-    f_shm = shared_memory.SharedMemory(
-        create=True,
-        name=args.flag_shm_name,
-        size=1  # just 1 byte
-    )
-
     # Define name and properties of episode ring buffer to pass down to EnvRunner
     # define the size of each rollout tuple
-    bytes_per_float = np.dtype("float32").itemsize      # number of bytes in rollout data type
+    bytes_per_float = np.dtype("float32").itemsize  # number of bytes in rollout data type
     dims = {
         "action": 3,
-        "reward": 2,
-        "state": 4,     # this will be the next state AFTER taking "action"
-    }   # the length of the vector of each component of the rollout
+        "reward": 1,
+        "state": 4,  # this will be the next state AFTER taking "action"
+    }  # the length of the vector of each component of the rollout
     BATCH_SIZE = 32  # number of rollouts per batch (episode)
     NUM_SLOTS = 8  # ring depth
     ELEMENTS_PER_ROLLOUT = sum(dims.values())
@@ -119,8 +89,7 @@ if __name__ == "__main__":
         .environment(
             observation_space=gym.spaces.Box(-1.0, 1.0, (4,), np.float32),
             action_space=gym.spaces.Discrete(2),
-            # EnvRunners listen on `port` + their worker index.
-            env_config={"weights_shm_name": args.weights_shm_name,
+            env_config={"policy_shm_name": args.policy_shm_name,
                         "flag_shm_name": args.flag_shm_name,
                         "ep_shm_properties": ep_shm_properties,
                         },
@@ -128,12 +97,12 @@ if __name__ == "__main__":
         .env_runners(
             # Point RLlib to the custom EnvRunner to be used here.
             env_runner_cls=SharedMemoryEnvRunner,
+            num_env_runners=args.num_env_runners,
+            num_cpus_per_worker=args.num_cpus_per_env_runner,
         )
         .training(
             num_epochs=10,
-            vf_loss_coeff=0.01,
         )
-        .rl_module(model_config=DefaultModelConfig(vf_share_layers=True))
     )
 
-    run_rllib_example_script_experiment(base_config, args)
+    run_rllib_shared_memory(base_config, args)

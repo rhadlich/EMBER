@@ -1,20 +1,9 @@
-import base64
 from collections import defaultdict
-import gzip
-import json
-import pathlib
-import socket
-import tempfile
-import threading
-import time
-from typing import Collection, DefaultDict, List, Optional, Union
+from typing import DefaultDict, List, Optional
 
-import gymnasium as gym
 import numpy as np
-import onnxruntime
 
 from ray.rllib.core import (
-    Columns,
     COMPONENT_RL_MODULE,
     DEFAULT_AGENT_ID,
     DEFAULT_MODULE_ID,
@@ -23,10 +12,6 @@ from ray.rllib.env import INPUT_ENV_SPACES
 from ray.rllib.env.env_runner import EnvRunner
 from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.rllib.env.single_agent_episode import SingleAgentEpisode
-from ray.rllib.env.utils.external_env_protocol import RLlink as rllink
-from ray.rllib.utils.annotations import ExperimentalAPI, override
-from ray.rllib.utils.checkpoints import Checkpointable
-from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.metrics import (
     EPISODE_DURATION_SEC_MEAN,
     EPISODE_LEN_MAX,
@@ -38,14 +23,36 @@ from ray.rllib.utils.metrics import (
     WEIGHTS_SEQ_NO,
 )
 from ray.rllib.utils.metrics.metrics_logger import MetricsLogger
-from ray.rllib.utils.numpy import softmax
 from ray.rllib.utils.typing import EpisodeID, StateDict
-from ray.rllib.policy.sample_batch import SampleBatch
 
 from multiprocessing import shared_memory
+import Minion
 import struct
-import subprocess
-import sys
+import ray
+from numba import njit
+
+
+# Helper functions
+def get_indices(buf) -> tuple:
+    """Return (write_idx, read_idx)."""
+    return struct.unpack_from("<II", buf, 0)
+
+
+def set_indices(buf, w, r) -> shared_memory.SharedMemory.buf:
+    """Atomically update both indices (optionally split these)."""
+    return struct.pack_into("<II", buf, 0, w, r)
+
+
+@ray.remote(num_cpus=1)
+def _run_minion(policy_shm_name: str,
+                flag_shm_name: str,
+                episode_shm_name: str,
+                episode_shm_properties: dict
+                ) -> None:
+    """
+    Thin wrapper that just calls minion to execute in a separate CPU core.
+    """
+    Minion.main(policy_shm_name, flag_shm_name, episode_shm_name, episode_shm_properties)
 
 
 class SharedMemoryEnvRunner(EnvRunner):
@@ -72,7 +79,7 @@ class SharedMemoryEnvRunner(EnvRunner):
             config: The AlgorithmConfig to use for setup.
 
         Keyword Args:
-            weights_shm_name: name of the shared memory block that will contain model weights
+            policy_shm_name: name of the shared memory block that will contain model weights
             flag_shm_name: name of the shared memory block that will contain update flag
         """
         super().__init__(config=config)
@@ -87,12 +94,6 @@ class SharedMemoryEnvRunner(EnvRunner):
         )
         self.module = module_spec.build()
 
-        # weights communication properties go here
-        self.weights_shm_name = self.config.env_config.get("weights_shm_name", 'weight')
-        self.flag_shm_name = self.config.env_config.get("flag_shm_name", 'flag')
-        self.weights_shm = None
-        self.flag_shm = None
-
         self.metrics = MetricsLogger()
 
         self._episode_chunks_to_return: Optional[List[SingleAgentEpisode]] = None
@@ -100,6 +101,13 @@ class SharedMemoryEnvRunner(EnvRunner):
         self._ongoing_episodes_for_metrics: DefaultDict[
             EpisodeID, List[SingleAgentEpisode]
         ] = defaultdict(list)
+
+        # Policy weights communication stuff goes here
+        self.policy_shm_name = self.config.env_config.get("policy_shm_name", 'policy')
+        self.flag_shm_name = self.config.env_config.get("flag_shm_name", 'flag')
+        # Can't get shm references in init because the run method only creates the shm blocks once init is done
+        self.policy_shm = False
+        self.flag_shm = False
 
         # Start shared memory block for episodes
         self.BATCH_SIZE = self.config.env_config["ep_shm_properties"]["BATCH_SIZE"]
@@ -118,27 +126,36 @@ class SharedMemoryEnvRunner(EnvRunner):
             size=self.TOTAL_SIZE
         )
         self.ep_buf = self.episode_shm.buf
+        self.episode_shm_name = self.episode_shm.name
 
         # Initialize the write and read indices in the episode buffer to 0
         struct.pack_into("<II", self.ep_buf, 0, 0, 0)  # write_idx=0, read_idx=0
 
-        # Spawn minion subprocess. Decided to go with subprocess instead of threading because this way can split the
+        # Spawn minion subprocess. Decided to go with ray task because it's convenient. This approach can split the
         # workload in the Raspberry Pi to be: 1 core Algorithm/Learner, 1 core EnvRunner, 1 core Minion (environment),
         # and the other core for the OS and any other support tasks.
-        self._minion_proc = subprocess.Popen(
-            [sys.executable, "Minion.py",
-             "--weights_shm_name", self.weights_shm_name,
-             "--episodes_shm_name", self.episode_shm.name,
-             "--flag_shm_name", self.flag_shm_name]
+        self._minion_ref = _run_minion.remote(
+            self.policy_shm_name,
+            self.flag_shm_name,
+            self.episode_shm_name,
+            self.config.env_config["ep_shm_properties"],
         )
 
     def assert_healthy(self):
-        """Checks that shared memory blocks have been created."""
+        """Checks that shared memory blocks and minion process have been created."""
+        minion_running, _ = ray.wait([self._minion_ref], timeout=0)
+        if not minion_running:
+            minion_running = None
+
+        # in the first iteration, get shm references
+        if self.policy_shm == False:
+            self._get_shm_references()
+
         assert (
-                self.weights_shm is not None and
+                self.policy_shm is not None and
                 self.flag_shm is not None and
                 self.episode_shm is not None and
-                self._minion_proc.poll() is None
+                minion_running is not None
         ), "Shared memory blocks or minion process not alive."
 
     def sample(self, **kwargs):
@@ -229,16 +246,24 @@ class SharedMemoryEnvRunner(EnvRunner):
 
     # Helper functions
 #   #------------------------------------------------------------------------#
+    def _get_shm_references(self):
+        # get reference to policy shared memory weights
+        self.policy_shm = shared_memory.SharedMemory(name=self.policy_shm_name, create=False)
+        self.flag_shm = shared_memory.SharedMemory(name=self.flag_shm_name, create=False)
+
     def _unlink_mem_blocks_if_necessary(self):
-        if self.weights_shm:
-            self.weights_shm.close()
-            self.weights_shm.unlink()
+        """Close all shared memory blocks and terminate minion subprocess."""
+        if self.policy_shm:
+            self.policy_shm.close()
+            self.policy_shm.unlink()
         if self.flag_shm:
             self.flag_shm.close()
             self.flag_shm.unlink()
         if self.episode_shm:
             self.episode_shm.close()
             self.episode_shm.unlink()
+        if ray.wait([self._minion_ref], timeout=0)[0]:
+            ray.cancel(self._minion_ref)
 
     def _log_episode_metrics(self, length, ret, sec):
         # Log general episode metrics.
@@ -264,19 +289,10 @@ class SharedMemoryEnvRunner(EnvRunner):
         self.metrics.log_value(EPISODE_RETURN_MAX, ret, reduce="max", window=win)
 
     # Helper functions for episode ring buffer manipulation
-    def get_indices(self):
-        """Return (write_idx, read_idx)."""
-        return struct.unpack_from("<II", self.ep_buf, 0)
-
-    def set_indices(self, w, r):
-        """Atomically update both indices (optionally split these)."""
-        struct.pack_into("<II", self.ep_buf, 0, w, r)
-
-    # I think this one goes in the minion
-    def write_fragment(self, data: np.ndarray):
+    def _read_batch(self):
         """
-        Append ONE rollout into the ring buffer.
-        Drops the oldest slot if ring is full.
+        Pop the oldest COMPLETE 32-rollout batch from the ring.
+        Returns list of SingleAgentEpisode objects or None if no complete slot is ready.
 
         Structure of the ring is as follows:
         ┌────────────────────────────────────────────────────────────────┐
@@ -321,52 +337,7 @@ class SharedMemoryEnvRunner(EnvRunner):
         │       └ same as rollout[0]                           │
         └──────────────────────────────────────────────────────┘
         """
-        assert data.shape == (self.ELEMENTS_PER_ROLLOUT,) and data.dtype == np.float32
-        raw = data.tobytes()
-
-        write_idx, read_idx = self.get_indices()
-        slot_off = self.HEADER_SIZE + write_idx * self.SLOT_SIZE
-
-        filled = struct.unpack_from("<H", self.ep_buf, slot_off)[0]  # uint16 count
-
-        # Copy rollout into slot payload
-        episode_off = slot_off + self.HEADER_SLOT_SIZE + filled * self.BYTES_PER_ROLLOUT
-        self.ep_buf[episode_off: episode_off + self.BYTES_PER_ROLLOUT] = raw
-
-        # Increment fill counter
-        struct.pack_into("<H", self.ep_buf, slot_off, filled + 1)
-
-        # If this is the last rollout that can be added to this slot -> move write_idx to next slot and populate the
-        # first elements as the initial state (equal to last state of current write_idx).
-        if filled == self.BATCH_SIZE:
-            next_w = (write_idx + 1) % self.NUM_SLOTS
-            if next_w == read_idx:  # ring full → drop oldest
-                read_idx = (read_idx + 1) % self.NUM_SLOTS
-
-            # get offset for next slot
-            write_idx = next_w
-            slot_off = self.HEADER_SIZE + write_idx * self.SLOT_SIZE
-
-            # extract last state from current rollout (raw)
-            state_off = len(raw) - self.STATE_ACTION_DIMS["state"] * int(self.BYTES_PER_ROLLOUT/self.ELEMENTS_PER_ROLLOUT)
-            state_bytes = raw[state_off:]
-
-            # add starting state to next slot
-            initial_state_off = slot_off + self.HEADER_SLOT_SIZE
-            self.ep_buf[initial_state_off: initial_state_off + len(state_bytes)] = state_bytes
-
-            # reset the fill counter to include initial state
-            struct.pack_into("<H", self.ep_buf, slot_off, len(state_bytes))
-
-        # Commit updated indices
-        self.set_indices(write_idx, read_idx)
-
-    def _read_batch(self):
-        """
-        Pop the oldest COMPLETE 32-rollout batch from the ring.
-        Returns list of SingleAgentEpisode objects or None if no complete slot is ready.
-        """
-        write_idx, read_idx = self.get_indices()
+        write_idx, read_idx = get_indices(self.ep_buf)
         # if any of these are true it means the last batch read is the most updated full batch
         if write_idx == read_idx or write_idx == read_idx+1 or (write_idx == 0 and read_idx == self.NUM_SLOTS-1):
             return None  # ring empty
@@ -382,16 +353,19 @@ class SharedMemoryEnvRunner(EnvRunner):
 
         batches = []
         for i in range(num_batches):
+            # assert that the batch/slot is full
             slot_off = self.HEADER_SIZE + read_idx * self.SLOT_SIZE
             filled = struct.unpack_from("<H", self.ep_buf, slot_off)[0]
             assert filled == self.BATCH_SIZE
 
             # extract data from ring
             data_start = slot_off + self.HEADER_SLOT_SIZE
-            payload = bytes(self.ep_buf[data_start: data_start + self.PAYLOAD_SIZE])
+            raw = bytes(self.ep_buf[data_start: data_start + self.PAYLOAD_SIZE])    # get raw array in bytes
+            payload = np.frombuffer(raw, dtype=np.float32)      # convert raw array to np vector
 
-            # extract initial state from front of payload
-            initial_state = payload[:self.STATE_ACTION_DIMS["state"] * int(self.BYTES_PER_ROLLOUT/self.ELEMENTS_PER_ROLLOUT)]
+            # extract initial state from front of payload and remove it so that shape is consistent for next step
+            initial_state = payload[:self.STATE_ACTION_DIMS["state"]]
+            payload = np.delete(payload, np.arange(self.STATE_ACTION_DIMS["action"]))
 
             # reshape data and add truncated and terminated fields
             flat = np.frombuffer(payload, dtype=np.float32).reshape(self.BATCH_SIZE, self.ELEMENTS_PER_ROLLOUT)
@@ -425,6 +399,8 @@ class SharedMemoryEnvRunner(EnvRunner):
             read_idx = (read_idx + 1) % self.NUM_SLOTS
 
         # commit new indices
-        self.set_indices(write_idx, read_idx)
+        self.ep_buf = set_indices(self.ep_buf, write_idx, read_idx)
 
         return batches
+
+

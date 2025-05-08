@@ -256,4 +256,13 @@ def custom_args(
         "algorithm's default value.",
     )
 
+    # Ray init options.
+    parser.add_argument("--num-cpus", type=int, default=0)
+    parser.add_argument("--num-gpus", type=int, default=0)
+    parser.add_argument(
+        "--local-mode",
+        action="store_true",
+        help="Init Ray in local mode for easier debugging.",
+    )
+
     return parser
