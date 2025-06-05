@@ -1,15 +1,24 @@
 from collections import defaultdict
-from typing import DefaultDict, List, Optional
+from typing import DefaultDict, List, Optional, Union, Collection
 
 import numpy as np
+import torch
+import os
+import gzip
+import time
 
 from ray.rllib.core import (
     COMPONENT_RL_MODULE,
     DEFAULT_AGENT_ID,
     DEFAULT_MODULE_ID,
+    DEFAULT_POLICY_ID,
+    COMPONENT_ENV_TO_MODULE_CONNECTOR,
+    COMPONENT_MODULE_TO_ENV_CONNECTOR
 )
 from ray.rllib.env import INPUT_ENV_SPACES
 from ray.rllib.env.env_runner import EnvRunner
+from ray.rllib.utils.framework import get_device
+from ray.rllib.utils.checkpoints import Checkpointable
 from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.rllib.env.single_agent_episode import SingleAgentEpisode
 from ray.rllib.utils.metrics import (
@@ -17,46 +26,57 @@ from ray.rllib.utils.metrics import (
     EPISODE_LEN_MAX,
     EPISODE_LEN_MEAN,
     EPISODE_LEN_MIN,
+    NUM_ENV_STEPS_SAMPLED_LIFETIME,
     EPISODE_RETURN_MAX,
     EPISODE_RETURN_MEAN,
     EPISODE_RETURN_MIN,
     WEIGHTS_SEQ_NO,
 )
 from ray.rllib.utils.metrics.metrics_logger import MetricsLogger
-from ray.rllib.utils.typing import EpisodeID, StateDict
+from ray.rllib.utils.typing import EpisodeID, StateDict, PolicyID
+
+from ray.rllib.policy.policy_map import PolicyMap
+from ray.rllib.policy.policy import Policy
 
 from multiprocessing import shared_memory
 import Minion
+from custom_run import _get_current_onnx_model
 import struct
 import ray
+from Minion import (
+    get_indices,
+    set_indices,
+    _flatten_obs_onehot
+)
 
-
-# Helper functions
-def get_indices(buf_arr) -> tuple:
-    """Return (write_idx, read_idx)."""
-    # return struct.unpack_from("<II", buf, 0)
-    return buf_arr[:2].astype(np.int32)
-
-
-def set_indices(buf_arr, w, r) -> shared_memory.SharedMemory.buf:
-    """Atomically update both indices (optionally split these)."""
-    # return struct.pack_into("<II", buf, 0, w, r)
-    buf_arr[:2] = [w, r]
+import logging
+import logging_setup
 
 
 @ray.remote(num_cpus=1)
 def _run_minion(policy_shm_name: str,
                 flag_shm_name: str,
-                ep_arr: np.ndarray,
-                episode_shm_properties: dict
+                ep_shm_name: str,
+                episode_shm_properties: dict,
+                logger,
                 ) -> None:
     """
     Thin wrapper that just calls minion to execute in a separate CPU core.
     """
-    Minion.main(policy_shm_name, flag_shm_name, ep_arr, episode_shm_properties)
+    logger.debug("IN _RUN_MINION NOW.")
+    logger.debug(f"_run_minion called by PID: {os.getpid()}")
+    Minion.main(policy_shm_name, flag_shm_name, ep_shm_name, episode_shm_properties)
 
 
-class SharedMemoryEnvRunner(EnvRunner):
+def _decode_obs(obs):
+    """
+    Function that takes in flattened observation (np.array) and converts it to
+    the dictionary format of the environment's observation space.
+    """
+    return {"state": obs[:-1], "target": obs[-1]}
+
+
+class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
     """An EnvRunner communicating with an external env through shared memory.
 
         This implementation assumes:
@@ -77,13 +97,41 @@ class SharedMemoryEnvRunner(EnvRunner):
         Initializes a SharedMemoryEnvRunner instance.
 
         Args:
-            config: The AlgorithmConfig to use for setup.
+            config: The AlgorithmConfig to use for setup (set by RLlib).
+            worker_index: The index of the worker process to use (set by RLlib).
+            num_workers: The number of worker processes to use (set by RLlib).
 
         Keyword Args:
             policy_shm_name: name of the shared memory block that will contain model weights
             flag_shm_name: name of the shared memory block that will contain update flag
         """
         super().__init__(config=config)
+
+        self.logger = logging.getLogger("MyRLApp.EnvRunner")
+        self.logger.info(f"SharedMemoryEnvRunner, PID={os.getpid()}")
+
+        self.worker_index: int = kwargs.get("worker_index")
+        self.spaces = kwargs.get("spaces", {})
+
+        self.logger.debug(f"EnvRunner: spaces -> {self.spaces}")
+
+        # Set device.
+        self._device = get_device(
+            self.config,
+            0 if not self.worker_index else self.config.num_gpus_per_env_runner,
+        )
+
+        # from SingleAgentEnvRunner
+        # Create the env-to-module connector pipeline.
+        self._env_to_module = self.config.build_env_to_module_connector(
+            env=self.env, spaces=self.spaces, device=self._device
+        )
+        # Create the module-to-env connector pipeline.
+        self._module_to_env = self.config.build_module_to_env_connector(
+            env=self.env, spaces=self.spaces
+        )
+
+        self.logger.debug("EnvRunner: Started __init__()")
 
         self.worker_index: int = kwargs.get("worker_index", 0)
 
@@ -110,68 +158,107 @@ class SharedMemoryEnvRunner(EnvRunner):
         self.policy_shm = False
         self.flag_shm = False
 
-        # Start shared memory block for episodes
-        self.BATCH_SIZE = self.config.env_config["ep_shm_properties"]["BATCH_SIZE"]
-        self.NUM_SLOTS = self.config.env_config["ep_shm_properties"]["NUM_SLOTS"]
-        self.ELEMENTS_PER_ROLLOUT = self.config.env_config["ep_shm_properties"]["ELEMENTS_PER_ROLLOUT"]
-        self.BYTES_PER_ROLLOUT = self.config.env_config["ep_shm_properties"]["BYTES_PER_ROLLOUT"]
-        self.PAYLOAD_SIZE = self.config.env_config["ep_shm_properties"]["PAYLOAD_SIZE"]
-        self.HEADER_SIZE = self.config.env_config["ep_shm_properties"]["HEADER_SIZE"]
-        self.HEADER_SLOT_SIZE = self.config.env_config["ep_shm_properties"]["HEADER_SLOT_SIZE"]
-        self.SLOT_SIZE = self.config.env_config["ep_shm_properties"]["SLOT_SIZE"]
-        self.TOTAL_SIZE_BYTES = self.config.env_config["ep_shm_properties"]["TOTAL_SIZE_BYTES"]
-        self.STATE_ACTION_DIMS = self.config.env_config["ep_shm_properties"]["STATE_ACTION_DIMS"]
-        self.BYTES_PER_FLOAT = self.config.env_config["ep_shm_properties"]["BYTES_PER_FLOAT"]
-        self.episode_shm = shared_memory.SharedMemory(
-            create=True,
-            name=self.config.env_config["ep_shm_properties"].get("name", 'episodes'),
-            size=self.TOTAL_SIZE_BYTES
-        )
-        self.ep_buf = self.episode_shm.buf
-        self.ep_arr = np.frombuffer(self.ep_buf, dtype=np.float32)
-        self.episode_shm_name = self.episode_shm.name
+        # get dimensions of observation space
+        self.imep_space = self.config.env_config["imep_space"]
+        self.mprr_space = self.config.env_config["mprr_space"]
 
-        # Initialize the write and read indices in the episode buffer to 0
-        self.ep_arr[:2] = 0
-        # struct.pack_into("<II", self.ep_buf, 0, 0, 0)  # write_idx=0, read_idx=0
+        # Block some things from the EnvRunner execution in driver process.
+        self._local_worker_bool = (self.worker_index == 0 and self.config.num_env_runners > 0)
+        if not self._local_worker_bool:
+            # Start shared memory block for episodes
+            self.BATCH_SIZE = self.config.env_config["ep_shm_properties"]["BATCH_SIZE"]
+            self.NUM_SLOTS = self.config.env_config["ep_shm_properties"]["NUM_SLOTS"]
+            self.ELEMENTS_PER_ROLLOUT = self.config.env_config["ep_shm_properties"]["ELEMENTS_PER_ROLLOUT"]
+            self.BYTES_PER_ROLLOUT = self.config.env_config["ep_shm_properties"]["BYTES_PER_ROLLOUT"]
+            self.PAYLOAD_SIZE = self.config.env_config["ep_shm_properties"]["PAYLOAD_SIZE"]
+            self.HEADER_SIZE = self.config.env_config["ep_shm_properties"]["HEADER_SIZE"]
+            self.HEADER_SLOT_SIZE = self.config.env_config["ep_shm_properties"]["HEADER_SLOT_SIZE"]
+            self.SLOT_SIZE = self.config.env_config["ep_shm_properties"]["SLOT_SIZE"]
+            self.TOTAL_SIZE = self.config.env_config["ep_shm_properties"]["TOTAL_SIZE"]
+            self.TOTAL_SIZE_BYTES = self.config.env_config["ep_shm_properties"]["TOTAL_SIZE_BYTES"]
+            self.STATE_ACTION_DIMS = self.config.env_config["ep_shm_properties"]["STATE_ACTION_DIMS"]
+            self.BYTES_PER_FLOAT = self.config.env_config["ep_shm_properties"]["BYTES_PER_FLOAT"]
+            self.action_onehot_size = self.config.env_config["ep_shm_properties"]["action_onehot_size"]
+            self.episode_shm = shared_memory.SharedMemory(
+                create=True,
+                name=self.config.env_config["ep_shm_properties"].get("name", 'episodes'),
+                size=self.TOTAL_SIZE_BYTES
+            )
+            self.ep_buf = self.episode_shm.buf
+            self.ep_arr = np.ndarray(shape=(self.TOTAL_SIZE,),
+                                     dtype=np.float32,
+                                     buffer=self.ep_buf
+                                     )
+            self.logger.debug(f"ep_arr size -> {self.ep_arr.shape}")
+            self.logger.debug(f"EnvRunner: e_arr is writable? {self.ep_arr.flags.writeable}.")
+            self.episode_shm_name = self.episode_shm.name
 
-        # Spawn minion subprocess. Decided to go with ray task because it's convenient. This approach can split the
-        # workload in the Raspberry Pi to be: 1 core Algorithm/Learner, 1 core EnvRunner, 1 core Minion (environment),
-        # and the other core for the OS and any other support tasks.
-        self._minion_ref = _run_minion.remote(
-            self.policy_shm_name,
-            self.flag_shm_name,
-            self.ep_arr,
-            self.config.env_config["ep_shm_properties"],
-        )
+            self.logger.debug("EnvRunner: Created episode_shm.")
+
+            # Initialize the write and read indices in the episode buffer to 0
+            self.ep_arr[:2] = 0
+
+            # Spawn minion subprocess. Decided to go with ray task because it's convenient. This approach can split the
+            # workload in the Raspberry Pi to be: 1 core Algorithm/Learner, 1 core EnvRunner, 1 core Minion
+            # (environment), and the other core for the OS and any other support tasks.
+            self._minion_ref = _run_minion.remote(
+                self.policy_shm_name,
+                self.flag_shm_name,
+                self.episode_shm_name,
+                self.config.env_config["ep_shm_properties"],
+                self.logger,
+            )
+
+            # code will not run without this, something to do with timing of when processes get spawned
+            ready, _ = ray.wait([self._minion_ref], timeout=1.0)
+            self.logger.debug(f"EnvRunner: minion scheduled? {bool(ready)}")
+            self.logger.debug("EnvRunner: Spawned minion. Done with __init__")
+
+            # Set first_assert_healthy flag to true. This was needed due to a race condition in creating/accessing the
+            # policy shared memory block
+            self.first_assert_healthy = True
 
     def assert_healthy(self):
         """Checks that shared memory blocks and minion process have been created."""
+        self.logger.debug("EnvRunner: Called assert_healthy()")
+
         minion_running, _ = ray.wait([self._minion_ref], timeout=0)
         if not minion_running:
             minion_running = None
 
-        # in the first iteration, get shm references
-        if self.policy_shm == False:
-            self._get_shm_references()
+        if not self.first_assert_healthy:
+            # in the second iteration, get shm references
+            if self.policy_shm == False:
+                self.logger.debug("EnvRunner: Calling _get_shm_references() in assert_healthy()")
+                self._get_shm_references()
 
-        assert (
-                self.policy_shm is not None and
-                self.flag_shm is not None and
-                self.episode_shm is not None and
-                minion_running is not None
-        ), "Shared memory blocks or minion process not alive."
+            assert (
+                    self.policy_shm is not None and
+                    self.flag_shm is not None and
+                    self.episode_shm is not None and
+                    minion_running is not None
+            ), "Shared memory blocks or minion process not alive."
+        else:
+            # set flag to false so it checks
+            self.first_assert_healthy = False
 
     def sample(self, **kwargs):
         """
         Get new training batches.
         Returns an empty list if no new batches are available.
         """
-        episodes = self._read_batch()
+        # self.logger.debug("EnvRunner: Called sample()")
 
-        # if no new batches were found
-        if episodes is None:
-            return []
+        episodes = None
+
+        # block until a new episode is available
+        while episodes is None:
+            try:
+                episodes = self._read_batch()
+            except Exception as e:
+                self.logger.error(f"EnvRunner: Exception reading episodes: {e}")
+            if episodes is None:
+                time.sleep(0.0001)
 
         # if new batches were found
         num_env_steps = 0
@@ -182,20 +269,44 @@ class SharedMemoryEnvRunner(EnvRunner):
             num_episodes_completed += 1
             num_env_steps += len(eps)
 
+            # # checks for dimensions
+            # try:
+            #     obs = np.array(eps.get_observations())
+            #     actions = np.array(eps.get_actions())
+            #     rewards = np.array(eps.get_rewards())
+            #     self.logger.debug(f"EnvRunner(sample): observations -> {obs.shape}")
+            #     self.logger.debug(f"EnvRunner(sample): actions -> {actions.shape}")
+            #     self.logger.debug(f"EnvRunner(sample): rewards -> {rewards.shape}")
+            # except Exception as e:
+            #     self.logger.debug(f"EnvRunner(sample): Could not get episode dimensions due to error {e}")
+
         # not sure why/if this is necessary but TCP example does it so couldn't hurt
         SingleAgentEnvRunner._increase_sampled_metrics(
             self, num_env_steps, num_episodes_completed
         )
 
+        # self.logger.debug(f"EnvRunner(sample): Logged {len(episodes)} episodes.")
+
         return episodes
 
     def get_metrics(self):
         # Compute per-episode metrics (only on already completed episodes).
+        # self.logger.debug("EnvRunner: Called get_metrics()")
+
+        # self.logger.debug(f"EnvRunner(get_metrics): weights_seq_no -> {self._weights_seq_no}.")
+
+        if not self._done_episodes_for_metrics:
+            # self.logger.debug("EnvRunner(get_metrics): No new episodes to compute metrics.")
+            return {}
+
         for eps in self._done_episodes_for_metrics:
             assert eps.is_done
             episode_length = len(eps)
             episode_return = eps.get_return()
             episode_duration_s = eps.get_duration_s()
+
+            # self.logger.debug(f"EnvRunner(get_metrics): episode length, return, and duration: "
+            #                   f"{episode_length}, {episode_return}, {episode_duration_s}")
 
             self._log_episode_metrics(
                 episode_length, episode_return, episode_duration_s
@@ -204,14 +315,18 @@ class SharedMemoryEnvRunner(EnvRunner):
         # Now that we have logged everything, clear cache of done episodes.
         self._done_episodes_for_metrics.clear()
 
+        # self.logger.debug("EnvRunner(get_metrics): Logged new episode metrics.")
+
         # Return reduced metrics.
         return self.metrics.reduce()
 
     def stop(self):
         """Closes and unlinks the weights, flag, and episode shared memory blocks."""
+        self.logger.debug("EnvRunner: Called stop()")
         self._unlink_mem_blocks_if_necessary()
 
     def get_spaces(self):
+        self.logger.debug(f"EnvRunner: Called get_spaces(), PID={os.getpid()}")
         return {
             INPUT_ENV_SPACES: (self.config.observation_space, self.config.action_space),
             DEFAULT_MODULE_ID: (
@@ -220,13 +335,46 @@ class SharedMemoryEnvRunner(EnvRunner):
             ),
         }
 
-    def get_state(self, state):
-        return {
-            COMPONENT_RL_MODULE: self.module.get_state(),
-            WEIGHTS_SEQ_NO: self._weights_seq_no,
+    def get_state(
+        self,
+        components: Optional[Union[str, Collection[str]]] = None,
+        *,
+        not_components: Optional[Union[str, Collection[str]]] = None,
+        **kwargs,
+    ) -> StateDict:
+
+        # self.logger.debug("EnvRunner: Called get_state()")
+
+        state = {
+            NUM_ENV_STEPS_SAMPLED_LIFETIME: (
+                self.metrics.peek(NUM_ENV_STEPS_SAMPLED_LIFETIME, default=0)
+            ),
         }
 
+        if self._check_component(COMPONENT_RL_MODULE, components, not_components):
+            state[COMPONENT_RL_MODULE] = self.module.get_state(
+                components=self._get_subcomponents(COMPONENT_RL_MODULE, components),
+                not_components=self._get_subcomponents(
+                    COMPONENT_RL_MODULE, not_components
+                ),
+                **kwargs,
+            )
+            state[WEIGHTS_SEQ_NO] = self._weights_seq_no
+        if self._check_component(
+            COMPONENT_ENV_TO_MODULE_CONNECTOR, components, not_components
+        ):
+            state[COMPONENT_ENV_TO_MODULE_CONNECTOR] = self._env_to_module.get_state()
+        if self._check_component(
+            COMPONENT_MODULE_TO_ENV_CONNECTOR, components, not_components
+        ):
+            state[COMPONENT_MODULE_TO_ENV_CONNECTOR] = self._module_to_env.get_state()
+
+        # self.logger.debug(f"EnvRunner (get_state): NUM_ENV_STEPS_SAMPLED_LIFETIME={state[NUM_ENV_STEPS_SAMPLED_LIFETIME]}")
+
+        return state
+
     def set_state(self, state: StateDict) -> None:
+        self.logger.debug("EnvRunner: Called set_state()")
         # Update the RLModule state.
         if COMPONENT_RL_MODULE in state:
             # A missing value for WEIGHTS_SEQ_NO or a value of 0 means: Force the
@@ -244,16 +392,80 @@ class SharedMemoryEnvRunner(EnvRunner):
                     rl_module_state = rl_module_state[DEFAULT_MODULE_ID]
                 self.module.set_state(rl_module_state)
 
-                # Update our weights_seq_no, if the new one is > 0.
-                if weights_seq_no > 0:
-                    self._weights_seq_no = weights_seq_no
+                # send new weights to minion
+                if self.worker_index > 0:
+                    # make sure shared memory blocks have been linked
+                    if self.policy_shm == False:
+                        self.logger.debug("EnvRunner: Calling _get_shm_references() in set_state()")
+                        self._get_shm_references()
+
+                    self.logger.debug("EnvRunner: getting onnx model weights")
+                    # get new model weights
+                    ort_raw = _get_current_onnx_model(self.module, logger=self.logger)
+
+                    self.logger.debug("EnvRunner: got onnx model weights, updating policy shm")
+
+                    # update the policy weights in the policy shared memory buffer
+                    self._update_policy_shm(ort_raw)
+
+                    self.logger.debug("EnvRunner: policy shm updated")
+
+            # Update our weights_seq_no, if the new one is > 0.
+            if weights_seq_no > 0:
+                self._weights_seq_no = weights_seq_no
+
+            # Update our lifetime counters.
+            if NUM_ENV_STEPS_SAMPLED_LIFETIME in state:
+                self.metrics.set_value(
+                    key=NUM_ENV_STEPS_SAMPLED_LIFETIME,
+                    value=state[NUM_ENV_STEPS_SAMPLED_LIFETIME],
+                    reduce="sum",
+                    with_throughput=True,
+                )
+
+    def get_ctor_args_and_kwargs(self):
+        return (
+            (),  # *args
+            {"config": self.config},  # **kwargs
+        )
 
     # Helper functions
 #   #------------------------------------------------------------------------#
     def _get_shm_references(self):
-        # get reference to policy shared memory weights
-        self.policy_shm = shared_memory.SharedMemory(name=self.policy_shm_name, create=False)
-        self.flag_shm = shared_memory.SharedMemory(name=self.flag_shm_name, create=False)
+        while True:
+            try:
+                # get reference to policy shared memory weights
+                self.policy_shm = shared_memory.SharedMemory(name=self.policy_shm_name, create=False)
+                self.flag_shm = shared_memory.SharedMemory(name=self.flag_shm_name, create=False)
+                self.p_buf = self.policy_shm.buf
+                self.f_buf = self.flag_shm.buf
+                self.logger.debug("EnvRunner: Created shm references.")
+                break
+            except FileNotFoundError:
+                # could reach here before Master has created the shm. if so, wait and try again
+                time.sleep(0.05)
+
+    def _update_policy_shm(self, ort_raw: bytes):
+        self.logger.debug("EnvRunner: Called update_policy_shm()")
+
+        # get expected ort_compressed length from header
+        _len_ort_expected = struct.unpack_from("<I", self.p_buf, 0)
+        header_offset = 4   # number of bytes in the int
+
+        # sanity check to make sure the size of the weights vector is as expected
+        assert _len_ort_expected[0] == len(ort_raw), (
+            f"Expected model size {_len_ort_expected[0]} bytes but got {len(ort_raw)} bytes."
+        )
+
+        # if lock is set to true wait until it isn't and then update the weights
+        while self.f_buf[0] == 1:
+            time.sleep(0.0001)
+
+        # save new model weights to buffer
+        self.f_buf[0] = 1  # set lock flag to locked
+        self.p_buf[header_offset:header_offset+len(ort_raw)] = ort_raw  # insert compressed weights
+        self.f_buf[0] = 0  # set lock flag to unlocked
+        self.f_buf[1] = 1  # set weights-available flag to 1 (true)
 
     def _unlink_mem_blocks_if_necessary(self):
         """Close all shared memory blocks and terminate minion subprocess."""
@@ -342,19 +554,36 @@ class SharedMemoryEnvRunner(EnvRunner):
         │       └ same as rollout[0]                           │
         └──────────────────────────────────────────────────────┘
         """
-        write_idx, read_idx = get_indices(self.ep_arr)
+        # self.logger.debug("EnvRunner: In _read_batch().")
+
+        # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
+        while True:
+            if self.f_buf[3] == 0:
+                write_idx, read_idx = get_indices(self.ep_arr, self.f_buf)
+                # self.logger.debug(f"EnvRunner(_read_batch): Started reading buffer. "
+                #                   f"Identified write_idx, read_idx: {write_idx}, {read_idx}.")
+                break
+            else:
+                time.sleep(0.0001)
+
         # if any of these are true it means the last batch read is the most updated full batch
-        if write_idx == read_idx or write_idx == read_idx+1 or (write_idx == 0 and read_idx == self.NUM_SLOTS-1):
+        if write_idx == read_idx:
+            # self.logger.debug("EnvRunner(_read_batch): Returning None.")
+            set_indices(self.ep_arr, read_idx, 'r', self.f_buf)   # to unlock episode buffer
+            # self.logger.debug(f"EnvRunner(_read_batch): Done reading buffer, no episodes available. "
+            #                   f"Final read index: {read_idx}.")
             return None  # ring empty
 
         # In case the write_idx has wrapped around and there are more full batches available
         elif write_idx < read_idx:
-            # write_idx-1 because the batch of write_idx is not full yet.
-            num_batches = ((self.NUM_SLOTS-1) - read_idx) + (write_idx - 1)
+            # write_idx + 1 because indexing starts at 0.
+            num_batches = ((self.NUM_SLOTS-1) - read_idx) + write_idx + 1
 
-        # regular case where there are batches available
+        # regular case where there are full batches available
         else:
-            num_batches = write_idx - read_idx - 1
+            num_batches = write_idx - read_idx
+
+        # self.logger.debug(f"EnvRunner(_read_batch): num_batches: {num_batches}. Going into batches loop.")
 
         batches = []
         for i in range(num_batches):
@@ -369,7 +598,7 @@ class SharedMemoryEnvRunner(EnvRunner):
 
             # extract initial state from front of payload and remove it so that shape is consistent for next step
             initial_state = payload[:self.STATE_ACTION_DIMS["state"]]
-            payload = np.delete(payload, np.arange(self.STATE_ACTION_DIMS["action"]))
+            payload = np.delete(payload, np.arange(self.STATE_ACTION_DIMS["state"]))
 
             # reshape data and add truncated and terminated fields
             payload = payload.reshape(self.BATCH_SIZE, self.ELEMENTS_PER_ROLLOUT)
@@ -384,27 +613,47 @@ class SharedMemoryEnvRunner(EnvRunner):
             )
 
             # add initial state
-            batch.add_env_reset(initial_state)
+            batch.add_env_reset(_flatten_obs_onehot(_decode_obs(initial_state), self.imep_space, self.mprr_space))
 
-            # add one rollout at a time (i.e. one row in flat)
-            for j in payload:
+            # get start and end indices of each component of the payload
+            action_start = 0
+            action_end = self.STATE_ACTION_DIMS["action"]
+            reward_start = action_end
+            reward_end = reward_start + self.STATE_ACTION_DIMS["reward"]
+            obs_start = reward_end
+            obs_end = obs_start + self.STATE_ACTION_DIMS["state"]
+            logp_start = obs_end
+            logp_end = logp_start + self.STATE_ACTION_DIMS["logp"]
+            dist_start = logp_end
+            dist_end = dist_start + self.STATE_ACTION_DIMS["action_onehot"]
+
+            # add one rollout at a time (i.e. one row in payload)
+            for j, rollout in enumerate(payload):
                 batch.add_env_step(
-                    observation=payload[j, 0:self.STATE_ACTION_DIMS["state"]],     # observation !AFTER! taking "action"
-                    action=payload[j, self.STATE_ACTION_DIMS["state"]:self.STATE_ACTION_DIMS["action"]],
-                    reward=payload[j, self.STATE_ACTION_DIMS["action"]:self.STATE_ACTION_DIMS["reward"]],
-                    terminated=terminateds[j],
-                    truncated=truncateds[j],
+                    action=rollout[action_start:action_end],
+                    reward=np.squeeze(rollout[reward_start:reward_end]),
+                    # observation !AFTER! taking "action"
+                    observation=_flatten_obs_onehot(_decode_obs(rollout[obs_start:obs_end]),
+                                                    self.imep_space, self.mprr_space),
+                    terminated=bool(terminateds[j]),
+                    truncated=bool(truncateds[j]),
+                    extra_model_outputs={
+                        "action_logp": np.squeeze(rollout[logp_start:logp_end]),
+                        "action_dist_inputs": rollout[dist_start:dist_end],
+                    }
                 )
 
             # append to list of batches to pass to learner
-            batches.append(batch)
+            batches.append(batch.to_numpy())
 
             # Advance read_idx
             read_idx = (read_idx + 1) % self.NUM_SLOTS
 
-        # commit new indices
-        self.ep_buf = set_indices(self.ep_buf, write_idx, read_idx)
+        # self.logger.debug("EnvRunner(_read_batch): Done logging batches.")
+
+        # commit new indices and unlock episode buffer (unlocking happens inside set_indices)
+        set_indices(self.ep_arr, read_idx, 'r', self.f_buf)
+        # self.logger.debug(f"EnvRunner(_read_batch): Done reading buffer. "
+        #                   f"Final read index: {read_idx}.")
 
         return batches
-
-
