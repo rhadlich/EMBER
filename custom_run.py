@@ -58,55 +58,6 @@ import logging
 import logging_setup
 
 
-# def _get_strings_related_to_policy(algo_name: str) -> List[str]:
-#     """
-#     Function that returns a list of strings that relate to policy for a particular algo.
-#     Each algo has a specific naming convention for their weights as keys in algo.get_weights(),
-#     need to find them and include them here.
-#     """
-#     if algo_name == "PPO":
-#         return ['pi', 'actor']
-#     elif algo_name == "DQN":
-#         return ['encoder', 'af']
-#     else:
-#         raise ValueError(f"Algo name not currently available: {algo_name}. "
-#                          "Please add the algo to the _get_strings_related_to_policy function.")
-#
-#
-# def _get_policy_weight_dimensions(algo: Algorithm) -> int:
-#     """
-#     Function that returns the size of the policy network in bytes for the creation of the shared memory block.
-#     """
-#     weights = algo.get_weights()["default_policy"]
-#     list_policy_str = _get_strings_related_to_policy(algo.__class__.__name__)
-#     total_bytes = 0
-#     for pol_str in list_policy_str:
-#         total_bytes += sum(arr.nbytes for n, arr in weights.items() if pol_str in n)
-#     return total_bytes
-
-# OLD VERSION
-# def _get_current_onnx_model(algo: ray.rllib.algorithms.Algorithm,
-#                             *,
-#                             outdir: str = "export_torch"):
-#     """
-#     Function to extract the policy model converted to ort.
-#     """
-#     if os.path.exists(outdir):
-#         shutil.rmtree(outdir)
-#     algo.export_policy_model(outdir, onnx=20)
-#     path = os.path.join(outdir, "model.onnx")
-#     # convert .onnx to .ort (optimized for faster loading and inference in the minion)
-#     styles = [c2o.OptimizationStyle.Fixed]
-#     c2o.convert_onnx_models_to_ort(
-#         model_path_or_dir=Path(path),  # may also be a directory
-#         output_dir=None,  # None = same folder as the .onnx
-#         optimization_styles=styles,
-#         # target_platform="arm",  # Only in the Raspberry Pi
-#     )
-#     with open(os.path.join(outdir, "model.ort"), "rb") as f:
-#         ort_raw = f.read()
-#     return ort_raw
-
 def _get_current_onnx_model(module: RLModule,
 
                             *,
