@@ -14,6 +14,8 @@ from gymCustom import reward_fn, EngineEnv
 import logging
 import logging_setup
 
+import zmq
+
 
 def get_indices(buf_arr, f_buf, *, logger=None) -> tuple:
     """Return (write_idx, read_idx)."""
@@ -320,6 +322,11 @@ def main(policy_shm_name: str,
 
     logger.debug("Minion: Initialized ENV.")
 
+    # set up data broadcasting to GUI
+    ctx = zmq.Context()
+    pub = ctx.socket(zmq.PUB)
+    pub.bind("ipc:///tmp/engine.ipc")
+
     try:
         # write initial state to episode buffer
         write_fragment(obs_flat,
@@ -400,6 +407,11 @@ def main(policy_shm_name: str,
 
             # set minion rollout flag to true to enable the algo.train() calls
             f_buf[2] = 1
+
+            # send results to be logged in the GUI
+            msg = {"topic": "engine", "state": obs["state"].tolist(), "target": float(obs["target"])}
+            pub.send_json(msg)
+            logger.debug(f"Minion: Sent message to GUI: {msg}.")
 
             # logger.debug(f"Minion: Done with iteration {timesteps}")
 

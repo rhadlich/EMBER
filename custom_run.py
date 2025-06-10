@@ -7,6 +7,7 @@ import pprint
 import random
 import re
 import time
+import zmq
 import gzip
 import base64
 import struct
@@ -424,6 +425,11 @@ def run_rllib_shared_memory(
         logger.debug(f"custom_run: merge -> {merge}")
         logger.debug(f"custom_run: broadcast -> {broadcast}")
 
+        # set up data broadcasting to GUI
+        ctx = zmq.Context()
+        pub = ctx.socket(zmq.PUB)
+        pub.bind("ipc:///tmp/training.ipc")
+
         try:
             # start counter
             train_iter = 0
@@ -454,19 +460,27 @@ def run_rllib_shared_memory(
                 logger.debug(f"custom_run: num training steps since last synch: {last_synch}")
                 logger.debug(f"custom_run: num_weights_broadcast -> {algo.metrics.peek('num_weight_broadcasts')}")
 
+                msg = {"topic": "training", "iteration": train_iter}     # to send to GUI
+
                 # print results
                 if ENV_RUNNER_RESULTS in results:
                     mean_return = results[ENV_RUNNER_RESULTS].get(
                         EPISODE_RETURN_MEAN, np.nan
                     )
                     logger.debug(f"iter={train_iter} R={mean_return}")
+                    msg.update({"mean_return": float(mean_return)})
                     # print(f"iter={train_iter} R={mean_return}", end="")
                 if EVALUATION_RESULTS in results:
                     Reval = results[EVALUATION_RESULTS][ENV_RUNNER_RESULTS][
                         EPISODE_RETURN_MEAN
                     ]
                     print(f" R(eval)={Reval}", end="")
+                    msg.update({"eval_return": float(Reval)})
                 print()
+
+                # send results to be logged in the GUI
+                pub.send_json(msg)
+                logger.debug(f"custom_run: sent message to GUI: {msg}")
 
                 # increment counter
                 train_iter += 1
