@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+from collections import deque
 
 from PyQt6 import QtCore, QtWidgets
 import pyqtgraph as pg
@@ -73,45 +74,79 @@ class MainWindow(QtWidgets.QMainWindow):
         # use the same Python interpreter
         self.master_proc = subprocess.Popen([sys.executable, master_path])
 
-        # 2) Set up the UI
-        central = QtWidgets.QWidget()
-        vlay = QtWidgets.QVBoxLayout(central)
-        self.setCentralWidget(central)
-
-        # 2a) Engine metrics plot
-        self.engine_plot = pg.PlotWidget(title="Engine Metrics (Minion.py)")
-        self.engine_plot.addLegend()
-        self.engine_plot.showGrid(x=True, y=True)
-        self.engine_plot.setBackground('w')
-        vlay.addWidget(self.engine_plot)
-
-        # 2b) Training reward plot
-        self.training_plot = pg.PlotWidget(title="Training Reward (custom_run.py)")
-        self.training_plot.showGrid(x=True, y=True)
-        self.training_plot.setBackground('w')
-        vlay.addWidget(self.training_plot)
-
         # Create containers for plot parameters
         self.plot_colors = ['#d7191c', '#fdae61', '#ffffbf', '#abd9e9', '#2c7bb6']
         self.plot_line_width = 5
 
         # Data structures for plotting
-        self._max_points = 10000
+        self._max_points = 5000
         # engine: dynamic curves keyed by metric name
         self.engine_curves = {}
         self.engine_data = {}
-        self.engine_x = []
+        self.engine_x = deque(maxlen=self._max_points)
         self.engine_count = 0
 
         # manually set fields to be plotted
-        self.engine_data["imep"] = []
-        self.engine_data["mprr"] = []
-        self.engine_data["target imep"] = []
+        self.engine_data["imep"] = deque(maxlen=self._max_points)
+        self.engine_data["mprr"] = deque(maxlen=self._max_points)
+        self.engine_data["target imep"] = deque(maxlen=self._max_points)
 
         # training: one curve for reward vs iteration
         self.training_curve = None
         self.training_x = []
         self.training_y = []
+
+        # 2) Set up the UI
+        central = QtWidgets.QWidget()
+        vlay = QtWidgets.QVBoxLayout(central)
+        self.setCentralWidget(central)
+
+        # 2a) Engine metrics (load tracking) plot
+        self.load_plot = pg.PlotWidget(title="Load Tracking (Minion.py)")
+        self.load_plot.addLegend()
+        self.load_plot.showGrid(x=True, y=True)
+        self.load_plot.setBackground('w')
+        vlay.addWidget(self.load_plot)
+        # make curves for load tracking plot
+        pen = pg.mkPen(color=self.plot_colors[0], width=self.plot_line_width)
+        curve = self.load_plot.plot(name='imep', pen=pen)
+        self.engine_curves['imep'] = curve
+        pen = pg.mkPen(color=self.plot_colors[1], width=self.plot_line_width)
+        curve = self.load_plot.plot(name='target imep', pen=pen)
+        self.engine_curves['target imep'] = curve
+
+        # 2b) Engine metrics (safety) plot
+        self.safety_plot = pg.PlotWidget(title="Safety (Minion.py)")
+        self.safety_plot.addLegend()
+        self.safety_plot.showGrid(x=True, y=True)
+        self.safety_plot.setBackground('w')
+        vlay.addWidget(self.safety_plot)
+        # make curve for safety plot
+        pen = pg.mkPen(color=self.plot_colors[2], width=self.plot_line_width)
+        curve = self.safety_plot.plot(name='mprr', pen=pen)
+        self.engine_curves['mprr'] = curve
+
+        # 2c) Training reward plot
+        self.training_plot = pg.PlotWidget(title="Training Reward (custom_run.py)")
+        self.training_plot.showGrid(x=True, y=True)
+        self.training_plot.setBackground('w')
+        vlay.addWidget(self.training_plot)
+
+        # ── Insert a horizontal layout at the top for controls ──
+        controls = QtWidgets.QHBoxLayout()
+        self.stop_btn = QtWidgets.QPushButton("Stop Processes")
+        self.stop_btn.clicked.connect(self.stop_processes)
+        controls.addWidget(self.stop_btn)
+        # you could add more buttons here later (e.g. “Pause”, “Restart”)
+
+        # Insert controls above the plots
+        central = QtWidgets.QWidget()
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.addLayout(controls)
+        main_layout.addWidget(self.load_plot)
+        main_layout.addWidget(self.safety_plot)
+        main_layout.addWidget(self.training_plot)
+        self.setCentralWidget(central)
 
         # 3) Start ZMQ listener thread
         #    (adjust these addresses if you used tcp:// or a different ipc path)
@@ -123,7 +158,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.listener.message.connect(self.on_zmq_message)
         self.listener.start()
 
+        # 4) Setup a QTimer to refresh the plots at 10 Hz
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setInterval(50)        # 100 ms => 10 Hz
+        self._refresh_timer.timeout.connect(self._refresh_plots)
+        self._refresh_timer.start()
+
         self.log.debug("GUI: Done with init.")
+
+    def stop_processes(self):
+        if self.listener.isRunning():
+            self.listener.stop()
+
+        if self.master_proc.poll() is None:
+            self.master_proc.terminate()
+            try:
+                self.master_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.master_proc.kill()
 
     def closeEvent(self, event):
         # Clean up ZMQ thread
@@ -132,6 +184,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.master_proc.poll() is None:
             self.master_proc.terminate()
         super().closeEvent(event)
+
+    @QtCore.pyqtSlot()
+    def _refresh_plots(self):
+        x = list(self.engine_x)
+        self.engine_curves['imep'].setData(x, list(self.engine_data['imep']))
+        self.engine_curves['target imep'].setData(x, list(self.engine_data['target imep']))
+        self.engine_curves['mprr'].setData(x, list(self.engine_data['mprr']))
+        if self.training_curve:
+            self.training_curve.setData(self.training_x, self.training_y)
 
     @QtCore.pyqtSlot(dict)
     def on_zmq_message(self, msg):
@@ -145,8 +206,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # self.log.debug(f"GUI: In _update_engine.")
         self.engine_count += 1
         self.engine_x.append(self.engine_count)
-        if len(self.engine_x) > self._max_points:
-            self.engine_x.pop(0)
         # self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
 
         data = {
@@ -157,25 +216,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # self.log.debug(f"GUI (_update_engine): data -> {data}.")
         for i, (k, v) in enumerate(data.items()):
-            # create curve on first sighting
-            if k not in self.engine_curves:
-                pen = pg.mkPen(color=self.plot_colors[i], width=self.plot_line_width)
-                curve = self.engine_plot.plot(name=k, pen=pen)
-                self.engine_curves[k] = curve
-
             # append data
             data_list = self.engine_data[k]
             data_list.append(v)
-            if len(data_list) > self._max_points:
-                data_list.pop(0)
-            # redraw
-            self.engine_curves[k].setData(self.engine_x, data_list)
+
+        # self.log.debug(f"GUI: Done with _update_engine.")
 
     def _update_training(self, msg):
         # Determine iteration & reward keys
         # Adjust these if you used different JSON keys
 
-        self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
+        # self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
 
         if "iteration" in msg:
             x = msg["iteration"]
@@ -202,13 +253,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.training_curve = self.training_plot.plot(name="Reward", pen=pen)
             self.training_plot.addLegend()
 
-        self.training_curve.setData(self.training_x, self.training_y)
+        # self.training_curve.setData(self.training_x, self.training_y)
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
-    win.resize(900, 600)
+    win.resize(1200, 900)
     win.show()
     sys.exit(app.exec())
 
