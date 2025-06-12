@@ -64,7 +64,7 @@ class Predictor:
         data = torch.tensor(data)
         return data
 
-    def model_predict(self, values):
+    def model_predict(self, values, *, noise_in_percent=None):
         # case of no injection
         if values[2] == 0:
             p = np.zeros(self.cad_plt.size)
@@ -86,6 +86,11 @@ class Predictor:
         # MPRR calculation
         prr = np.diff(p, 1)*1/self.res
         mprr = max(prr)
+
+        # add noise if desired
+        if noise_in_percent is not None:
+            imep = imep + np.random.normal(0, imep * noise_in_percent / 100)
+            mprr = mprr + np.random.normal(0, mprr * noise_in_percent / 100)
         return p, imep, mprr, self.cad_plt
 
 # For RL, the states would have to be (assuming only IMEP matters) the current IMEP and the desired IMEP, and the

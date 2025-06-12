@@ -391,7 +391,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             if weights_seq_no == 0 or self._weights_seq_no < weights_seq_no:
                 rl_module_state = state[COMPONENT_RL_MODULE]
                 # this was needed because ray was passing an object reference after
-                # the first iteration to lower latency. need to dereference
+                # the first iteration to decrease latency. need to dereference
                 if isinstance(rl_module_state, ray.ObjectRef):
                     rl_module_state = ray.get(rl_module_state)
 

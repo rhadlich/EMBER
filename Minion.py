@@ -269,6 +269,8 @@ def main(policy_shm_name: str,
 
     logger.debug("Minion: Started main()")
 
+    eval_frequency = 1*episode_shm_properties["BATCH_SIZE"]
+
     # connect to shared memory
     f_shm = shared_memory.SharedMemory(name=flag_shm_name, create=False)  # this one has to be first
     f_buf = f_shm.buf
@@ -340,6 +342,7 @@ def main(policy_shm_name: str,
 
     timesteps = 0
     weight_updates = 0
+    store_rollout = True
 
     try:
         while True:
@@ -355,23 +358,27 @@ def main(policy_shm_name: str,
             logits_soi, logits_d = np.split(logits, cuts)
             soi_probs = softmax(logits_soi)
             inj_d_probs = softmax(logits_d)
-            idx_soi = int(np.random.choice(sizes[0], p=soi_probs))
-            idx_inj_d = int(np.random.choice(sizes[1], p=inj_d_probs))
-            logp = float(
-                np.log(soi_probs[idx_soi]) +
-                np.log(inj_d_probs[idx_inj_d])
-            )       # joint log-probability of multi-branch action spa
+            if timesteps % eval_frequency == 0:
+                idx_soi = np.argmax(soi_probs)
+                idx_inj_d = np.argmax(inj_d_probs)
+                store_rollout = False
+            else:
+                idx_soi = int(np.random.choice(sizes[0], p=soi_probs))
+                idx_inj_d = int(np.random.choice(sizes[1], p=inj_d_probs))
+                logp = float(
+                    np.log(soi_probs[idx_soi]) +
+                    np.log(inj_d_probs[idx_inj_d])
+                )       # joint log-probability of multi-branch action space
 
             # send action to environment (and in the case of gym.Env collect new observation and reward)
             action = np.array([1, idx_soi, idx_inj_d], dtype=np.int32)    # 1 is for inj_p, to be kept const.
             obs, reward, terminated, truncated, info = env.step(action)
-            action = action[1:]
-            obs_onehot = _flatten_obs_onehot(obs, imep_space, mprr_space)       # flatten to one-hot shape needed by ort
-            obs_flat = _flatten_obs_array(obs)                              # flatten to shape needed by memory buffer
 
-            # log rollout into episode shm buffer
-            try:
-                # package rollout
+            if store_rollout:
+                # package rollout to the right format
+                action = action[1:]
+                obs_onehot = _flatten_obs_onehot(obs, imep_space, mprr_space)       # flatten to one-hot shape needed by ort
+                obs_flat = _flatten_obs_array(obs)                              # flatten to shape needed by memory buffer
                 current_packet = np.concatenate((
                     action,
                     np.array([reward], dtype=np.float32),
@@ -391,8 +398,15 @@ def main(policy_shm_name: str,
                     env=env,
                     reset_env_each_batch=True,      # would only apply when training using a gym env
                 )
-            except Exception as e:
-                logger.error(f"Minion: could not write fragment due to error: {e}")
+
+                # send training results to be logged in the GUI
+                msg = {"topic": "engine", "state": obs["state"].tolist(), "target": float(obs["target"])}
+                pub.send_json(msg)
+            else:
+                # send evaluation results to be logged in the GUI
+                msg = {"topic": "evaluation", "state": obs["state"].tolist(), "target": float(obs["target"])}
+                pub.send_json(msg)
+                store_rollout = True    # reset this so that it stores rollout next iteration
 
             # update policy network weights if available and not being written to
             if f_buf[1] == 1 and f_buf[0] == 0:
@@ -408,14 +422,10 @@ def main(policy_shm_name: str,
             # set minion rollout flag to true to enable the algo.train() calls
             f_buf[2] = 1
 
-            # send results to be logged in the GUI
-            msg = {"topic": "engine", "state": obs["state"].tolist(), "target": float(obs["target"])}
-            pub.send_json(msg)
-            logger.debug(f"Minion: Sent message to GUI: {msg}.")
-
             # logger.debug(f"Minion: Done with iteration {timesteps}")
 
-            # if environment is the physical engine, wait for new state update and reward
+            # if environment is the physical engine, wait for new state update and reward (simulated with a sleep)
+            # time.sleep(0.001)
 
 
 

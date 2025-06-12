@@ -110,7 +110,7 @@ class EngineEnv(gym.Env):
 
         # send action values to torch model and get new state
         pressure, self._current_imep, self._current_mprr, cad = (
-            self.predictor.model_predict(action_arr))
+            self.predictor.model_predict(action_arr, noise_in_percent=1))
 
         # get observation in the right format
         observation = self._get_obs()
@@ -128,7 +128,6 @@ class EngineEnv(gym.Env):
 
         return observation, reward, terminated, False, info
 
-
     def _get_obs(self):
         return {"state": np.array([self._current_imep, self._current_mprr]), "target": self._desired_imep}
 
@@ -137,7 +136,12 @@ def reward_fn(obs):
     imep, mprr = obs["state"]
     target = obs["target"]
 
-    load_tracking = (imep - target)**2
-    safety = max(0, mprr-7)**2
+    l = (imep - target)**2
+    l1 = 3
+    l2 = -8
+    l3 = -0.5
 
-    return -(20*load_tracking + 1000*safety)
+    load_tracking = np.tanh(l1*l)*l2 + l*l3
+    safety = (max(0, mprr-7)**2) * -0.2
+
+    return load_tracking + safety

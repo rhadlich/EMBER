@@ -9,6 +9,7 @@ How to run this script
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import os
 
 from shared_memory_env_runner import SharedMemoryEnvRunner
 # from ray.rllib.utils.test_utils import (
@@ -59,6 +60,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logger = logging.getLogger("MyRLApp.Master")
+    logger.info(f"MASTER, PID={os.getpid()}")
 
     # decided to go with one-hot observation representation, manually handling it outside or RLlib.
     # RLlib was having issues with the internal connectors so this was more transparent (and probably faster).
@@ -143,6 +145,7 @@ if __name__ == "__main__":
         .environment(
             observation_space=obs_space,
             action_space=action_space,
+            clip_rewards=False,
             env_config={"policy_shm_name": args.policy_shm_name,
                         "flag_shm_name": args.flag_shm_name,
                         "ep_shm_properties": ep_shm_properties,

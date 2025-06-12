@@ -11,6 +11,7 @@ import zmq
 import gzip
 import base64
 import struct
+import signal
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -57,6 +58,10 @@ from pathlib import Path
 
 import logging
 import logging_setup
+
+
+def on_sigterm(signum, frame):
+    raise KeyboardInterrupt
 
 
 def _get_current_onnx_model(module: RLModule,
@@ -312,6 +317,8 @@ def run_rllib_shared_memory(
             config.offline_data(output=args.output)
 
     logger.debug("custom_run: Done with setting config. Going into args.no_tune")
+
+    signal.signal(signal.SIGTERM, on_sigterm)
 
     # Run the experiment w/o Tune (directly operate on the RLlib Algorithm object).
     # THIS IS WHAT WILL BE RUN ON THE RASPBERRY PI
