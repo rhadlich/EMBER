@@ -6,6 +6,7 @@ from statistics import mean
 
 from PyQt6 import QtCore, QtWidgets
 import pyqtgraph as pg
+from pyqtgraph import mkBrush
 import zmq
 import numpy as np
 
@@ -70,7 +71,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.info(f"GUI, PID={os.getpid()}")
 
         # 1) Launch Master.py (which you’ve set up to spawn
-        #    custom_run.py, shared_memory_env_runner.py, Minion.py)
+        #    custom_run.py, shared_memory_env_runner.py, minion.py)
         script_dir = os.path.dirname('/Users/rodrigohadlich/PycharmProjects/RayProject/')
         master_path = os.path.join(script_dir, "Master.py")
         # use the same Python interpreter
@@ -107,9 +108,13 @@ class MainWindow(QtWidgets.QMainWindow):
         vlay = QtWidgets.QVBoxLayout(central)
         self.setCentralWidget(central)
 
+        alpha = 225
+
         # 2a) Engine metrics (load tracking) plot
-        self.load_plot = pg.PlotWidget(title="Load Tracking (Minion.py)")
-        self.load_plot.addLegend()
+        self.load_plot = pg.PlotWidget(title="Load Tracking (minion.py)")
+        legend_load = self.load_plot.addLegend()
+        legend_load.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
+        # legend_load.setFrame(True)
         self.load_plot.showGrid(x=True, y=True)
         self.load_plot.setBackground('w')
         vlay.addWidget(self.load_plot)
@@ -125,8 +130,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_curves['mean sampled imep'] = curve
 
         # 2b) Engine metrics (safety) plot
-        self.safety_plot = pg.PlotWidget(title="Safety (Minion.py)")
-        self.safety_plot.addLegend()
+        self.safety_plot = pg.PlotWidget(title="Safety (minion.py)")
+        legend_safety = self.safety_plot.addLegend()
+        legend_safety.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
         self.safety_plot.showGrid(x=True, y=True)
         self.safety_plot.setBackground('w')
         vlay.addWidget(self.safety_plot)
@@ -136,8 +142,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_curves['mprr'] = curve
 
         # 2c) Engine metrics (safety) plot
-        self.evaluation_plot = pg.PlotWidget(title="Evaluation (Minion.py)")
-        self.evaluation_plot.addLegend()
+        self.evaluation_plot = pg.PlotWidget(title="Evaluation (minion.py)")
+        legend_evaluation = self.evaluation_plot.addLegend()
+        legend_evaluation.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
         self.evaluation_plot.showGrid(x=True, y=True)
         self.evaluation_plot.setBackground('w')
         vlay.addWidget(self.evaluation_plot)
@@ -148,6 +155,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 2d) Training reward plot
         self.training_plot = pg.PlotWidget(title="Training Reward (custom_run.py)")
+        legend_training = self.training_plot.addLegend()
+        legend_training.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
         self.training_plot.showGrid(x=True, y=True)
         self.training_plot.setBackground('w')
         vlay.addWidget(self.training_plot)
@@ -181,13 +190,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 4a) Setup a QTimer to refresh the high-speed plots at 10 Hz
         self._refresh_timer_HS = QtCore.QTimer(self)
-        self._refresh_timer_HS.setInterval(100)        # 100 ms => 10 Hz
+        self._refresh_timer_HS.setInterval(100)  # 100 ms => 10 Hz
         self._refresh_timer_HS.timeout.connect(self._refresh_plots_hs)
         self._refresh_timer_HS.start()
 
         # 4a) Setup a QTimer to refresh the low-speed plots at 1 Hz
         self._refresh_timer_LS = QtCore.QTimer(self)
-        self._refresh_timer_LS.setInterval(1000)        # 1000 ms => 1 Hz
+        self._refresh_timer_LS.setInterval(1000)  # 1000 ms => 1 Hz
         self._refresh_timer_LS.timeout.connect(self._refresh_plots_ls)
         self._refresh_timer_LS.start()
 
@@ -240,13 +249,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_evaluation(msg)
 
     def _update_evaluation(self, msg):
-        self.log.debug("GUI: _update_evaluation called")
         self.evaluation_count += 1
         self.evaluation_x.append(self.evaluation_count)
 
         data_list = self.engine_data['evaluation error']
         data_list.append(np.abs(msg["state"][0] - msg["target"]))
-        self.log.debug("GUI: _update_evaluation finished")
 
     def _update_engine(self, msg):
         # self.log.debug(f"GUI: In _update_engine.")
@@ -258,7 +265,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "imep": msg["state"][0],
             "mprr": msg["state"][1],
             "target imep": msg["target"],
-            "mean sampled imep": mean(self.engine_data['target imep']) if list(self.engine_data['target imep']) != [] else 0,
+            "mean sampled imep": mean(self.engine_data['target imep']) if list(
+                self.engine_data['target imep']) != [] else 0,
         }
 
         # if list(self.engine_data['target imep']) is not []:
