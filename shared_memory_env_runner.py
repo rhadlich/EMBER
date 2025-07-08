@@ -8,13 +8,18 @@ import os
 import gzip
 import time
 
+from ray.rllib.models.torch.torch_distributions import (
+    TorchSquashedGaussian
+)
+
 from ray.rllib.core import (
     COMPONENT_RL_MODULE,
     DEFAULT_AGENT_ID,
     DEFAULT_MODULE_ID,
     DEFAULT_POLICY_ID,
     COMPONENT_ENV_TO_MODULE_CONNECTOR,
-    COMPONENT_MODULE_TO_ENV_CONNECTOR
+    COMPONENT_MODULE_TO_ENV_CONNECTOR,
+    Columns
 )
 from ray.rllib.env import INPUT_ENV_SPACES, INPUT_ENV_SINGLE_SPACES
 from ray.rllib.env.env_runner import EnvRunner
@@ -49,6 +54,7 @@ from minion import (
     set_indices,
     flatten_obs_onehot
 )
+from utils import ActionAdapter, get_action_dist
 
 import logging
 import logging_setup
@@ -59,7 +65,7 @@ from pprint import pformat
 def _run_minion(policy_shm_name: str,
                 flag_shm_name: str,
                 ep_shm_name: str,
-                episode_shm_properties: dict,
+                config,
                 logger,
                 ) -> None:
     """
@@ -67,7 +73,7 @@ def _run_minion(policy_shm_name: str,
     """
     logger.debug("IN _RUN_MINION NOW.")
     logger.debug(f"_run_minion called by PID: {os.getpid()}")
-    minion.main(policy_shm_name, flag_shm_name, ep_shm_name, episode_shm_properties)
+    minion.main(policy_shm_name, flag_shm_name, ep_shm_name, config)
 
 
 def _decode_obs(obs):
@@ -153,6 +159,15 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         )
         self.module = module_spec.build()
 
+        # get distribution class for action sampling
+        self.action_dist_cls = self.module.get_inference_action_dist_cls()
+        self.logger.debug(f"EnvRunner: action_dist_cls -> {self.action_dist_cls}")
+
+        # check if observation and action spaces are discrete
+        self.obs_is_discrete = self.config.env_config["obs_is_discrete"]
+        self.action_adapter = ActionAdapter(self.config.action_space)
+        self.act_is_discrete = (self.action_adapter.mode != "continuous")
+
         self.metrics = MetricsLogger()
 
         self._episode_chunks_to_return: Optional[List[SingleAgentEpisode]] = None
@@ -188,7 +203,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             self.TOTAL_SIZE_BYTES = self.config.env_config["ep_shm_properties"]["TOTAL_SIZE_BYTES"]
             self.STATE_ACTION_DIMS = self.config.env_config["ep_shm_properties"]["STATE_ACTION_DIMS"]
             self.BYTES_PER_FLOAT = self.config.env_config["ep_shm_properties"]["BYTES_PER_FLOAT"]
-            self.action_onehot_size = self.config.env_config["ep_shm_properties"]["action_onehot_size"]
+            self.action_dist_size = self.config.env_config["ep_shm_properties"]["action_dist_size"]
             self.episode_shm = shared_memory.SharedMemory(
                 create=True,
                 name=self.config.env_config["ep_shm_properties"].get("name", 'episodes'),
@@ -215,7 +230,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                 self.policy_shm_name,
                 self.flag_shm_name,
                 self.episode_shm_name,
-                self.config.env_config["ep_shm_properties"],
+                self.config,
                 self.logger,
             )
 
@@ -301,7 +316,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
     def get_metrics(self):
         # Compute per-episode metrics (only on already completed episodes).
-        # self.logger.debug("EnvRunner: Called get_metrics()")
+        # self.logger.debug("EnvRunner (get_metrics): Called get_metrics()")
 
         # self.logger.debug(f"EnvRunner(get_metrics): weights_seq_no -> {self._weights_seq_no}.")
 
@@ -315,12 +330,72 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             episode_return = eps.get_return()
             episode_duration_s = eps.get_duration_s()
 
+            # self.logger.debug("EnvRunner (get_metrics): Cleared older stuff")
+
+            if not self.act_is_discrete:
+                dist_inputs = torch.as_tensor(
+                    eps.get_extra_model_outputs(Columns.ACTION_DIST_INPUTS)
+                )  # shape [T, 2*k]
+                old_logp = torch.as_tensor(
+                    eps.get_extra_model_outputs(Columns.ACTION_LOGP)
+                )  # shape [T]
+                actions = torch.as_tensor(np.array(eps.actions))  # shape [T, action_dim]
+
+                with torch.no_grad():
+                    self.low_t = torch.as_tensor(self.config.action_space.low, dtype=torch.float32)
+                    self.high_t = torch.as_tensor(self.config.action_space.high, dtype=torch.float32)
+
+                    # Reconstruct the old‐policy log‐probs
+                    mu, log_sig = dist_inputs.chunk(2, dim=-1)
+                    beh_dist = get_action_dist(
+                        action_dist_cls=self.action_dist_cls,
+                        mu=torch.as_tensor(mu, dtype=torch.float32),
+                        std=torch.exp(torch.as_tensor(log_sig, dtype=torch.float32)),
+                        low=self.low_t,
+                        high=self.high_t,
+                    )
+                    logp_re = beh_dist.logp(actions)
+
+                    # Compute the new‐policy log‐probs by doing a forward pass
+                    # through the RLModule that the runner already holds:
+                    # self.logger.debug(f"EnvRunner (get_metrics): obs.shape={np.array(eps.observations[1:]).shape}")
+                    # self.logger.debug(f"EnvRunner (get_metrics): obs={np.array(eps.observations[1:])}")
+                    fwd_out = self.module.forward_inference({"obs": torch.as_tensor(np.array(eps.observations[1:]))})
+                    curr_dist_inputs = fwd_out[Columns.ACTION_DIST_INPUTS]
+                    mu, log_sig = curr_dist_inputs.chunk(2, dim=-1)
+                    cur_dist = get_action_dist(
+                        action_dist_cls=self.action_dist_cls,
+                        mu=torch.as_tensor(mu, dtype=torch.float32),
+                        std=torch.exp(torch.as_tensor(log_sig, dtype=torch.float32)),
+                        low=self.low_t,
+                        high=self.high_t,
+                    )
+                    cur_logp = cur_dist.logp(actions)
+
+                # convert back to numpy
+                logp_re = logp_re.numpy()
+                old_logp = old_logp.numpy()
+                cur_logp = cur_logp.numpy()
+
+                # Now our three metrics:
+                ratio = np.exp(cur_logp - old_logp)
+                ratio_max = float(ratio.max())
+                ratio_p99 = float(np.quantile(ratio, 0.99))
+                delta_lp = float(np.mean(np.abs(logp_re - old_logp)))
+                extra = {"ratio_max": ratio_max, "ratio_p99": ratio_p99, "delta_lp": delta_lp}
+            else:
+                extra = None
+
+            # self.logger.debug("EnvRunner (get_metrics): Cleared new stuff")
+
             # self.logger.debug(f"EnvRunner(get_metrics): episode length, return, and duration: "
             #                   f"{episode_length}, {episode_return}, {episode_duration_s}")
 
             self._log_episode_metrics(
-                episode_length, episode_return, episode_duration_s
+                episode_length, episode_return, episode_duration_s, extra=extra
             )
+
+            # self.logger.debug("EnvRunner (get_metrics): Cleared _log_episode_metrics()")
 
         # Now that we have logged everything, clear cache of done episodes.
         self._done_episodes_for_metrics.clear()
@@ -346,11 +421,11 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         }
 
     def get_state(
-        self,
-        components: Optional[Union[str, Collection[str]]] = None,
-        *,
-        not_components: Optional[Union[str, Collection[str]]] = None,
-        **kwargs,
+            self,
+            components: Optional[Union[str, Collection[str]]] = None,
+            *,
+            not_components: Optional[Union[str, Collection[str]]] = None,
+            **kwargs,
     ) -> StateDict:
 
         # self.logger.debug("EnvRunner: Called get_state()")
@@ -371,11 +446,11 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             )
             state[WEIGHTS_SEQ_NO] = self._weights_seq_no
         if self._check_component(
-            COMPONENT_ENV_TO_MODULE_CONNECTOR, components, not_components
+                COMPONENT_ENV_TO_MODULE_CONNECTOR, components, not_components
         ):
             state[COMPONENT_ENV_TO_MODULE_CONNECTOR] = self._env_to_module.get_state()
         if self._check_component(
-            COMPONENT_MODULE_TO_ENV_CONNECTOR, components, not_components
+                COMPONENT_MODULE_TO_ENV_CONNECTOR, components, not_components
         ):
             state[COMPONENT_MODULE_TO_ENV_CONNECTOR] = self._module_to_env.get_state()
 
@@ -403,8 +478,8 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                     rl_module_state = ray.get(rl_module_state)
 
                 if (
-                    isinstance(rl_module_state, dict)
-                    and DEFAULT_MODULE_ID in rl_module_state
+                        isinstance(rl_module_state, dict)
+                        and DEFAULT_MODULE_ID in rl_module_state
                 ):
                     rl_module_state = rl_module_state[DEFAULT_MODULE_ID]
 
@@ -457,7 +532,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         )
 
     # Helper functions
-#   #------------------------------------------------------------------------#
+    #   #------------------------------------------------------------------------#
     def _get_shm_references(self):
         while True:
             try:
@@ -477,7 +552,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
         # get expected ort_compressed length from header
         _len_ort_expected = struct.unpack_from("<I", self.p_buf, 0)
-        header_offset = 4   # number of bytes in the int
+        header_offset = 4  # number of bytes in the int
 
         # sanity check to make sure the size of the weights vector is as expected
         assert _len_ort_expected[0] == len(ort_raw), (
@@ -490,7 +565,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
         # save new model weights to buffer
         self.f_buf[0] = 1  # set lock flag to locked
-        self.p_buf[header_offset:header_offset+len(ort_raw)] = ort_raw  # insert compressed weights
+        self.p_buf[header_offset:header_offset + len(ort_raw)] = ort_raw  # insert compressed weights
         self.f_buf[0] = 0  # set lock flag to unlocked
         self.f_buf[1] = 1  # set weights-available flag to 1 (true)
 
@@ -509,11 +584,11 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         if ray.wait([self._minion_ref], timeout=0)[0]:
             ray.cancel(self._minion_ref)
 
-    def _log_episode_metrics(self, length, ret, sec):
+    def _log_episode_metrics(self, length, ret, sec, **kwargs):
         # Log general episode metrics.
         # To mimic the old API stack behavior, we'll use `window` here for
         # these particular stats (instead of the default EMA).
-        win = self.config.metrics_num_episodes_for_smoothing        # default is 100 episodes for smoothing
+        win = self.config.metrics_num_episodes_for_smoothing  # default is 100 episodes for smoothing
         self.metrics.log_value(EPISODE_LEN_MEAN, length, window=win)
         self.metrics.log_value(EPISODE_RETURN_MEAN, ret, window=win)
         self.metrics.log_value(EPISODE_DURATION_SEC_MEAN, sec, window=win)
@@ -531,6 +606,17 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         self.metrics.log_value(EPISODE_RETURN_MIN, ret, reduce="min", window=win)
         self.metrics.log_value(EPISODE_LEN_MAX, length, reduce="max", window=win)
         self.metrics.log_value(EPISODE_RETURN_MAX, ret, reduce="max", window=win)
+
+        if kwargs["extra"]:
+            extra = kwargs["extra"]
+            assert isinstance(extra, dict)
+            try:
+                # extra
+                self.metrics.log_value("ratio_max", extra["ratio_max"], reduce="max")
+                self.metrics.log_value("ratio_p99", extra["ratio_p99"])
+                self.metrics.log_value("delta_logp", extra["delta_lp"])
+            except KeyError:
+                raise NotImplementedError(f"Extra logs not implemented, parameters available are {kwargs.keys()}")
 
     # Helper functions for episode ring buffer manipulation
     def _read_batch(self):
@@ -596,7 +682,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         # if any of these are true it means the last batch read is the most updated full batch
         if write_idx == read_idx:
             # self.logger.debug("EnvRunner(_read_batch): Returning None.")
-            set_indices(self.ep_arr, read_idx, 'r', self.f_buf)   # to unlock episode buffer
+            set_indices(self.ep_arr, read_idx, 'r', self.f_buf)  # to unlock episode buffer
             # self.logger.debug(f"EnvRunner(_read_batch): Done reading buffer, no episodes available. "
             #                   f"Final read index: {read_idx}.")
             return None  # ring empty
@@ -604,7 +690,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         # In case the write_idx has wrapped around and there are more full batches available
         elif write_idx < read_idx:
             # write_idx + 1 because indexing starts at 0.
-            num_batches = ((self.NUM_SLOTS-1) - read_idx) + write_idx + 1
+            num_batches = ((self.NUM_SLOTS - 1) - read_idx) + write_idx + 1
 
         # regular case where there are full batches available
         else:
@@ -622,6 +708,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             # extract data from ring
             data_start = slot_off + self.HEADER_SLOT_SIZE
             payload = np.copy(self.ep_arr[data_start: data_start + self.PAYLOAD_SIZE])  # extract data from array
+            assert payload.dtype == np.float32
 
             # extract initial state from front of payload and remove it so that shape is consistent for next step
             initial_state = payload[:self.STATE_ACTION_DIMS["state"]]
@@ -640,7 +727,10 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             )
 
             # add initial state
-            batch.add_env_reset(flatten_obs_onehot(_decode_obs(initial_state), self.imep_space, self.mprr_space))
+            batch.add_env_reset(
+                flatten_obs_onehot(_decode_obs(initial_state), self.imep_space, self.mprr_space) if self.obs_is_discrete
+                else initial_state,
+            )
 
             # get start and end indices of each component of the payload
             action_start = 0
@@ -652,7 +742,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             logp_start = obs_end
             logp_end = logp_start + self.STATE_ACTION_DIMS["logp"]
             dist_start = logp_end
-            dist_end = dist_start + self.STATE_ACTION_DIMS["action_onehot"]
+            dist_end = dist_start + self.STATE_ACTION_DIMS["action_dist_size"]
 
             # add one rollout at a time (i.e. one row in payload)
             for j, rollout in enumerate(payload):
@@ -660,13 +750,16 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                     action=rollout[action_start:action_end],
                     reward=np.squeeze(rollout[reward_start:reward_end]),
                     # observation !AFTER! taking "action"
-                    observation=flatten_obs_onehot(_decode_obs(rollout[obs_start:obs_end]),
-                                                    self.imep_space, self.mprr_space),
+                    observation=(
+                        flatten_obs_onehot(_decode_obs(rollout[obs_start:obs_end]),
+                                           self.imep_space, self.mprr_space) if self.obs_is_discrete
+                        else rollout[obs_start:obs_end]
+                    ),
                     terminated=bool(terminateds[j]),
                     truncated=bool(truncateds[j]),
                     extra_model_outputs={
-                        "action_logp": np.squeeze(rollout[logp_start:logp_end]),
-                        "action_dist_inputs": rollout[dist_start:dist_end],
+                        Columns.ACTION_LOGP: np.squeeze(rollout[logp_start:logp_end]),
+                        Columns.ACTION_DIST_INPUTS: rollout[dist_start:dist_end],
                     }
                 )
 

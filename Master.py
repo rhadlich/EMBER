@@ -10,7 +10,7 @@ import os
 
 import gymnasium as gym
 from gymnasium import spaces
-from gymCustom import EngineEnv, reward_fn
+from gymCustom import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
 
 from shared_memory_env_runner import SharedMemoryEnvRunner
 # from ray.rllib.utils.test_utils import (
@@ -33,6 +33,8 @@ from torch_rl_modules.impala_rl_modules import ImpalaMlpModule
 import logging
 import logging_setup
 
+from custom_learner import BehaviourAuditLearner
+
 
 parser = custom_args(
     default_reward=450.0, default_iters=200, default_timesteps=2000000
@@ -46,7 +48,7 @@ parser.set_defaults(
     num_learners=0,  # only have the learner in the main driver
     num_cpus_per_learner=0,  # this will be ignored if num_learners is 0
     num_cpus=3,  # for ray_init call inside test_utils
-    algo='IMPALA',
+    algo='SAC',
 )
 parser.add_argument(
     "--policy_shm_name",
@@ -68,43 +70,38 @@ if __name__ == "__main__":
     logger.info(f"MASTER, PID={os.getpid()}")
 
     # make environment to have access to observation and action spaces
-    env = EngineEnv(reward=reward_fn)
+    env = EngineEnvContinuous(reward=reward_fn)
     obs_space = env.observation_space
     action_space = env.action_space
-    imep_space = env.imep_space
-    mprr_space = env.mprr_space
 
-    # patch up the dimensions issue when running a discrete observation space
-    flat_dim = len(imep_space)
-    obs_space_onehot = spaces.Box(
-            low=0.0, high=1.0, shape=(flat_dim,), dtype=np.float32
-        )
+    if isinstance(obs_space, spaces.Discrete):
+        imep_space = env.imep_space
+        mprr_space = env.mprr_space
 
-    # # define action and observation spaces
-    # imep_space = np.arange(1.6, 4.1, 0.1)
-    # mprr_space = np.arange(0, 15, 0.5)
-    # # flat_dim = 2*len(imep_space) + len(mprr_space)
-    # flat_dim = len(imep_space)
-    # obs_space = spaces.Box(
-    #         low=0.0, high=1.0, shape=(flat_dim,), dtype=np.float32
-    #     )
-    # inj_p_space = np.arange(450, 950, 100)
-    # soi_space = np.arange(-5.6, 2.7, 0.1)
-    # inj_d_space = np.arange(0.31, 0.64, 0.01)
-    # action_space = spaces.Tuple((
-    #     # spaces.Discrete(len(inj_p_space)),    # will be kept constant
-    #     spaces.Discrete(len(soi_space)),
-    #     spaces.Discrete(len(inj_d_space))
-    # ))
+        # patch up the dimensions issue when running a discrete observation space
+        flat_dim = len(imep_space)
+        obs_space_onehot = spaces.Box(
+                low=0.0, high=1.0, shape=(flat_dim,), dtype=np.float32
+            )
+        obs_is_discrete = True
+    elif isinstance(obs_space, spaces.Box):
+        obs_space_onehot = None
+        imep_space = env.imep_lims
+        mprr_space = env.mprr_lims
+        obs_is_discrete = False
+    else:
+        raise NotImplementedError(f"Unsupported observation space {obs_space}")
 
     adapter = ActionAdapter(action_space)
 
-    # get action space size in one-hot representation. will need this to create
+    # get action space size in one-hot representation (if discrete). will need this to create
     # the episode buffer such that it can hold the probability distribution
     if adapter.mode in ("discrete1", "multidiscrete"):
-        action_onehot_size = int(sum(adapter.nvec))
+        # logits will be the same length as action_onehot_size
+        action_dist_size = int(sum(adapter.nvec))
     else:
-        action_onehot_size = 0
+        # non-discrete action space, need mean and standard deviation of the distribution instead of logits
+        action_dist_size = 2*action_space.shape[0]
 
     # Define name and properties of episode ring buffer to pass down to EnvRunner
     # define the size of each rollout tuple
@@ -113,7 +110,7 @@ if __name__ == "__main__":
         "action": 2,
         "reward": 1,
         "state": 1,                             # this will be the next state AFTER taking "action"
-        "action_onehot": action_onehot_size,
+        "action_dist_size": action_dist_size,
         "logp": 1                               # has to be scalar
     }  # the length of the vector of each component of the rollout
     BATCH_SIZE = 32  # number of rollouts per batch (episode)
@@ -131,7 +128,7 @@ if __name__ == "__main__":
     SLOT_SIZE = HEADER_SLOT_SIZE + PAYLOAD_SIZE
     TOTAL_SIZE = HEADER_SIZE + NUM_SLOTS*SLOT_SIZE
     TOTAL_SIZE_BYTES = int(TOTAL_SIZE * bytes_per_float)
-    logger.debug(f"action_onehot_size: {action_onehot_size}")
+    logger.debug(f"action_dist_size: {action_dist_size}")
     logger.debug(f"ELEMENTS_PER_ROLLOUT: {ELEMENTS_PER_ROLLOUT}")
     logger.debug(f"PAYLOAD_SIZE: {PAYLOAD_SIZE}")
     logger.debug(f"SLOT_SIZE: {SLOT_SIZE}")
@@ -151,13 +148,13 @@ if __name__ == "__main__":
         "STATE_ACTION_DIMS": dims,
         "BYTES_PER_FLOAT": bytes_per_float,
         "name": "episodes",
-        "action_onehot_size": action_onehot_size,
+        "action_dist_size": action_dist_size,
     }
 
     # wrap custom RLModule in the module spec
     spec = RLModuleSpec(
         module_class=ImpalaMlpModule,
-        observation_space=obs_space_onehot,
+        observation_space=obs_space_onehot or obs_space,
         action_space=action_space,
     )
 
@@ -171,14 +168,17 @@ if __name__ == "__main__":
             enable_env_runner_and_connector_v2=True,  # turn connector-v2 on
         )
         .environment(
-            observation_space=obs_space_onehot,
+            observation_space=obs_space_onehot or obs_space,
             action_space=action_space,
+            normalize_actions=(True if adapter.mode == "continuous" else False),
+            clip_actions=(True if adapter.mode == "continuous" else False),
             clip_rewards=False,
             env_config={"policy_shm_name": args.policy_shm_name,
                         "flag_shm_name": args.flag_shm_name,
                         "ep_shm_properties": ep_shm_properties,
                         "imep_space": imep_space,
                         "mprr_space": mprr_space,
+                        "obs_is_discrete": obs_is_discrete,
                         },
         )
         .env_runners(
@@ -193,10 +193,34 @@ if __name__ == "__main__":
         .training(
             num_epochs=10,
             train_batch_size_per_learner=1,
-            vtrace_clip_rho_threshold=10,
-            vtrace_clip_pg_rho_threshold=5,
+            model={"free_log_std": True},
+            q_model_config={
+                "fcnet_hiddens": [64, 64],
+                "fcnet_activation": "relu",
+                "post_fcnet_hiddens": [],
+                "post_fcnet_activation": None,
+                "custom_model": None,  # Use this to define custom Q-model(s).
+                "custom_model_config": {},
+            },
+            policy_model_config={
+                "fcnet_hiddens": [128, 128],
+                "fcnet_activation": "relu",
+                "post_fcnet_hiddens": [],
+                "post_fcnet_activation": None,
+                "custom_model": None,  # Use this to define a custom policy model.
+                "custom_model_config": {},
+            },
+            initial_alpha=0.1,
+            alpha_lr=3e-5,
+            actor_lr=3e-5,
+            critic_lr=3e-5,
+            tau=0.001,
+            # learner_class=BehaviourAuditLearner,
+            # vtrace_clip_rho_threshold=10,
+            # vtrace_clip_pg_rho_threshold=5,
         )
-        .rl_module(rl_module_spec=spec)
+        # .callbacks(BehaviourAudit)
+        # .rl_module(rl_module_spec=spec)
         # .rl_module(model_config={"vf_share_layers": False})
         # .rl_module(rl_module_spec=RLModuleSpec(
         #     observation_space=obs_space,

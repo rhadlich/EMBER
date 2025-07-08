@@ -1,12 +1,13 @@
 import sys
 import os
+import time
 import subprocess
 from collections import deque
 from statistics import mean
 
 from PyQt6 import QtCore, QtWidgets
 import pyqtgraph as pg
-from pyqtgraph import mkBrush
+from pyqtgraph import mkBrush, ViewBox, PlotCurveItem, DateAxisItem
 import zmq
 import numpy as np
 
@@ -90,6 +91,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_count = 0
         self.evaluation_count = 0
         self.evaluation_x = deque(maxlen=self._max_points)
+        self.policy_x = {
+            'delta in minion': deque(maxlen=self._max_points),
+            'ratio_max': deque(maxlen=self._max_points),
+        }
 
         # manually set fields to be plotted
         self.engine_data["imep"] = deque(maxlen=self._max_points)
@@ -97,6 +102,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_data["target imep"] = deque(maxlen=self._max_points)
         self.engine_data["mean sampled imep"] = deque(maxlen=self._max_points)
         self.engine_data["evaluation error"] = deque(maxlen=self._max_points)
+        self.policy_data = {
+            'delta in minion': deque(maxlen=self._max_points),
+            'ratio_max': deque(maxlen=self._max_points),
+        }
+        # self.engine_data["ratio_p99"] = deque(maxlen=self._max_points)
 
         # training: one curve for reward vs iteration
         self.training_curve = None
@@ -161,6 +171,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.training_plot.setBackground('w')
         vlay.addWidget(self.training_plot)
 
+        # 2e) Policy update plots
+        date_axis = DateAxisItem(orientation='bottom')
+        self.t0 = time.time()
+        self.policy_plot = pg.PlotWidget(
+            axisItems={'bottom': date_axis},
+            title="Policy Update"
+        )
+        legend_policy = self.policy_plot.addLegend()
+        legend_policy.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
+        self.policy_plot.showGrid(x=True, y=True)
+        self.policy_plot.setBackground('w')
+        vlay.addWidget(self.policy_plot)
+        self.policy_plot.showAxis('right')
+        self.policy_plot.getAxis('right').setLabel('ratio_max', **{'color': self.plot_colors[6]})
+        self.ratio_vb = ViewBox()
+        self.policy_plot.scene().addItem(self.ratio_vb)
+        self.policy_plot.getAxis('right').linkToView(self.ratio_vb)
+        self.ratio_vb.setXLink(self.policy_plot.getViewBox())
+        self.policy_plot.getViewBox().sigResized.connect(
+            lambda: self.ratio_vb.setGeometry(self.policy_plot.getViewBox().sceneBoundingRect())
+        )
+        # add curves
+        pen = pg.mkPen(color=self.plot_colors[5], width=self.plot_line_width)
+        curve = self.policy_plot.plot(name='delta in minion', pen=pen)
+        self.engine_curves['delta in minion'] = curve
+        pen = pg.mkPen(color=self.plot_colors[6], width=self.plot_line_width)
+        curve = PlotCurveItem(name='ratio_max', pen=pen)
+        self.ratio_vb.addItem(curve)
+        self.engine_curves['ratio_max'] = curve
+        # pen = pg.mkPen(color=self.plot_colors[6], width=self.plot_line_width)
+        # curve = self.policy_plot.plot(name='ratio_p99', pen=pen)
+        # self.engine_curves['ratio_p99'] = curve
+
         # ── Insert a horizontal layout at the top for controls ──
         controls = QtWidgets.QHBoxLayout()
         self.stop_btn = QtWidgets.QPushButton("Stop Processes")
@@ -176,6 +219,7 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(self.safety_plot)
         main_layout.addWidget(self.evaluation_plot)
         main_layout.addWidget(self.training_plot)
+        main_layout.addWidget(self.policy_plot)
         self.setCentralWidget(central)
 
         # 3) Start ZMQ listener thread
@@ -201,6 +245,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timer_LS.start()
 
         self.log.debug("GUI: Done with init.")
+
+    def update_views(self):
+        """When the main plot is resized, update the secondary VB to match."""
+        self.ratio_vb.setGeometry(self.policy_plot.getViewBox().sceneBoundingRect())
+        self.ratio_vb.linkedViewChanged(self.policy_plot.getViewBox(), self.ratio_vb.XAxis)
 
     def stop_processes(self):
         if self.listener.isRunning():
@@ -235,6 +284,14 @@ class MainWindow(QtWidgets.QMainWindow):
             list(self.evaluation_x),
             list(self.engine_data['evaluation error'])
         )
+        self.engine_curves['delta in minion'].setData(
+            list(self.policy_x['delta in minion']),
+            list(self.policy_data['delta in minion'])
+        )
+        self.engine_curves['ratio_max'].setData(
+            list(self.policy_x['ratio_max']),
+            list(self.policy_data['ratio_max'])
+        )
         if self.training_curve:
             self.training_curve.setData(self.training_x, self.training_y)
 
@@ -247,13 +304,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_training(msg)
         elif topic == "evaluation":
             self._update_evaluation(msg)
+        elif topic == "policy":
+            self._update_policy(msg)
+
+    def _update_policy(self, msg):
+        self.log.debug(f"GUI: In _update_policy.")
+        t = time.time() - self.t0
+
+        for key in msg.keys():
+            if key != "topic":
+                # self.log.debug(f"GUI: In _update_policy key: {key}, value = {msg[key]}")
+                self.policy_data[key].append(msg[key])
+                self.policy_x[key].append(t)
+        # self.log.debug(f"GUI: Done with _update_evaluation.")
 
     def _update_evaluation(self, msg):
+        self.log.debug(f"GUI: In _update_evaluation.")
         self.evaluation_count += 1
         self.evaluation_x.append(self.evaluation_count)
 
         data_list = self.engine_data['evaluation error']
         data_list.append(np.abs(msg["current imep"] - msg["target"]))
+        # self.log.debug(f"GUI: Done with _update_evaluation.")
 
     def _update_engine(self, msg):
         # self.log.debug(f"GUI: In _update_engine.")

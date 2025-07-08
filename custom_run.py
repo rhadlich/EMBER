@@ -59,6 +59,8 @@ from pathlib import Path
 import logging
 import logging_setup
 
+from custom_callbacks import walk_keys
+
 
 def on_sigterm(signum, frame):
     raise KeyboardInterrupt
@@ -76,8 +78,13 @@ def _get_current_onnx_model(module: RLModule,
     # if os.path.exists(outdir):
     #     shutil.rmtree(outdir)
     assert module.get_ctor_args_and_kwargs()[1]["inference_only"]
+
+    # act_dim = module.action_space.shape[0]
+    # obs_dim = module.observation_space.shape[0]
+    # dummy_obs = torch.randn(1, obs_dim, dtype=torch.float32)
+
     torch.onnx.export(module,
-                      {"batch":{"obs": torch.randn(1, *module.observation_space.shape)}},
+                      {"batch": {"obs": torch.randn(1, *module.observation_space.shape)}},
                       outdir,
                       export_params=True)
     # convert .onnx to .ort (optimized for faster loading and inference in the minion)
@@ -95,17 +102,17 @@ def _get_current_onnx_model(module: RLModule,
 
 
 def run_rllib_shared_memory(
-    base_config: "AlgorithmConfig",
-    args: Optional[argparse.Namespace] = None,
-    *,
-    stop: Optional[Dict] = None,
-    success_metric: Optional[Dict] = None,
-    trainable: Optional[Type] = None,
-    tune_callbacks: Optional[List] = None,
-    keep_config: bool = False,
-    keep_ray_up: bool = False,
-    scheduler=None,
-    progress_reporter=None,
+        base_config: "AlgorithmConfig",
+        args: Optional[argparse.Namespace] = None,
+        *,
+        stop: Optional[Dict] = None,
+        success_metric: Optional[Dict] = None,
+        trainable: Optional[Type] = None,
+        tune_callbacks: Optional[List] = None,
+        keep_config: bool = False,
+        keep_ray_up: bool = False,
+        scheduler=None,
+        progress_reporter=None,
 ) -> Union[ResultDict, tune.result_grid.ResultGrid]:
     """Given an algorithm config and some command line args, runs an experiment.
 
@@ -176,7 +183,6 @@ def run_rllib_shared_memory(
 
     # pass main driver PID down to EnvRunner
 
-
     logger.debug("custom_run: Started custom run function")
 
     # Initialize Ray.
@@ -241,19 +247,19 @@ def run_rllib_shared_memory(
             # Number of actual Learner instances (including the local Learner if
             # `num_learners=0`).
             num_actual_learners = (
-                args.num_learners
-                if args.num_learners is not None
-                else config.num_learners
-            ) or 1  # 1: There is always a local Learner, if num_learners=0.
+                                      args.num_learners
+                                      if args.num_learners is not None
+                                      else config.num_learners
+                                  ) or 1  # 1: There is always a local Learner, if num_learners=0.
             # How many were hard-requested by the user
             # (through explicit `--num-gpus-per-learner >= 1`).
             num_gpus_requested = (args.num_gpus_per_learner or 0) * num_actual_learners
             # Number of GPUs needed, if `num_gpus_per_learner=None` (auto).
             num_gpus_needed_if_available = (
-                args.num_gpus_per_learner
-                if args.num_gpus_per_learner is not None
-                else 1
-            ) * num_actual_learners
+                                               args.num_gpus_per_learner
+                                               if args.num_gpus_per_learner is not None
+                                               else 1
+                                           ) * num_actual_learners
             # Define compute resources used.
             config.resources(num_gpus=0)  # old API stack setting
             if args.num_learners is not None:
@@ -321,25 +327,23 @@ def run_rllib_shared_memory(
     if args.no_tune:
         assert not args.as_test and not args.as_release_test
 
-        # create flag shared memory block here and set to lock to serve as a stopper for the minion
-        f_shm = shared_memory.SharedMemory(
-            create=True,
-            name=args.flag_shm_name,
-            size=3  # first byte for access control (lock flag), second byte for whether new weights are available,
-                    # third byte is the flag for minion collecting rollouts
-        )
-        f_buf = f_shm.buf
-
+        # create flag shared memory block here
         # flag buffer has 4 flags:
         #   0 -> weights lock flag (locked_state=1)
         #   1 -> weights available flag (true_state=1)
         #   2 -> minion data collection flag (has it started collecting data, true_state=1)
         #   3 -> episode buffer lock flag (needed because of race conditions with reading and writing, locked_state=1)
+        f_shm = shared_memory.SharedMemory(
+            create=True,
+            name=args.flag_shm_name,
+            size=4,
+        )
+        f_buf = f_shm.buf
 
-        f_buf[0] = 1    # set weights lock flag to locked
-        f_buf[1] = 0    # set weights-available flag to false
-        f_buf[2] = 0    # set minion flag to false (minion has not started collecting rollouts)
-        f_buf[3] = 0    # set episode lock flag to unlocked
+        f_buf[0] = 1  # set weights lock flag to locked
+        f_buf[1] = 0  # set weights-available flag to false
+        f_buf[2] = 0  # set minion flag to false (minion has not started collecting rollouts)
+        f_buf[3] = 0  # set episode lock flag to unlocked
 
         logger.debug("custom_run: created flag memory buffer")
 
@@ -362,7 +366,7 @@ def run_rllib_shared_memory(
         p_shm = shared_memory.SharedMemory(
             create=True,
             name=args.policy_shm_name,
-            size=policy_nbytes+header_offset
+            size=policy_nbytes + header_offset
         )
 
         logger.debug("custom_run: created policy memory buffer")
@@ -374,7 +378,7 @@ def run_rllib_shared_memory(
 
         # store initial weights and remove lock flags
         struct.pack_into("<I", p_buf, 0, policy_nbytes)
-        p_buf[header_offset:header_offset+len(ort_raw)] = ort_raw  # insert raw weights
+        p_buf[header_offset:header_offset + len(ort_raw)] = ort_raw  # insert raw weights
         f_buf[0] = 0  # set lock flag to unlocked
         f_buf[1] = 1  # set weights-available flag to 1 (true)
 
@@ -393,40 +397,44 @@ def run_rllib_shared_memory(
         # logger.debug(
         #     f"custom_run: circular_buffer_iterations_per_batch -> {algo.config.circular_buffer_iterations_per_batch}")
         # logger.debug(f"custom_run: target_network_update_freq -> {algo.config.target_network_update_freq}")
-        logger.debug(
-            f"custom_run: num_aggregator_actors_per_learner -> {algo.config.num_aggregator_actors_per_learner}")
-        logger.debug(
-            f"custom_run: num_envs_per_env_runner -> {algo.config.num_envs_per_env_runner}")
-        logger.debug(f"custom_run: _skip_learners -> {algo.config._skip_learners}")
-        logger.debug(f"custom_run: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
-        logger.debug(f"custom_run: broadcast_env_runner_states? {algo.config.broadcast_env_runner_states}")
-        logger.debug(f"custom_run: num_learners -> {algo.config.num_learners}")
-        logger.debug(f"custom_run: min_sample_timesteps_per_iteration -> {algo.config.min_sample_timesteps_per_iteration}")
+        # logger.debug(
+        #     f"custom_run: num_aggregator_actors_per_learner -> {algo.config.num_aggregator_actors_per_learner}")
+        # logger.debug(
+        #     f"custom_run: num_envs_per_env_runner -> {algo.config.num_envs_per_env_runner}")
+        # logger.debug(f"custom_run: _skip_learners -> {algo.config._skip_learners}")
+        # logger.debug(f"custom_run: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
+        # logger.debug(f"custom_run: broadcast_env_runner_states? {algo.config.broadcast_env_runner_states}")
+        # logger.debug(f"custom_run: num_learners -> {algo.config.num_learners}")
+        # logger.debug(f"custom_run: min_sample_timesteps_per_iteration -> {algo.config.min_sample_timesteps_per_iteration}")
         # logger.debug(f"custom_run: min_env_steps_per_iteration -> {algo.config.min_env_steps_per_iteration}")
         # logger.debug(f"custom_run: min_time_s_per_iteration -> {algo.config.min_time_s_per_iteration}")
 
         merge = (
-            not algo.config.enable_env_runner_and_connector_v2
-            and algo.config.use_worker_filter_stats
-        ) or (
-            algo.config.enable_env_runner_and_connector_v2
-            and (
-                algo.config.merge_env_runner_states is True
-                or (
-                    algo.config.merge_env_runner_states == "training_only"
-                    and not algo.config.in_evaluation
+                        not algo.config.enable_env_runner_and_connector_v2
+                        and algo.config.use_worker_filter_stats
+                ) or (
+                        algo.config.enable_env_runner_and_connector_v2
+                        and (
+                                algo.config.merge_env_runner_states is True
+                                or (
+                                        algo.config.merge_env_runner_states == "training_only"
+                                        and not algo.config.in_evaluation
+                                )
+                        )
                 )
-            )
-        )
         broadcast = (
-            not algo.config.enable_env_runner_and_connector_v2
-            and algo.config.update_worker_filter_stats
-        ) or (
-            algo.config.enable_env_runner_and_connector_v2
-            and algo.config.broadcast_env_runner_states
-        )
+                            not algo.config.enable_env_runner_and_connector_v2
+                            and algo.config.update_worker_filter_stats
+                    ) or (
+                            algo.config.enable_env_runner_and_connector_v2
+                            and algo.config.broadcast_env_runner_states
+                    )
         logger.debug(f"custom_run: merge -> {merge}")
         logger.debug(f"custom_run: broadcast -> {broadcast}")
+
+        module = algo.get_module()
+        dist_cls = module.get_inference_action_dist_cls()
+        logger.debug(f"policy dist_class: {dist_cls}, {dist_cls.__name__}")
 
         # set up data broadcasting to GUI
         ctx = zmq.Context()
@@ -441,6 +449,43 @@ def run_rllib_shared_memory(
 
                 # perform one logical iteration of training
                 results = algo.train()
+
+                state = algo.learner_group.get_state(components="learner")
+                if 'metrics_logger' in state['learner']:
+                    stats = state['learner']['metrics_logger']['stats']
+                    try:
+                        logger.debug(f"step {train_iter:>4}: "
+                                     f"Qloss={list(stats['default_policy--qf_loss']['values'])} | "
+                                     f"Ploss={list(stats['default_policy--policy_loss']['values'])} | "
+                                     f"α={list(stats['default_policy--alpha_value']['values'])} "
+                                     f"(αloss={list(stats['default_policy--alpha_loss']['values'])}) | "
+                                     f"Qµ={list(stats['default_policy--qf_mean']['values'])}"
+                                     )
+                    except Exception as e:
+                        logger.debug(f"could not print stats due to error {e}")
+
+                seq_learn = state["learner"]["weights_seq_no"]
+
+                logger.debug(f"custom_run: learner weights_seq_no="
+                             f"{seq_learn}")
+
+                # walk_keys(results)
+                # logger.debug(f"custom_run: results.keys()={results.keys()}.")
+                logger.debug("custom_run: printing BehaviourAudit.")
+                try:
+                    msg = {
+                        "topic": "policy",
+                        "ratio_max": float(results["env_runners"]["ratio_max"]),
+                    }
+                    # send results to be logged in the GUI
+                    pub.send_json(msg)
+
+                    logger.debug(f'ratio_max={results["env_runners"]["ratio_max"]}, '
+                                 f'ratio_p99={results["env_runners"]["ratio_p99"]}, '
+                                 f'delta_logp={results["env_runners"]["delta_logp"]}')
+                except KeyError:
+                    logger.debug("Could not find the keys in results dictionary")
+
 
                 # attempt at debugging
                 # logger.debug("custom_run: ran algo.train()")
@@ -457,13 +502,13 @@ def run_rllib_shared_memory(
                 # logger.debug(f"custom_run: tentative update frequency: {algo.config.num_epochs * algo.config.minibatch_buffer_size}")
                 # logger.debug(f"custom_run: update math: {cur_ts - last_update}")
                 # logger.debug(f"custom_run: number of target updates: {target_updates}")
-                last_synch = algo.metrics.peek(
-                    "num_training_step_calls_since_last_synch_worker_weights",
-                )
-                logger.debug(f"custom_run: num training steps since last synch: {last_synch}")
-                logger.debug(f"custom_run: num_weights_broadcast -> {algo.metrics.peek('num_weight_broadcasts')}")
+                # last_synch = algo.metrics.peek(
+                #     "num_training_step_calls_since_last_synch_worker_weights",
+                # )
+                # logger.debug(f"custom_run: num training steps since last synch: {last_synch}")
+                # logger.debug(f"custom_run: num_weights_broadcast -> {algo.metrics.peek('num_weight_broadcasts')}")
 
-                msg = {"topic": "training", "iteration": train_iter}     # to send to GUI
+                msg = {"topic": "training", "iteration": train_iter}  # to send to GUI
 
                 # print results
                 if ENV_RUNNER_RESULTS in results:
@@ -499,11 +544,11 @@ def run_rllib_shared_memory(
     # Log results using WandB.
     tune_callbacks = tune_callbacks or []
     if hasattr(args, "wandb_key") and (
-        args.wandb_key is not None or WANDB_ENV_VAR in os.environ
+            args.wandb_key is not None or WANDB_ENV_VAR in os.environ
     ):
         wandb_key = args.wandb_key or os.environ[WANDB_ENV_VAR]
         project = args.wandb_project or (
-            args.algo.lower() + "-" + re.sub("\\W+", "-", str(config.env).lower())
+                args.algo.lower() + "-" + re.sub("\\W+", "-", str(config.env).lower())
         )
         tune_callbacks.append(
             WandbLoggerCallback(
@@ -612,8 +657,8 @@ def run_rllib_shared_memory(
                 "failures": {str(trial): 1} if not test_passed else {},
             }
             with open(
-                os.environ.get("TEST_OUTPUT_JSON", "/tmp/learning_test.json"),
-                "wt",
+                    os.environ.get("TEST_OUTPUT_JSON", "/tmp/learning_test.json"),
+                    "wt",
             ) as f:
                 try:
                     json.dump(json_summary, f)

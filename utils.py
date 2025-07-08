@@ -1,12 +1,43 @@
 import numpy as np
+import torch
 from ray.rllib.utils.numpy import softmax
 from gymnasium import spaces
+
+from typing import Union, Type
 
 from ray.rllib.models.torch.torch_distributions import (
     TorchCategorical,
     TorchMultiCategorical,
     TorchDiagGaussian,
+    TorchSquashedGaussian
 )
+from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
+
+import logging
+import logging_setup
+
+
+def get_action_dist(
+        action_dist_cls: Type[TorchDistributionWrapper],
+        mu: Union[float, "torch.Tensor"],
+        std: Union[float, "torch.Tensor"],
+        low: Union[float, "torch.Tensor", np.ndarray] = None,
+        high: Union[float, "torch.Tensor", np.ndarray] = None,
+):
+    if action_dist_cls == TorchDiagGaussian:
+        return TorchDiagGaussian(
+            loc=mu,
+            scale=std,
+        )
+    elif action_dist_cls == TorchSquashedGaussian:
+        return TorchSquashedGaussian(
+            loc=mu,
+            scale=std,
+            low=low,
+            high=high,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported action_dist_cls {action_dist_cls}")
 
 
 class ActionAdapter:
@@ -21,7 +52,10 @@ class ActionAdapter:
     """
 
     # ---------- initialisation ------------------------------------------------
-    def __init__(self, action_space: spaces.Space):
+    def __init__(self, action_space: spaces.Space, *, action_dist_cls: Type[TorchDistributionWrapper] = None):
+        self.log = logging.getLogger('MyRLApp.ActionAdapter')
+
+        self.action_dist_cls = action_dist_cls
         self.space = action_space
 
         # --- single-dim categorical ------------------------------------------
@@ -37,7 +71,7 @@ class ActionAdapter:
             self.nint = int(action_space.nvec.sum())
 
         elif isinstance(action_space, spaces.Tuple) and all(
-            isinstance(sp, spaces.Discrete) for sp in action_space
+                isinstance(sp, spaces.Discrete) for sp in action_space
         ):
             self.mode = "multidiscrete"
             self.nvec = np.array([sp.n for sp in action_space], dtype=np.int32)
@@ -50,13 +84,23 @@ class ActionAdapter:
             self.high = action_space.high.astype(np.float32)
             self.scale = (self.high - self.low) / 2.0
             self.center = (self.high + self.low) / 2.0
-
+            self.act_dim = action_space.shape[0]
         else:
             raise NotImplementedError(f"Unsupported space {action_space}")
 
         if self.mode.startswith("multi"):
             # pre-compute split points for slicing the concatenated logits
             self.cuts = np.cumsum(self.nvec)[:-1]
+
+    def unsquash(self, action):
+        """
+        Take action in the normalized space (-1, 1) and convert to the range expected by the environment.
+        """
+        if self.mode == "continuous":
+            act_unsquashed = self.low + (action + 1) * self.scale
+            return np.clip(act_unsquashed, self.low, self.high)
+        else:
+            raise NotImplementedError(f"Cannot unsquash, unsupported mode {self.mode}")
 
     # ---------- representation fed back into the network ----------------------
     def encode(self, action):
@@ -86,7 +130,7 @@ class ActionAdapter:
 
     # ---------- forward pass → env action + log-prob --------------------------
     def sample_from_policy(
-        self, net_out, deterministic=False, rng=np.random.default_rng()
+            self, net_out, deterministic=False, rng=np.random.default_rng()
     ):
         """
         * For categorical: `net_out` is a **flat** logits vector
@@ -124,27 +168,56 @@ class ActionAdapter:
                 logps.append(np.log(prob + 1e-8))
 
             if self.mode == "discrete1":
-                return actions[0], logps[0]
+                return actions[0], logps[0], None
             # k-dim ➜ numpy int array for env; sum log-probs (independent dims)
-            return np.array(actions, dtype=np.int32), float(np.sum(logps))
+            return np.array(actions, dtype=np.int32), float(np.sum(logps)), None
 
         # ---------- CONTINUOUS -------------------------------------------------
-        if isinstance(net_out, tuple):
-            mu, log_sigma = [x.astype(np.float32) for x in net_out]
-            sigma = np.exp(log_sigma)
+        # self.log.debug("ActionAdapter (sample_from_policy): in the continuous action section.")
+
+        if isinstance(net_out, (tuple, np.ndarray)):
+            # self.log.debug(f"ActionAdapter (sample_from_policy): net_out= {net_out}.")
+            if isinstance(net_out, tuple):
+                mu, log_sigma = [x.astype(np.float32) for x in net_out]
+            else:
+                if net_out.size == 2 * self.act_dim:
+                    mu = net_out[:self.act_dim]
+                    log_sigma = net_out[self.act_dim:]
+                else:
+                    raise NotImplementedError(f"Unexpected net_out size {net_out.size}; "
+                                              f"expected {2 * self.act_dim} for action_dim={self.act_dim}")
+            dist_inputs = np.concatenate([mu, log_sigma], axis=-1).astype(np.float32)
             if deterministic:
-                act = mu
+                act = ((mu + 1.0) / 2.0) * (self.high - self.low) + self.low
                 logp = None
             else:
-                eps = rng.normal(size=mu.shape).astype(np.float32)
-                act = mu + sigma * eps
-                logp = -0.5 * np.sum(((act - mu) / sigma) ** 2 +
-                                     2 * log_sigma + np.log(2 * np.pi))
+                # use RLlib's built-in class to perform sampling
+                try:
+                    with torch.no_grad():
+                        mu_t = torch.from_numpy(mu)
+                        log_st = torch.from_numpy(log_sigma)
+                        low_t = torch.from_numpy(self.low)
+                        high_t = torch.from_numpy(self.high)
+                        dist = get_action_dist(self.action_dist_cls,
+                                               mu=mu_t,
+                                               std=log_st.exp(),
+                                               low=low_t,
+                                               high=high_t)
+                        act_t = dist.sample()  # sample action normalized (using tanh) by the env bounds
+                        logp_t = dist.logp(act_t)  # calculate log probability
+                    act = act_t.numpy()
+                    logp = logp_t.numpy()
+                except Exception as e:
+                    self.log.debug(f"ActionAdapter (sample_from_policy): got exception {e}")
+
         else:  # deterministic net
             mu = net_out.astype(np.float32)
             act = mu
             logp = None
+            dist_inputs = None
 
-        # squash / clip to env range
-        act = np.clip(act, self.low, self.high)
-        return act.astype(np.float32), logp
+        # # clip to env range
+        # act = np.clip(act, -1, 1)
+
+        # self.log.debug(f"ActionAdapter (sample_from_policy): outputs are: act={act}, logp={logp}, dist_inputs={dist_inputs}.")
+        return act.astype(np.float32), logp, dist_inputs
