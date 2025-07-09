@@ -22,7 +22,7 @@ from ray.rllib.core.rl_module import RLModuleSpec
 from ray.rllib.connectors.env_to_module import FlattenObservations
 
 from multiprocessing import shared_memory
-from define_args import custom_args
+from define_args import get_full_parser
 from custom_run import run_rllib_shared_memory
 from impala_debug import IMPALADebug
 from ray.rllib.algorithms.impala import IMPALAConfig
@@ -36,9 +36,7 @@ import logging_setup
 from custom_learner import BehaviourAuditLearner
 
 
-parser = custom_args(
-    default_reward=450.0, default_iters=200, default_timesteps=2000000
-)
+parser = get_full_parser()
 parser.set_defaults(
     enable_new_api_stack=True,
     num_env_runners=1,  # number of remote EnvRunners
@@ -48,7 +46,8 @@ parser.set_defaults(
     num_learners=0,  # only have the learner in the main driver
     num_cpus_per_learner=0,  # this will be ignored if num_learners is 0
     num_cpus=3,  # for ray_init call inside test_utils
-    algo='SAC',
+    num_gpus_per_learner=0,
+    # algo='APPO',
 )
 parser.add_argument(
     "--policy_shm_name",
@@ -70,7 +69,12 @@ if __name__ == "__main__":
     logger.info(f"MASTER, PID={os.getpid()}")
 
     # make environment to have access to observation and action spaces
-    env = EngineEnvContinuous(reward=reward_fn)
+    if args.env_type.lower() == 'continuous':
+        env = EngineEnvContinuous(reward=reward_fn)
+    elif args.env_type.lower() == 'discrete':
+        env = EngineEnvDiscrete(reward=reward_fn)
+    else:
+        raise NotImplementedError(f"Environment type not supported or not provided.")
     obs_space = env.observation_space
     action_space = env.action_space
 
@@ -179,6 +183,7 @@ if __name__ == "__main__":
                         "imep_space": imep_space,
                         "mprr_space": mprr_space,
                         "obs_is_discrete": obs_is_discrete,
+                        "env_type": args.env_type.lower(),
                         },
         )
         .env_runners(
@@ -190,43 +195,46 @@ if __name__ == "__main__":
             create_env_on_local_worker=args.create_env_on_local_worker,
             # env_to_module_connector=_env_to_module_pipeline,    # needed because observation space is a nested structure
         )
-        .training(
-            num_epochs=10,
-            train_batch_size_per_learner=1,
-            model={"free_log_std": True},
-            q_model_config={
-                "fcnet_hiddens": [64, 64],
-                "fcnet_activation": "relu",
-                "post_fcnet_hiddens": [],
-                "post_fcnet_activation": None,
-                "custom_model": None,  # Use this to define custom Q-model(s).
-                "custom_model_config": {},
-            },
-            policy_model_config={
-                "fcnet_hiddens": [128, 128],
-                "fcnet_activation": "relu",
-                "post_fcnet_hiddens": [],
-                "post_fcnet_activation": None,
-                "custom_model": None,  # Use this to define a custom policy model.
-                "custom_model_config": {},
-            },
-            initial_alpha=0.1,
-            alpha_lr=3e-5,
-            actor_lr=3e-5,
-            critic_lr=3e-5,
-            tau=0.001,
-            # learner_class=BehaviourAuditLearner,
-            # vtrace_clip_rho_threshold=10,
-            # vtrace_clip_pg_rho_threshold=5,
-        )
-        # .callbacks(BehaviourAudit)
+        # .training(
+        #     num_epochs=10,
+        #     train_batch_size_per_learner=1,
+        #     model={"free_log_std": True},
+        #     # q_model_config={
+        #     #     "fcnet_hiddens": [64, 64],
+        #     #     "fcnet_activation": "relu",
+        #     #     "post_fcnet_hiddens": [],
+        #     #     "post_fcnet_activation": None,
+        #     #     "custom_model": None,  # Use this to define custom Q-model(s).
+        #     #     "custom_model_config": {},
+        #     # },
+        #     # policy_model_config={
+        #     #     "fcnet_hiddens": [128, 128],
+        #     #     "fcnet_activation": "relu",
+        #     #     "post_fcnet_hiddens": [],
+        #     #     "post_fcnet_activation": None,
+        #     #     "custom_model": None,  # Use this to define a custom policy model.
+        #     #     "custom_model_config": {},
+        #     # },
+        #     # initial_alpha=0.1,
+        #     # alpha_lr=3e-5,
+        #     # actor_lr=3e-5,
+        #     # critic_lr=3e-5,
+        #     # tau=0.001,
+        #     # learner_class=BehaviourAuditLearner,
+        #     # vtrace_clip_rho_threshold=10,
+        #     # vtrace_clip_pg_rho_threshold=5,
+        # )
         # .rl_module(rl_module_spec=spec)
         # .rl_module(model_config={"vf_share_layers": False})
-        # .rl_module(rl_module_spec=RLModuleSpec(
-        #     observation_space=obs_space,
-        #     action_space=action_space,
-        #     )
-        # )
     )
+
+    import importlib
+
+    try:
+        mod = importlib.import_module(f"algo_configs.{args.algo.lower()}_cfg")
+        if hasattr(mod, "update_config"):
+            base_config = mod.update_config(base_config, args)
+    except ModuleNotFoundError:
+        pass
 
     run_rllib_shared_memory(base_config, args)

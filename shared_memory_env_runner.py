@@ -54,7 +54,7 @@ from minion import (
     set_indices,
     flatten_obs_onehot
 )
-from utils import ActionAdapter, get_action_dist
+from utils import ActionAdapter
 
 import logging
 import logging_setup
@@ -165,7 +165,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
         # check if observation and action spaces are discrete
         self.obs_is_discrete = self.config.env_config["obs_is_discrete"]
-        self.action_adapter = ActionAdapter(self.config.action_space)
+        self.action_adapter = ActionAdapter(self.config.action_space, action_dist_cls=self.action_dist_cls)
         self.act_is_discrete = (self.action_adapter.mode != "continuous")
 
         self.metrics = MetricsLogger()
@@ -347,12 +347,9 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
                     # Reconstruct the old‐policy log‐probs
                     mu, log_sig = dist_inputs.chunk(2, dim=-1)
-                    beh_dist = get_action_dist(
-                        action_dist_cls=self.action_dist_cls,
+                    beh_dist = self.action_adapter.get_action_dist(
                         mu=torch.as_tensor(mu, dtype=torch.float32),
                         std=torch.exp(torch.as_tensor(log_sig, dtype=torch.float32)),
-                        low=self.low_t,
-                        high=self.high_t,
                     )
                     logp_re = beh_dist.logp(actions)
 
@@ -363,12 +360,9 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                     fwd_out = self.module.forward_inference({"obs": torch.as_tensor(np.array(eps.observations[1:]))})
                     curr_dist_inputs = fwd_out[Columns.ACTION_DIST_INPUTS]
                     mu, log_sig = curr_dist_inputs.chunk(2, dim=-1)
-                    cur_dist = get_action_dist(
-                        action_dist_cls=self.action_dist_cls,
+                    cur_dist = self.action_adapter.get_action_dist(
                         mu=torch.as_tensor(mu, dtype=torch.float32),
                         std=torch.exp(torch.as_tensor(log_sig, dtype=torch.float32)),
-                        low=self.low_t,
-                        high=self.high_t,
                     )
                     cur_logp = cur_dist.logp(actions)
 

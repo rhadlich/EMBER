@@ -1,5 +1,19 @@
 import argparse
 from typing import Optional
+import importlib
+
+
+def get_full_parser():
+    parser = custom_args()
+    tmp, _ = parser.parse_known_args()
+    try:
+        mod = importlib.import_module(f"algo_configs.{tmp.algo.lower()}_cfg")
+        if hasattr(mod, "add_cli_args"):
+            mod.add_cli_args(parser)  # inject algo-specific flags
+    except ModuleNotFoundError:
+        pass  # no extra flags for this algo
+
+    return parser
 
 
 def custom_args(

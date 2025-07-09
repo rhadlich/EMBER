@@ -12,32 +12,63 @@ from ray.rllib.models.torch.torch_distributions import (
     TorchSquashedGaussian
 )
 from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
+from ray.rllib.models.distributions import Distribution
 
 import logging
 import logging_setup
 
 
-def get_action_dist(
-        action_dist_cls: Type[TorchDistributionWrapper],
-        mu: Union[float, "torch.Tensor"],
-        std: Union[float, "torch.Tensor"],
-        low: Union[float, "torch.Tensor", np.ndarray] = None,
-        high: Union[float, "torch.Tensor", np.ndarray] = None,
-):
-    if action_dist_cls == TorchDiagGaussian:
-        return TorchDiagGaussian(
-            loc=mu,
-            scale=std,
-        )
-    elif action_dist_cls == TorchSquashedGaussian:
-        return TorchSquashedGaussian(
-            loc=mu,
-            scale=std,
-            low=low,
-            high=high,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported action_dist_cls {action_dist_cls}")
+# class DistributionHandler:
+#     def __init__(
+#             self,
+#             action_dist_cls: Type[TorchDistributionWrapper],
+#             mu: Union[float, "torch.Tensor"],
+#             std: Union[float, "torch.Tensor"],
+#             low: Union[float, "torch.Tensor", np.ndarray] = None,
+#             high: Union[float, "torch.Tensor", np.ndarray] = None,
+#     ):
+#         self.action_dist_cls = action_dist_cls
+#         self.mu = mu
+#         self.std = std
+#         self.low = low
+#         self.high = high
+#
+#         # get distribution object
+#         if action_dist_cls == TorchDiagGaussian:
+#             self.dist = TorchDiagGaussian(
+#                 loc=mu,
+#                 scale=std,
+#             )
+#         elif action_dist_cls == TorchSquashedGaussian:
+#             self.dist = TorchSquashedGaussian(
+#                 loc=mu,
+#                 scale=std,
+#                 low=low,
+#                 high=high,
+#             )
+#         else:
+#             raise NotImplementedError(f"Unsupported action_dist_cls {action_dist_cls}")
+#
+#     def sample(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         """
+#         Method for sampling the action and logp using the action distribution.
+#
+#         :return:
+#             act_for_env: action scaled to the range expected by the environment.
+#             act_norm: action in the range expected by the learner (to be passed to EnvRunner).
+#             logp: log probability of the sampled action (to be passed to EnvRunner).
+#         """
+#         if self.action_dist_cls == TorchDiagGaussian:
+#             act_raw = self.dist.sample()
+#             act_norm = torch.clamp(act_raw, min=-1.0, max=1.0)
+#             logp = self.dist.logp(act_norm)
+#             act_for_env = ((act_norm + 1) / 2) * (self.high - self.low) + self.low
+#             return act_for_env, act_norm, logp
+#         elif self.action_dist_cls == TorchDiagGaussian:
+#             act_norm = self.dist.sample()
+#             act_for_env = act_norm
+#             logp = self.dist.logp(act_norm)
+#             return act_for_env, act_norm, logp
 
 
 class ActionAdapter:
@@ -52,7 +83,13 @@ class ActionAdapter:
     """
 
     # ---------- initialisation ------------------------------------------------
-    def __init__(self, action_space: spaces.Space, *, action_dist_cls: Type[TorchDistributionWrapper] = None):
+    def __init__(
+            self,
+            action_space: spaces.Space,
+            *,
+            action_dist_cls: Union[Type[TorchDistributionWrapper], Type[Distribution]]
+            = None
+    ):
         self.log = logging.getLogger('MyRLApp.ActionAdapter')
 
         self.action_dist_cls = action_dist_cls
@@ -92,53 +129,74 @@ class ActionAdapter:
             # pre-compute split points for slicing the concatenated logits
             self.cuts = np.cumsum(self.nvec)[:-1]
 
-    def unsquash(self, action):
-        """
-        Take action in the normalized space (-1, 1) and convert to the range expected by the environment.
-        """
-        if self.mode == "continuous":
-            act_unsquashed = self.low + (action + 1) * self.scale
-            return np.clip(act_unsquashed, self.low, self.high)
+        self.dist = None
+
+    def get_action_dist(
+            self,
+            mu: Union[float, "torch.Tensor"],
+            std: Union[float, "torch.Tensor"],
+            *,
+            action_dist_cls: Type[TorchDistributionWrapper] = None
+    ):
+        if not self.action_dist_cls and not action_dist_cls:
+            raise NotImplementedError(f"Action distribution class not provided.")
+
+        if action_dist_cls:
+            self.action_dist_cls = action_dist_cls
+
+        # get distribution object
+        if self.action_dist_cls == TorchDiagGaussian:
+            return TorchDiagGaussian(
+                loc=mu,
+                scale=std,
+            )
+        elif self.action_dist_cls == TorchSquashedGaussian:
+            return TorchSquashedGaussian(
+                loc=mu,
+                scale=std,
+                low=torch.from_numpy(self.low),
+                high=torch.from_numpy(self.high),
+            )
         else:
-            raise NotImplementedError(f"Cannot unsquash, unsupported mode {self.mode}")
+            raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
-    # ---------- representation fed back into the network ----------------------
-    def encode(self, action):
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """
-        Return the representation you append to the observation
-        as “previous action”.
-
-        * Discrete(1)      → one-hot (length n)
-        * Multi-Discrete   → concat(one-hot(i, n_i))  (length ∑ n_i)
-        * Continuous       → scaled to (-1, 1)
+        Normalize the action to match what the learner expects according to the action distribution class.
         """
-        if self.mode == "discrete1":
-            one_hot = np.zeros(self.nvec[0], dtype=np.float32)
-            one_hot[int(action)] = 1.0
-            return one_hot
+        if self.action_dist_cls == TorchDiagGaussian:
+            return torch.clamp(action, min=-1.0, max=1.0)
+        elif self.action_dist_cls == TorchSquashedGaussian:
+            # squashed gaussian already squashes to the env range
+            return action
+        else:
+            raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
-        if self.mode == "multidiscrete":
-            outs = []
-            for comp, n in zip(np.asarray(action).astype(int), self.nvec):
-                oh = np.zeros(n, dtype=np.float32)
-                oh[comp] = 1.0
-                outs.append(oh)
-            return np.concatenate(outs, dtype=np.float32)
+    def get_action_in_env_range(self, action: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        """
+        Get the action to be in the environment range if it is not already.
+        """
+        if isinstance(action, torch.Tensor):
+            action = action.numpy().astype(np.float32)
 
-        # continuous
-        return ((action - self.center) / self.scale).astype(np.float32)
+        if self.action_dist_cls == TorchDiagGaussian:
+            return ((action + 1.0) / 2) * (self.high - self.low) + self.low
+        elif self.action_dist_cls == TorchSquashedGaussian:
+            return action
+        else:
+            raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
     # ---------- forward pass → env action + log-prob --------------------------
     def sample_from_policy(
             self, net_out, deterministic=False, rng=np.random.default_rng()
     ):
         """
-        * For categorical: `net_out` is a **flat** logits vector
+        * For categorical: `net_out` is a flat logits vector
             – length n  (single-dim)  or  ∑ n_i  (multi-dim).
         * For continuous: `net_out` is
               (μ, log σ)  tuple  OR  just μ  for deterministic nets.
         Returns
-            action_for_env  (scalar, ndarray, or list)
+            action_norm     (scalar, ndarray, or list)
             logp            (float)   or None if deterministic
         """
 
@@ -196,14 +254,13 @@ class ActionAdapter:
                     with torch.no_grad():
                         mu_t = torch.from_numpy(mu)
                         log_st = torch.from_numpy(log_sigma)
-                        low_t = torch.from_numpy(self.low)
-                        high_t = torch.from_numpy(self.high)
-                        dist = get_action_dist(self.action_dist_cls,
-                                               mu=mu_t,
-                                               std=log_st.exp(),
-                                               low=low_t,
-                                               high=high_t)
-                        act_t = dist.sample()  # sample action normalized (using tanh) by the env bounds
+                        dist = self.get_action_dist(
+                           mu=mu_t,
+                           std=log_st.exp(),
+                        )
+
+                        # get action and logp normalized to the range expected by the learner
+                        act_t = self.normalize_action(dist.sample())
                         logp_t = dist.logp(act_t)  # calculate log probability
                     act = act_t.numpy()
                     logp = logp_t.numpy()
@@ -216,8 +273,7 @@ class ActionAdapter:
             logp = None
             dist_inputs = None
 
-        # # clip to env range
-        # act = np.clip(act, -1, 1)
 
-        # self.log.debug(f"ActionAdapter (sample_from_policy): outputs are: act={act}, logp={logp}, dist_inputs={dist_inputs}.")
+        # self.log.debug(
+        #     f"ActionAdapter (sample_from_policy): outputs are: act={act}, logp={logp}, dist_inputs={dist_inputs}.")
         return act.astype(np.float32), logp, dist_inputs

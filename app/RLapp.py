@@ -71,12 +71,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log = logging.getLogger('MyRLApp.GUI')
         self.log.info(f"GUI, PID={os.getpid()}")
 
+        #========= DEFINE WHICH ALGO TO RUN HERE ==========================================
+        algo = 'APPO'
+
         # 1) Launch Master.py (which you’ve set up to spawn
         #    custom_run.py, shared_memory_env_runner.py, minion.py)
         script_dir = os.path.dirname('/Users/rodrigohadlich/PycharmProjects/RayProject/')
         master_path = os.path.join(script_dir, "Master.py")
+        cmd = [
+            sys.executable,
+            master_path,
+            "--algo", algo,
+        ]
         # use the same Python interpreter
-        self.master_proc = subprocess.Popen([sys.executable, master_path])
+        self.master_proc = subprocess.Popen(cmd)
 
         # Create containers for plot parameters
         self.plot_colors = ["#e60049", "#0bb4ff", "#50e991", "#ffa300", "#9b19f5", "#dc0ab4", "#b3d4ff", "#00bfa0"]
@@ -308,7 +316,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_policy(msg)
 
     def _update_policy(self, msg):
-        self.log.debug(f"GUI: In _update_policy.")
+        # self.log.debug(f"GUI: In _update_policy.")
         t = time.time() - self.t0
 
         for key in msg.keys():
@@ -319,7 +327,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # self.log.debug(f"GUI: Done with _update_evaluation.")
 
     def _update_evaluation(self, msg):
-        self.log.debug(f"GUI: In _update_evaluation.")
+        # self.log.debug(f"GUI: In _update_evaluation.")
         self.evaluation_count += 1
         self.evaluation_x.append(self.evaluation_count)
 

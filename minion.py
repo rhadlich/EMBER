@@ -96,11 +96,14 @@ class Minion:
         self.logger.debug("Minion: Started __init__()")
 
         # add attributes to object
-        self.policy_shm_name = policy_shm_name
-        self.flag_shm_name = flag_shm_name
-        self.ep_shm_name = ep_shm_name
-        self.episode_shm_properties = config.env_config["ep_shm_properties"]
+        # self.policy_shm_name = policy_shm_name
+        # self.flag_shm_name = flag_shm_name
+        # self.ep_shm_name = ep_shm_name
         self.config = config
+        self.policy_shm_name = self.config.env_config['policy_shm_name']
+        self.flag_shm_name = self.config.env_config['flag_shm_name']
+        self.episode_shm_properties = self.config.env_config["ep_shm_properties"]
+        self.ep_shm_name = self.episode_shm_properties['name']
 
         # set parameters for training and evaluation
         self.reset_env_each_n_batches = False
@@ -136,8 +139,13 @@ class Minion:
         self.logger.debug("Minion: Initialized ORT session")
 
         # initialize environment (gym.Env or socket to LabVIEW)
-        # get env.reset() also, meaning system's initial state observation
-        self.env = EngineEnvContinuous(reward=reward_fn)
+        env_type = self.config.env_config['env_type']
+        if env_type == 'continuous':
+            self.env = EngineEnvContinuous(reward=reward_fn)
+        elif env_type == 'discrete':
+            self.env = EngineEnvDiscrete(reward=reward_fn)
+        else:
+            raise NotImplementedError(f"Environment type not supported or not provided.")
 
         if isinstance(self.env.observation_space, gym.spaces.Discrete):
             self.obs_is_discrete = True
@@ -218,6 +226,8 @@ class Minion:
         }
         # self.logger.debug(f"Minion (train_and_eval_sequence): eval msg: {msg}.")
         self.pub.send_json(msg)
+
+        self.old_policy_output = out_new
 
         self.logger.debug("Minion: Finished _weights_changed")
 
@@ -457,12 +467,8 @@ class Minion:
                 # inference pass through actor network
                 # first [0] -> selects "output". second [0] -> selects 0th batch
                 net_out = self._ort_session_run(self.ort_session, obs_for_model)[0][0]
-                # net_out = self.ort_session.run(
-                #     self.output_names,
-                #     {self.input_names[0]: obs_for_model},
-                # )[0][0]  # first [0] -> selects "output". second [0] -> selects 0th batch
             except Exception as e:
-                self.logger.error(f"Could not perform action inference due to error {e}")
+                raise RuntimeError(f"Could not perform action inference due to error {e}")
 
             # self.logger.debug(f"Minion: performed action inference, net_out={net_out}, type={type(net_out)}")
 
@@ -470,31 +476,19 @@ class Minion:
                                                                                        deterministic=deterministic)
 
             # self.logger.debug(
-            #     f"Minion: sampled action: action_raw={action_raw}, logp={logp}, dist_inputs={dist_inputs}")
+            #     f"Minion: sampled action: action_raw={action_sampled}, logp={logp}, dist_inputs={dist_inputs}")
 
             if self.action_adapter.mode == "continuous":
-                action_for_env = np.concatenate(([550, ], action_sampled),
+                action_for_env = np.concatenate(([550, ], self.action_adapter.get_action_in_env_range(action_sampled)),
                                                 dtype=np.float32)
             else:
                 action_for_env = np.concatenate(([1, ], action_sampled), dtype=np.int32)
 
             # self.logger.debug(f"Minion: made action vector: action_for_env={action_for_env}")
 
-            # idx_soi = action_for_env[0]
-            # idx_inj_d = action_for_env[1]
-            #
-            # # send action to environment (and in the case of gym.Env collect new observation and reward)
-            # action = np.array([(1 if self.action_adapter.mode in ("discrete1", "multidiscrete") else 550),
-            #                    idx_soi,
-            #                    idx_inj_d], dtype=np.int32)  # 1 is for inj_p, to be kept const.
             obs, reward, terminated, truncated, info = self.env.step(action_for_env)
 
             # self.logger.debug(f"Minion: sampled new rollout. obs={obs}")
-
-            # # if action space is discrete, pass the raw actor network output (i.e. logits). if the action space is
-            # # continuous, then pass mu and sigma which are contained in dist_inputs (calculated in ActionAdapter).
-            # if self.action_adapter.mode is "continuous":
-            #     net_out = dist_inputs
 
             if n_rollouts == 1:
                 return [obs, action_sampled, reward, terminated, truncated, logp, net_out, info]
