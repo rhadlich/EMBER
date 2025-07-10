@@ -72,7 +72,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.info(f"GUI, PID={os.getpid()}")
 
         #========= DEFINE WHICH ALGO TO RUN HERE ==========================================
-        algo = 'APPO'
+        algo = 'IMPALA'
 
         # 1) Launch Master.py (which you’ve set up to spawn
         #    custom_run.py, shared_memory_env_runner.py, minion.py)
