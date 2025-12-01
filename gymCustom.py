@@ -202,6 +202,7 @@ class EngineEnvContinuous(gym.Env):
         dropout = 0.1
         self.predictor = Predictor()
         # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
+
         path = 'gym_utils/model_weights_mac.pth'
         self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
 
