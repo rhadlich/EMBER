@@ -13,7 +13,7 @@ from ray.rllib.utils.numpy import softmax
 import gymnasium as gym
 from gymCustom import reward_fn, EngineEnvDiscrete, EngineEnvContinuous
 
-from utils import ActionAdapter
+from utils import ActionAdapter, TimingRecorder
 
 from ray.rllib.env import INPUT_ENV_SPACES
 from ray.rllib.core import DEFAULT_MODULE_ID
@@ -21,6 +21,7 @@ from ray.rllib.core import DEFAULT_MODULE_ID
 import logging
 import logging_setup
 from pprint import pformat
+from datetime import datetime
 
 # Try to import zmq, but make it optional
 try:
@@ -100,6 +101,11 @@ class Minion:
         self.logger = logging.getLogger("MyRLApp.Minion")
         self.logger.info(f"Minion, PID={os.getpid()}")
         self.logger.debug("Minion: Started __init__()")
+
+        # initialize timing instrumentation (must be early, before any methods that use it)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = f"minion_timing_{timestamp_str}.csv"
+        self.timing_recorder = TimingRecorder(csv_path=csv_path, logger=self.logger)
 
         # add attributes to object
         # self.policy_shm_name = policy_shm_name
@@ -219,14 +225,19 @@ class Minion:
         self.logger.debug("Minion: Done with __init__().")
 
     def _ort_session_run(self, session, obs):
+        tic = time.time()
         net_out = session.run(
             self.output_names,
             {self.input_names[0]: obs},
         )
+        toc = time.time()
+        duration_ms = (toc - tic) * 1000.0
+        self.timing_recorder.record_timing('ort_session_run', duration_ms)
         return net_out
 
     def _weights_changed(self, new_sess, atol=1e-5):
         self.logger.debug("Minion: Called _weights_changed")
+        tic = time.time()
 
         out_new = []
         for obs in self.ref_obs:
@@ -235,6 +246,9 @@ class Minion:
 
         if self.old_policy_output is None:
             self.old_policy_output = out_new
+            toc = time.time()
+            duration_ms = (toc - tic) * 1000.0
+            self.timing_recorder.record_timing('weights_changed', duration_ms)
             return True
 
         diff = np.sum(np.abs(self.old_policy_output - out_new))
@@ -250,12 +264,16 @@ class Minion:
 
         self.old_policy_output = out_new
 
+        toc = time.time()
+        duration_ms = (toc - tic) * 1000.0
+        self.timing_recorder.record_timing('weights_changed', duration_ms)
         self.logger.debug("Minion: Finished _weights_changed")
 
         return diff > atol
 
     def _get_ort_session(self, ):
         self.logger.debug("Minion: Called _get_ort_session")
+        tic = time.time()
         # get length of ort_compressed from header
         _len_ort = struct.unpack_from("<I", self.p_buf, 0)
         header_offset = 4  # number of bytes in the int
@@ -273,6 +291,9 @@ class Minion:
 
         input_names = [i.name for i in ort_session.get_inputs()]
 
+        toc = time.time()
+        duration_ms = (toc - tic) * 1000.0
+        self.timing_recorder.record_timing('get_ort_session', duration_ms)
         return ort_session, input_names, output_names
 
     def try_update_ort_weights(self) -> bool:
@@ -295,7 +316,15 @@ class Minion:
 
             self.f_buf[0] = 0  # set lock flag to unlocked
             self.f_buf[1] = 0  # reset weights-available flag to 0 (false, i.e. no new weights)
+            
+            # Time the full update process (from lock to unlock, excluding the initial check)
+            toc_full = time.time()
+            duration_ms = (toc_full - tic) * 1000.0
+            self.timing_recorder.record_timing('ort_weight_update', duration_ms)
             self.logger.debug("Minion: Ort weights updated.")
+            
+            # Save timing data after update completes
+            self.timing_recorder.save_timing_data()
             return True
         else:
             return False
@@ -353,6 +382,7 @@ class Minion:
         │       └ same as rollout[0]                           │
         └──────────────────────────────────────────────────────┘
         """
+        tic = time.time()
         if is_initial_state:
             assert data.shape == (
                 self.episode_shm_properties["STATE_ACTION_DIMS"]['state'],) and data.dtype == np.float32
@@ -442,6 +472,9 @@ class Minion:
         # logger.debug(f"Minion (write_fragment): Done writing fragment."
         #              f"Final writing index: {write_idx}.")
 
+        toc = time.time()
+        duration_ms = (toc - tic) * 1000.0
+        self.timing_recorder.record_timing('write_fragment', duration_ms)
         return self.ep_arr
 
     def collect_rollouts(
@@ -453,6 +486,7 @@ class Minion:
         """
         function to collect a set number of rollouts
         """
+        tic_collect = time.time()
 
         if initial_obs is None:
             obs, info = self.env.reset()
@@ -500,8 +534,13 @@ class Minion:
 
             # self.logger.debug(f"Minion: performed action inference, net_out={net_out}, type={type(net_out)}")
 
+            # Time policy sampling
+            tic_policy = time.time()
             action_sampled, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
                                                                                        deterministic=deterministic)
+            toc_policy = time.time()
+            duration_policy_ms = (toc_policy - tic_policy) * 1000.0
+            self.timing_recorder.record_timing('policy_sampling', duration_policy_ms, deterministic=deterministic)
 
             # self.logger.debug(
             #     f"Minion: sampled action: action_raw={action_sampled}, logp={logp}, dist_inputs={dist_inputs}")
@@ -514,11 +553,21 @@ class Minion:
 
             # self.logger.debug(f"Minion: made action vector: action_for_env={action_for_env}")
 
+            # Time environment step
+            tic_env = time.time()
             obs, reward, terminated, truncated, info = self.env.step(action_for_env)
+            toc_env = time.time()
+            duration_env_ms = (toc_env - tic_env) * 1000.0
+            self.timing_recorder.record_timing('env_step', duration_env_ms)
 
             # self.logger.debug(f"Minion: sampled new rollout. obs={obs}")
 
             if n_rollouts == 1:
+                toc_collect = time.time()
+                duration_collect_ms = (toc_collect - tic_collect) * 1000.0
+                self.timing_recorder.record_timing('collect_rollouts', duration_collect_ms, deterministic=deterministic)
+                # Save timing data after collect_rollouts completes
+                self.timing_recorder.save_timing_data()
                 return [obs, action_sampled, reward, terminated, truncated, logp, net_out, info]
             else:
                 rollouts["obs"].append(obs)
@@ -530,6 +579,11 @@ class Minion:
                 rollouts["action_dist_inputs"].append(net_out)
                 rollouts["info"].append(info)
 
+        toc_collect = time.time()
+        duration_collect_ms = (toc_collect - tic_collect) * 1000.0
+        self.timing_recorder.record_timing('collect_rollouts', duration_collect_ms, deterministic=deterministic)
+        # Save timing data after collect_rollouts completes
+        self.timing_recorder.save_timing_data()
         return rollouts
 
     def train_and_eval_sequence(
@@ -609,6 +663,9 @@ class Minion:
             # self.logger.debug(f"Minion (train_and_eval_sequence): eval msg: {msg}.")
             if self.pub is not None:
                 self.pub.send_json(msg)
+        
+        # Save timing data after train_and_eval_sequence completes
+        self.timing_recorder.save_timing_data()
 
 
 def main(policy_shm_name: str,
@@ -673,6 +730,8 @@ def main(policy_shm_name: str,
             timesteps += 1
 
     except KeyboardInterrupt:
+        # Save any remaining timing data before exit
+        actor.timing_recorder.save_timing_data()
         # close socket connection
         del actor.ep_arr
         actor.logger.debug("Program interrupted")

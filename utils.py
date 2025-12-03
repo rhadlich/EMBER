@@ -16,6 +16,10 @@ from ray.rllib.models.distributions import Distribution
 
 import logging
 import logging_setup
+import csv
+import time
+from datetime import datetime
+from typing import Optional
 
 
 # class DistributionHandler:
@@ -277,3 +281,83 @@ class ActionAdapter:
         # self.log.debug(
         #     f"ActionAdapter (sample_from_policy): outputs are: act={act}, logp={logp}, dist_inputs={dist_inputs}.")
         return act.astype(np.float32), logp, dist_inputs
+
+
+class TimingRecorder:
+    """
+    A reusable class for recording and saving timing measurements to CSV files.
+    Can be used across multiple processes.
+    """
+    
+    def __init__(self, csv_path: Optional[str] = None, logger: Optional[logging.Logger] = None):
+        """
+        Initialize the timing recorder.
+        
+        Args:
+            csv_path: Path to the CSV file. If None, generates a timestamped filename.
+            logger: Logger instance. If None, creates a default logger.
+        """
+        self.timing_data = []  # in-memory storage for timing records
+        self.sequence_number = 0  # counter for sequence numbers
+        
+        if csv_path is None:
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.timing_csv_path = f"timing_{timestamp_str}.csv"
+        else:
+            self.timing_csv_path = csv_path
+        
+        self.timing_csv_initialized = False  # track if CSV header has been written
+        
+        if logger is None:
+            self.logger = logging.getLogger('MyRLApp.TimingRecorder')
+        else:
+            self.logger = logger
+        
+        self.logger.debug(f"TimingRecorder: Timing data will be saved to {self.timing_csv_path}")
+    
+    def record_timing(self, process_name: str, duration_ms: float, deterministic: Optional[bool] = None):
+        """
+        Record a timing measurement to in-memory storage.
+        Does not save to CSV immediately to avoid interfering with nested operations.
+        
+        Args:
+            process_name: Name of the process being timed
+            duration_ms: Duration in milliseconds
+            deterministic: Optional boolean flag indicating if the process was deterministic
+        """
+        self.sequence_number += 1
+        record = {
+            'timestamp': round(time.time(), 3),  # Round to 3 decimal places (millisecond precision)
+            'sequence_number': self.sequence_number,
+            'process_name': process_name,
+            'duration_ms': round(duration_ms, 3),  # Round to 3 decimal places (0.001ms precision)
+            'deterministic': deterministic if deterministic is not None else None
+        }
+        self.timing_data.append(record)
+    
+    def save_timing_data(self):
+        """
+        Save accumulated timing data to CSV file incrementally.
+        This should be called at appropriate points (not during nested operations).
+        """
+        if not self.timing_data:
+            return
+        
+        # Write header if this is the first time
+        write_header = not self.timing_csv_initialized
+        
+        try:
+            with open(self.timing_csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['timestamp', 'sequence_number', 'process_name', 'duration_ms', 'deterministic'])
+                if write_header:
+                    writer.writeheader()
+                    self.timing_csv_initialized = True
+                
+                # Write all accumulated data
+                for record in self.timing_data:
+                    writer.writerow(record)
+            
+            # Clear the in-memory buffer after successful write
+            self.timing_data = []
+        except Exception as e:
+            self.logger.warning(f"TimingRecorder: Failed to save timing data: {e}")
