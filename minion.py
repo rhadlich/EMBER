@@ -89,6 +89,45 @@ def _flatten_obs_array(obs) -> np.ndarray:
     return np.expand_dims(obs, 0).astype(np.float32)
 
 
+def set_realtime_priority(priority: int = 80, logger=None):
+    """
+    Set real-time scheduling priority for the current process.
+    
+    Args:
+        priority: SCHED_FIFO priority (1-99). Higher = more priority.
+                  Use 80-90 range to avoid starving system processes.
+        logger: Optional logger instance for logging messages.
+    """
+    try:
+        import ctypes
+        from ctypes import c_int
+        
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        
+        # Constants
+        SCHED_FIFO = 1
+        
+        class sched_param(ctypes.Structure):
+            _fields_ = [("sched_priority", c_int)]
+        
+        # Set priority
+        param = sched_param(c_int(priority))
+        result = libc.sched_setscheduler(0, SCHED_FIFO, ctypes.byref(param))
+        
+        if result != 0:
+            errno = ctypes.get_errno()
+            if logger:
+                logger.warning(f"Failed to set real-time priority: errno {errno}")
+        else:
+            if logger:
+                logger.info(f"Set real-time priority to {priority} (SCHED_FIFO)")
+    except Exception as e:
+        # If setting real-time priority fails (e.g., not running as root, or not on Linux),
+        # log a warning but continue execution
+        if logger:
+            logger.warning(f"Could not set real-time priority: {e}. Continuing with default scheduling.")
+
+
 class Minion:
     def __init__(
             self,
@@ -101,6 +140,15 @@ class Minion:
         self.logger = logging.getLogger("MyRLApp.Minion")
         self.logger.info(f"Minion, PID={os.getpid()}")
         self.logger.debug("Minion: Started __init__()")
+        
+        # Set real-time priority (always defaults to 80 unless explicitly disabled)
+        rt_priority = self.config.env_config.get("realtime_priority", 80)
+        # Set priority if not explicitly disabled (None or False)
+        if rt_priority is not None and rt_priority is not False:
+            set_realtime_priority(priority=rt_priority, logger=self.logger)
+        else:
+            # Explicitly disabled, skip setting priority
+            self.logger.debug("Real-time priority explicitly disabled in config")
 
         # initialize timing instrumentation (must be early, before any methods that use it)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")

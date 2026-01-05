@@ -171,6 +171,7 @@ if __name__ == "__main__":
                         "cpu_core_env_runner": args.cpu_core_env_runner,
                         "cpu_core_minion": args.cpu_core_minion,
                         "enable_zmq": args.enable_zmq,
+                        "realtime_priority": 80,  # Default real-time priority for minion
                         },
         )
         .env_runners(
