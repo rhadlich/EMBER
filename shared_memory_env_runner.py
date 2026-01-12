@@ -680,8 +680,8 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
         # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
         while True:
-            if self.f_buf[3] == 0:
-                write_idx, read_idx = get_indices(self.ep_arr, self.f_buf)
+            if self.f_buf[5] == 0:  # actor episode buffer lock flag
+                write_idx, read_idx = get_indices(self.ep_arr, self.f_buf, lock_index=5)
                 # self.logger.debug(f"EnvRunner(_read_batch): Started reading buffer. "
                 #                   f"Identified write_idx, read_idx: {write_idx}, {read_idx}.")
                 break
@@ -691,7 +691,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         # if any of these are true it means the last batch read is the most updated full batch
         if write_idx == read_idx:
             # self.logger.debug("EnvRunner(_read_batch): Returning None.")
-            set_indices(self.ep_arr, read_idx, 'r', self.f_buf)  # to unlock episode buffer
+            set_indices(self.ep_arr, read_idx, 'r', self.f_buf, lock_index=5)  # to unlock episode buffer
             # self.logger.debug(f"EnvRunner(_read_batch): Done reading buffer, no episodes available. "
             #                   f"Final read index: {read_idx}.")
             return None  # ring empty
@@ -781,7 +781,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         # self.logger.debug("EnvRunner(_read_batch): Done logging batches.")
 
         # commit new indices and unlock episode buffer (unlocking happens inside set_indices)
-        set_indices(self.ep_arr, read_idx, 'r', self.f_buf)
+        set_indices(self.ep_arr, read_idx, 'r', self.f_buf, lock_index=5)
         # self.logger.debug(f"EnvRunner(_read_batch): Done reading buffer. "
         #                   f"Final read index: {read_idx}.")
 

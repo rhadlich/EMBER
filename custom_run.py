@@ -27,6 +27,7 @@ from multiprocessing import shared_memory
 
 import ray
 import torch
+import torch.nn as nn
 from ray import tune
 from ray.air.integrations.wandb import WandbLoggerCallback, WANDB_ENV_VAR
 from ray.rllib.core import DEFAULT_MODULE_ID, Columns
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
 from define_args import custom_args
 from onnxruntime.tools import convert_onnx_models_to_ort as c2o
 from pathlib import Path
+from safety_filter import StatePredictor, FilterStorageBuffer
+from minion import get_indices, set_indices
 
 import logging
 import logging_setup
@@ -103,6 +106,81 @@ def _get_current_onnx_model(module: RLModule,
     with open("model.ort", "rb") as f:
         ort_raw = f.read()
 
+    return ort_raw
+
+
+def _get_filter_onnx_model(state_predictor_model,
+                            *,
+                            outdir: str = "filter_model.onnx",
+                            logger,
+                            ):
+    """
+    Function to extract the StatePredictor model converted to ort.
+    
+    Args:
+        state_predictor_model: PyTorch StatePredictor model
+        outdir: Output directory for ONNX file
+        logger: Logger instance
+        
+    Returns:
+        ort_raw: Raw bytes of the ORT model
+    """
+    state_predictor_model.eval()
+    
+    # Get model dimensions
+    state_dim = state_predictor_model.state_dim
+    action_dim = state_predictor_model.action_dim
+    
+    # Create dummy inputs for export
+    dummy_x = torch.randn(1, state_dim, dtype=torch.float32)
+    dummy_u = torch.randn(1, action_dim, dtype=torch.float32)
+    
+    # Wrap forward to match ONNX export requirements
+    # We need to export with two inputs (x, u) and return (x_next, f_x, G_x_flat)
+    class WrappedPredictor(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+            
+        def forward(self, x, u):
+            x_next, f_x, G_x = self.model(x, u)
+            # Flatten G_x for ONNX export (reshape happens in inference)
+            G_x_flat = G_x.reshape(x.shape[0], -1)
+            return x_next, f_x, G_x_flat
+    
+    wrapped_model = WrappedPredictor(state_predictor_model)
+    
+    # Export to ONNX
+    torch.onnx.export(
+        wrapped_model,
+        (dummy_x, dummy_u),
+        outdir,
+        export_params=True,
+        input_names=['state', 'action'],
+        output_names=['x_next', 'f_x', 'G_x_flat'],
+        dynamic_axes={
+            'state': {0: 'batch_size'},
+            'action': {0: 'batch_size'},
+            'x_next': {0: 'batch_size'},
+            'f_x': {0: 'batch_size'},
+            'G_x_flat': {0: 'batch_size'},
+        }
+    )
+    
+    # Convert .onnx to .ort (optimized for faster loading and inference in the minion)
+    styles = [c2o.OptimizationStyle.Fixed]
+    c2o.convert_onnx_models_to_ort(
+        model_path_or_dir=Path(outdir),  # may also be a directory
+        output_dir=None,  # None = same folder as the .onnx
+        optimization_styles=styles,
+        # target_platform="arm",  # Only in the Raspberry Pi
+    )
+    
+    ort_path = outdir.replace('.onnx', '.ort')
+    with open(ort_path, "rb") as f:
+        ort_raw = f.read()
+    
+    logger.debug(f"Filter model converted to ORT: {len(ort_raw)} bytes")
     return ort_raw
 
 
@@ -339,22 +417,30 @@ def run_rllib_shared_memory(
         assert not args.as_test and not args.as_release_test
 
         # create flag shared memory block here
-        # flag buffer has 4 flags:
-        #   0 -> weights lock flag (locked_state=1)
-        #   1 -> weights available flag (true_state=1)
-        #   2 -> minion data collection flag (has it started collecting data?, true_state=1)
-        #   3 -> episode buffer lock flag (needed because of race conditions with reading and writing, locked_state=1)
+        # flag buffer has 8 bytes:
+        #   0 -> actor weights lock flag (locked_state=1)
+        #   1 -> actor weights available flag (true_state=1)
+        #   2 -> filter weights lock flag (locked_state=1)
+        #   3 -> filter weights available flag (true_state=1)
+        #   4 -> minion data collection flag (has it started collecting data?, true_state=1)
+        #   5 -> actor episode buffer lock flag (needed because of race conditions with reading and writing, locked_state=1)
+        #   6 -> filter episode buffer lock flag (locked_state=1)
+        #   7 -> reserved (can be used for model_error or other purposes)
         f_shm = shared_memory.SharedMemory(
             create=True,
             name=args.flag_shm_name,
-            size=4,
+            size=8,
         )
         f_buf = f_shm.buf
 
-        f_buf[0] = 1  # set weights lock flag to locked
-        f_buf[1] = 0  # set weights-available flag to false
-        f_buf[2] = 0  # set minion flag to false (minion has not started collecting rollouts)
-        f_buf[3] = 0  # set episode lock flag to unlocked
+        f_buf[0] = 1  # set actor weights lock flag to locked
+        f_buf[1] = 0  # set actor weights-available flag to false
+        f_buf[2] = 1  # set filter weights lock flag to locked
+        f_buf[3] = 0  # set filter weights-available flag to false
+        f_buf[4] = 0  # set minion flag to false (minion has not started collecting rollouts)
+        f_buf[5] = 0  # set actor episode lock flag to unlocked
+        f_buf[6] = 0  # set filter episode lock flag to unlocked
+        f_buf[7] = 0  # reserved
 
         logger.debug("custom_run: created flag memory buffer")
 
@@ -395,11 +481,132 @@ def run_rllib_shared_memory(
 
         logger.debug("custom_run: stored initial model weights")
 
+        # Initialize filter model (StatePredictor)
+        filter_state_dim = config.observation_space.shape[0]
+        filter_action_dim = config.action_space.shape[0]
+        filter_num_hidden = config.env_config.get("filter_num_hidden", 2)
+        filter_hidden_exp = config.env_config.get("filter_hidden_exp", 7)
+        filter_dropout = config.env_config.get("filter_dropout", 0.0)
+        
+        logger.debug(f"custom_run: Initializing filter model with state_dim={filter_state_dim}, "
+                    f"action_dim={filter_action_dim}, num_hidden={filter_num_hidden}, "
+                    f"hidden_exp={filter_hidden_exp}, dropout={filter_dropout}")
+        
+        # Initialize filter storage buffer configuration
+        filter_storage_max_samples = config.env_config.get("filter_storage_max_samples", 50000)
+        filter_storage_min_samples = config.env_config.get("filter_storage_min_samples", 1000)
+        filter_storage_training_batch_size = config.env_config.get("filter_storage_training_batch_size", None)
+        
+        logger.debug(f"custom_run: Filter storage buffer config: max_samples={filter_storage_max_samples}, "
+                    f"min_samples={filter_storage_min_samples}")
+        
+        # Create PyTorch StatePredictor model
+        filter_model = StatePredictor(
+            state_dim=filter_state_dim,
+            action_dim=filter_action_dim,
+            num_hidden=filter_num_hidden,
+            hidden_exp=filter_hidden_exp,
+            dropout=filter_dropout
+        )
+        filter_model.eval()
+        
+        # Convert filter model to ONNX/ORT
+        filter_ort_raw = _get_filter_onnx_model(filter_model, logger=logger, outdir="filter_model.onnx")
+        filter_policy_nbytes = len(filter_ort_raw)
+        
+        logger.debug(f"custom_run: filter_ort_raw length is {filter_policy_nbytes}")
+        
+        # Create filter policy shared memory block
+        # Size: header (4 bytes) + ORT model + MSE loss (4 bytes float32)
+        filter_policy_shm_name = config.env_config.get("filter_policy_shm_name", "filter_policy")
+        filter_p_shm = shared_memory.SharedMemory(
+            create=True,
+            name=filter_policy_shm_name,
+            size=filter_policy_nbytes + header_offset + 4  # +4 for MSE float32
+        )
+        
+        logger.debug("custom_run: created filter policy memory buffer")
+        
+        # Get reference to filter policy buffer
+        filter_p_buf = filter_p_shm.buf
+        
+        logger.debug(f"custom_run: filter buffer length is {len(filter_p_buf)}")
+        
+        # Store initial filter weights and remove lock flags
+        struct.pack_into("<I", filter_p_buf, 0, filter_policy_nbytes)
+        filter_p_buf[header_offset:header_offset + len(filter_ort_raw)] = filter_ort_raw  # insert raw weights
+        # Store initial MSE loss (0.0 for initial untrained model)
+        mse_offset = header_offset + filter_policy_nbytes
+        struct.pack_into("<f", filter_p_buf, mse_offset, 0.0)
+        f_buf[2] = 0  # set filter lock flag to unlocked
+        f_buf[3] = 1  # set filter weights-available flag to 1 (true)
+        
+        logger.debug("custom_run: stored initial filter model weights with MSE=0.0")
+
+        # Create filter episode shared memory block for training data
+        filter_ep_shm_properties = config.env_config.get("filter_ep_shm_properties")
+        filter_ep_shm = None
+        filter_ep_arr = None
+        if filter_ep_shm_properties is not None:
+            filter_ep_shm_name = filter_ep_shm_properties.get("name", "filter_episodes")
+            try:
+                # Try to connect first (might already exist from env runner)
+                filter_ep_shm = shared_memory.SharedMemory(name=filter_ep_shm_name, create=False)
+                filter_ep_buf = filter_ep_shm.buf
+                filter_ep_arr = np.ndarray(shape=(filter_ep_shm_properties["TOTAL_SIZE"],),
+                                           dtype=np.float32,
+                                           buffer=filter_ep_buf)
+                logger.debug(f"custom_run: Connected to existing filter episode shared memory: {filter_ep_arr.shape}")
+            except FileNotFoundError:
+                # Create if it doesn't exist
+                filter_ep_shm = shared_memory.SharedMemory(
+                    create=True,
+                    name=filter_ep_shm_name,
+                    size=filter_ep_shm_properties["TOTAL_SIZE_BYTES"]
+                )
+                filter_ep_buf = filter_ep_shm.buf
+                filter_ep_arr = np.ndarray(shape=(filter_ep_shm_properties["TOTAL_SIZE"],),
+                                           dtype=np.float32,
+                                           buffer=filter_ep_buf)
+                # Initialize write and read indices to 0
+                filter_ep_arr[:2] = 0
+                logger.debug(f"custom_run: Created filter episode shared memory: {filter_ep_arr.shape}")
+        else:
+            logger.warning("custom_run: filter_ep_shm_properties not found in config, filter training will be disabled")
+
+        # Initialize filter storage buffer
+        # Calculate sample dimension: state + action + next_state = 2*state_dim + action_dim
+        filter_storage_sample_dim = None
+        if filter_ep_shm_properties is not None:
+            state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
+            action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
+            filter_storage_sample_dim = 2 * state_dim + action_dim  # state + action + next_state
+            logger.debug(f"custom_run: Filter storage sample_dim={filter_storage_sample_dim} (state={state_dim}, action={action_dim})")
+        
+        filter_storage_buffer = FilterStorageBuffer(
+            max_samples=filter_storage_max_samples,
+            min_samples_for_training=filter_storage_min_samples,
+            sample_dim=filter_storage_sample_dim
+        )
+        logger.debug("custom_run: Initialized filter storage buffer")
+        
+        # Store filter model and shared memory references for training loop
+        filter_model_refs = {
+            'model': filter_model,
+            'filter_p_shm': filter_p_shm,
+            'filter_p_buf': filter_p_buf,
+            'filter_policy_shm_name': filter_policy_shm_name,
+            'state_dim': filter_state_dim,
+            'action_dim': filter_action_dim,
+            'storage_buffer': filter_storage_buffer,
+            'storage_training_batch_size': filter_storage_training_batch_size,
+        }
+
         results = None
 
         logger.debug("custom_run: waiting until minion starts collecting rollouts.")
         # wait until the minion has started collecting rollouts
-        while f_buf[2] == 0:
+        while f_buf[4] == 0:  # minion data collection flag is now at index 4
             time.sleep(0.1)
         logger.debug("custom_run: minion is now collecting rollouts")
 
@@ -465,14 +672,221 @@ def run_rllib_shared_memory(
         else:
             logger.debug("ZMQ disabled via --enable-zmq flag")
 
+        # Helper functions for filter training
+        def _read_filter_batch():
+            """Read completed batches from filter episode shared memory buffer.
+            Returns batches as numpy arrays of shape (batch_size, state_dim + action_dim + state_dim)
+            or None if no complete batch available.
+            Also adds batches to storage buffer for accumulation.
+            """
+            if filter_ep_arr is None or filter_ep_shm_properties is None:
+                return None
+
+            # wait until the buffer is unlocked to read indices
+            while True:
+                if f_buf[6] == 0:  # filter episode buffer lock flag
+                    write_idx, read_idx = get_indices(filter_ep_arr, f_buf, lock_index=6)
+                    break
+                else:
+                    time.sleep(0.0001)
+
+            # Check if any batches available
+            if write_idx == read_idx:
+                set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
+                return None  # ring empty
+
+            # Calculate number of batches
+            if write_idx < read_idx:
+                num_batches = ((filter_ep_shm_properties["NUM_SLOTS"] - 1) - read_idx) + write_idx + 1
+            else:
+                num_batches = write_idx - read_idx
+
+            batches = []
+            for i in range(num_batches):
+                slot_off = filter_ep_shm_properties["HEADER_SIZE"] + read_idx * filter_ep_shm_properties["SLOT_SIZE"]
+                filled = int(filter_ep_arr[slot_off])
+                
+                # Ensure batch is complete
+                if filled < filter_ep_shm_properties["BATCH_SIZE"]:
+                    set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
+                    return batches if batches else None
+
+                # Extract data from ring
+                data_start = slot_off + filter_ep_shm_properties["HEADER_SLOT_SIZE"]
+                payload = np.copy(filter_ep_arr[data_start: data_start + filter_ep_shm_properties["PAYLOAD_SIZE"]])
+                
+                # Extract initial state and remove it
+                state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
+                initial_state = payload[:state_dim]
+                payload = payload[state_dim:]
+                
+                # Reshape to (batch_size, elements_per_rollout)
+                batch = payload.reshape(filter_ep_shm_properties["BATCH_SIZE"], 
+                                       filter_ep_shm_properties["ELEMENTS_PER_ROLLOUT"])
+                
+                batches.append(batch)
+                
+                # Add batch to storage buffer
+                if filter_model_refs['storage_buffer'] is not None:
+                    filter_model_refs['storage_buffer'].add_batch(batch)
+                
+                # Advance read_idx
+                read_idx = (read_idx + 1) % filter_ep_shm_properties["NUM_SLOTS"]
+
+            # Commit new indices and unlock
+            set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
+            return batches
+
+        def _sample_from_storage_buffer():
+            """Sample batches from storage buffer for training.
+            Returns batches as numpy arrays or None if not enough samples available.
+            """
+            storage_buffer = filter_model_refs.get('storage_buffer')
+            if storage_buffer is None:
+                return None
+            
+            # Determine batch size for sampling
+            training_batch_size = filter_model_refs.get('storage_training_batch_size')
+            if training_batch_size is None:
+                # Use ring buffer batch size as default
+                if filter_ep_shm_properties is not None:
+                    training_batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
+                else:
+                    training_batch_size = 128
+            
+            # Sample batches from storage buffer
+            sampled_batches = storage_buffer.sample_batches(n_batches=1, batch_size=training_batch_size)
+            return sampled_batches
+
+        def _train_filter_model():
+            """Train filter model on available batch data.
+            First accumulates data from ring buffer to storage buffer, then samples from storage buffer
+            for training if enough samples are available. Falls back to ring buffer batches if storage buffer is too small.
+            Returns loss value or None if no data available.
+            """
+            if filter_model_refs['model'] is None:
+                return None
+
+            # First, read from ring buffer and accumulate in storage buffer
+            ring_batches = _read_filter_batch()  # This also adds batches to storage buffer
+            
+            # Try to sample from storage buffer first
+            batches = None
+            storage_buffer = filter_model_refs.get('storage_buffer')
+            if storage_buffer is not None and storage_buffer.size() >= storage_buffer.min_samples_for_training:
+                sampled = _sample_from_storage_buffer()
+                if sampled is not None and len(sampled) > 0:
+                    batches = sampled
+                    logger.debug(f"custom_run: Using storage buffer for training ({storage_buffer.size()} samples)")
+            
+            # Fall back to ring buffer batches if storage buffer doesn't have enough samples
+            if batches is None or len(batches) == 0:
+                batches = ring_batches
+                if batches is None or len(batches) == 0:
+                    return None
+                logger.debug(f"custom_run: Using ring buffer for training (storage buffer has {storage_buffer.size() if storage_buffer else 0} samples)")
+
+            model = filter_model_refs['model']
+            model.train()  # Set to training mode
+            
+            # Initialize optimizer if not already done
+            if not hasattr(_train_filter_model, 'optimizer'):
+                _train_filter_model.optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+            
+            optimizer = _train_filter_model.optimizer
+            criterion = torch.nn.MSELoss()
+            
+            total_loss = 0.0
+            num_samples = 0
+            
+            for batch in batches:
+                # Split batch into state, action, next_state
+                state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
+                action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
+                
+                states = torch.from_numpy(batch[:, :state_dim]).float()
+                actions = torch.from_numpy(batch[:, state_dim:state_dim + action_dim]).float()
+                next_states = torch.from_numpy(batch[:, state_dim + action_dim:]).float()
+                
+                # Forward pass
+                predicted_next_states, _, _ = model(states, actions)
+                
+                # Compute loss
+                loss = criterion(predicted_next_states, next_states)
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                num_samples += states.shape[0]
+            
+            model.eval()  # Set back to eval mode
+            
+            avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
+            logger.debug(f"custom_run: Filter model training loss: {avg_loss:.6f}")
+            
+            return avg_loss
+
+        def _update_filter_policy_shm(mse_loss):
+            """Update filter policy weights in shared memory along with MSE loss.
+            
+            Args:
+                mse_loss: The MSE loss value from training to store with the weights.
+            """
+            if filter_model_refs['model'] is None:
+                return
+            
+            model = filter_model_refs['model']
+            model.eval()
+            
+            # Convert to ONNX/ORT
+            filter_ort_raw = _get_filter_onnx_model(model, logger=logger, outdir="filter_model.onnx")
+            filter_policy_nbytes = len(filter_ort_raw)
+            filter_p_buf = filter_model_refs['filter_p_buf']
+            header_offset = 4
+            mse_offset = header_offset + filter_policy_nbytes  # Store MSE after the ORT weights
+            
+            # Check if buffer is large enough (weights + 4 bytes for MSE float32)
+            required_size = mse_offset + 4
+            if len(filter_p_buf) < required_size:
+                logger.warning(f"Filter policy buffer too small: need {required_size}, have {len(filter_p_buf)}")
+                return
+            
+            # Check size matches (excluding MSE storage)
+            _len_ort_expected = struct.unpack_from("<I", filter_p_buf, 0)
+            if _len_ort_expected[0] != filter_policy_nbytes:
+                logger.warning(f"Filter model size mismatch: expected {_len_ort_expected[0]}, got {filter_policy_nbytes}")
+                return
+            
+            # Wait for lock and update
+            while f_buf[2] == 1:  # filter weights lock flag
+                time.sleep(0.0001)
+            
+            f_buf[2] = 1  # set lock flag to locked
+            filter_p_buf[header_offset:header_offset + len(filter_ort_raw)] = filter_ort_raw
+            # Store MSE loss as float32 after the weights
+            struct.pack_into("<f", filter_p_buf, mse_offset, float(mse_loss))
+            f_buf[2] = 0  # set lock flag to unlocked
+            f_buf[3] = 1  # set filter weights-available flag to 1 (true)
+            
+            logger.debug(f"custom_run: Updated filter policy weights in shared memory with MSE={mse_loss:.6f}")
+
         try:
             # start counter
             train_iter = 0
             while True:
                 logger.debug("custom_run: in the train loop now.")
 
-                # perform one logical iteration of training
+                # perform one logical iteration of actor training
                 results = algo.train()
+
+                # Train filter model (alternating training)
+                filter_loss = _train_filter_model()
+                if filter_loss is not None:
+                    _update_filter_policy_shm(filter_loss)
+                    logger.debug(f"custom_run: Filter training completed, loss={filter_loss:.6f}")
 
                 state = algo.learner_group.get_state(components="learner")
                 if 'metrics_logger' in state['learner']:

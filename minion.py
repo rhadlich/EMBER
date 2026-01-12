@@ -22,6 +22,7 @@ import logging
 import logging_setup
 from pprint import pformat
 from datetime import datetime
+from safety_filter import SafetyFilter
 
 # Try to import zmq, but make it optional
 try:
@@ -32,9 +33,16 @@ except ImportError:
     zmq = None
 
 
-def get_indices(buf_arr, f_buf, *, logger=None) -> tuple:
-    """Return (write_idx, read_idx)."""
-    f_buf[3] = 1  # lock episode buffer
+def get_indices(buf_arr, f_buf, *, logger=None, lock_index=5) -> tuple:
+    """Return (write_idx, read_idx).
+    
+    Args:
+        buf_arr: Buffer array
+        f_buf: Flag buffer
+        logger: Optional logger
+        lock_index: Index in f_buf to use for locking (5 for actor, 6 for filter)
+    """
+    f_buf[lock_index] = 1  # lock episode buffer
     indices = buf_arr[:2].astype(np.int32)
     return indices
 
@@ -42,8 +50,17 @@ def get_indices(buf_arr, f_buf, *, logger=None) -> tuple:
 def set_indices(buf_arr: np.ndarray,
                 idx: int,
                 mode: str,
-                f_buf: shared_memory.SharedMemory.buf) -> None:
-    """Atomically update either write or read index."""
+                f_buf: shared_memory.SharedMemory.buf,
+                lock_index=5) -> None:
+    """Atomically update either write or read index.
+    
+    Args:
+        buf_arr: Buffer array
+        idx: Index to set
+        mode: 'w' for write index, 'r' for read index
+        f_buf: Flag buffer
+        lock_index: Index in f_buf to use for unlocking (5 for actor, 6 for filter)
+    """
     # return struct.pack_into("<II", buf, 0, w, r)
     if mode == 'w':
         buf_arr[0] = idx
@@ -51,7 +68,7 @@ def set_indices(buf_arr: np.ndarray,
         buf_arr[1] = idx
     else:
         raise ValueError(f'Unknown mode {mode}')
-    f_buf[3] = 0  # unlock episode buffer
+    f_buf[lock_index] = 0  # unlock episode buffer
 
 
 def flatten_obs_onehot(obs, imep_space, mprr_space) -> torch.Tensor:
@@ -117,7 +134,13 @@ def set_realtime_priority(priority: int = 80, logger=None):
         if result != 0:
             errno = ctypes.get_errno()
             if logger:
-                logger.warning(f"Failed to set real-time priority: errno {errno}")
+                if errno == 1:  # EPERM - Operation not permitted
+                    logger.warning(
+                        f"Failed to set real-time priority: Permission denied (errno {errno}). "
+                        f"Please run the application with sudo to enable real-time scheduling."
+                    )
+                else:
+                    logger.warning(f"Failed to set real-time priority: errno {errno}")
         else:
             if logger:
                 logger.info(f"Set real-time priority to {priority} (SCHED_FIFO)")
@@ -140,6 +163,8 @@ class Minion:
         self.logger = logging.getLogger("MyRLApp.Minion")
         self.logger.info(f"Minion, PID={os.getpid()}")
         self.logger.debug("Minion: Started __init__()")
+
+        self.config = config
         
         # Set real-time priority (always defaults to 80 unless explicitly disabled)
         rt_priority = self.config.env_config.get("realtime_priority", 80)
@@ -159,11 +184,16 @@ class Minion:
         # self.policy_shm_name = policy_shm_name
         # self.flag_shm_name = flag_shm_name
         # self.ep_shm_name = ep_shm_name
-        self.config = config
         self.policy_shm_name = self.config.env_config['policy_shm_name']
         self.flag_shm_name = self.config.env_config['flag_shm_name']
         self.episode_shm_properties = self.config.env_config["ep_shm_properties"]
         self.ep_shm_name = self.episode_shm_properties['name']
+        self.filter_policy_shm_name = self.config.env_config.get('filter_policy_shm_name', 'filter_policy')
+        self.filter_ep_shm_properties = self.config.env_config.get("filter_ep_shm_properties")
+        if self.filter_ep_shm_properties is not None:
+            self.filter_ep_shm_name = self.filter_ep_shm_properties['name']
+        else:
+            self.filter_ep_shm_name = None
 
         # set parameters for training and evaluation
         self.reset_env_each_n_batches = False
@@ -178,25 +208,71 @@ class Minion:
                                  dtype=np.float32,
                                  buffer=self.ep_buf,
                                  )
-        while self.f_buf[0] == 1:  # wait until policy shared memory block has been created
+        while self.f_buf[0] == 1:  # wait until actor policy shared memory block has been created
             time.sleep(0.01)
-        # connect to policy shared memory block and get buffer pointer
+        # connect to actor policy shared memory block and get buffer pointer
         self.p_shm = shared_memory.SharedMemory(name=policy_shm_name, create=False)
         self.p_buf = self.p_shm.buf
 
         self.logger.debug(f"Minion: ep_arr shape -> {self.ep_arr.shape}")
-        self.logger.debug("Minion: connected to all memory blocks")
+        self.logger.debug("Minion: connected to actor memory blocks")
 
-        self.logger.debug("Minion: Getting initial network weights")
+        self.logger.debug("Minion: Getting initial actor network weights")
         self.ort_session = None
-        # get initial network weights
-        while self.f_buf[1] == 0:  # wait until weights-available flag is set to true
+        # get initial actor network weights
+        while self.f_buf[1] == 0:  # wait until actor weights-available flag is set to true
             time.sleep(0.01)
-        self.ort_session, self.input_names, self.output_names = self._get_ort_session()
+        self.ort_session, self.input_names, self.output_names = self._get_ort_session(model_type='actor')
         self.logger.debug(f"Minion: input_names: {self.input_names}, output_names: {self.output_names}")
-        self.f_buf[1] = 0  # change new-weights-available flag to false
+        self.f_buf[1] = 0  # change actor new-weights-available flag to false
 
-        self.logger.debug("Minion: Initialized ORT session")
+        self.logger.debug("Minion: Initialized actor ORT session")
+
+        # Connect to filter policy shared memory block
+        while self.f_buf[2] == 1:  # wait until filter policy shared memory block has been created (lock flag)
+            time.sleep(0.01)
+        self.filter_p_shm = shared_memory.SharedMemory(name=self.filter_policy_shm_name, create=False)
+        self.filter_p_buf = self.filter_p_shm.buf
+
+        self.logger.debug("Minion: Getting initial filter network weights")
+        self.filter_ort_session = None
+        # get initial filter network weights
+        while self.f_buf[3] == 0:  # wait until filter weights-available flag is set to true
+            time.sleep(0.01)
+        self.filter_ort_session, self.filter_input_names, self.filter_output_names = self._get_ort_session(model_type='filter')
+        self.logger.debug(f"Minion: filter_input_names: {self.filter_input_names}, filter_output_names: {self.filter_output_names}")
+        self.f_buf[3] = 0  # change filter new-weights-available flag to false
+
+        self.logger.debug("Minion: Initialized filter ORT session")
+
+        # Initialize SafetyFilter with ORT session
+        if self.obs_is_discrete:
+            state_dim = self.len_imep
+        else:
+            state_dim = self.episode_shm_properties["STATE_ACTION_DIMS"]["state"]
+        action_dim = self.config.action_space.shape[0]
+        
+        self.safety_filter = SafetyFilter(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            ort_session=self.filter_ort_session,
+            input_names=self.filter_input_names,
+            output_names=self.filter_output_names
+        )
+        self.model_error = 0.0  # Initial model error, will be updated from shared memory (float, not torch tensor)
+        
+        self.logger.debug("Minion: Initialized SafetyFilter")
+
+        # Connect to filter episode shared memory if available
+        if self.filter_ep_shm_properties is not None:
+            self.filter_ep_shm = shared_memory.SharedMemory(name=self.filter_ep_shm_name, create=False)
+            self.filter_ep_buf = self.filter_ep_shm.buf
+            self.filter_ep_arr = np.ndarray(shape=(self.filter_ep_shm_properties["TOTAL_SIZE"],),
+                                            dtype=np.float32,
+                                            buffer=self.filter_ep_buf,
+                                            )
+            self.logger.debug(f"Minion: filter_ep_arr shape -> {self.filter_ep_arr.shape}")
+            self.logger.debug("Minion: connected to filter episode memory block")
 
         # initialize environment (gym.Env or socket to LabVIEW)
         env_type = self.config.env_config['env_type']
@@ -319,14 +395,33 @@ class Minion:
 
         return diff > atol
 
-    def _get_ort_session(self, ):
-        self.logger.debug("Minion: Called _get_ort_session")
+    def _get_ort_session(self, model_type: str = 'actor'):
+        """
+        Get ORT session from shared memory for either actor or filter model.
+        
+        Args:
+            model_type: 'actor' or 'filter' to specify which model to load
+            
+        Returns:
+            Tuple of (ort_session, input_names, output_names)
+        """
+        if model_type == 'actor':
+            self.logger.debug("Minion: Called _get_ort_session (actor)")
+            p_buf = self.p_buf
+            timing_name = 'get_ort_session'
+        elif model_type == 'filter':
+            self.logger.debug("Minion: Called _get_ort_session (filter)")
+            p_buf = self.filter_p_buf
+            timing_name = 'get_filter_ort_session'
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}. Must be 'actor' or 'filter'")
+        
         tic = time.time()
         # get length of ort_compressed from header
-        _len_ort = struct.unpack_from("<I", self.p_buf, 0)
+        _len_ort = struct.unpack_from("<I", p_buf, 0)
         header_offset = 4  # number of bytes in the int
 
-        ort_raw = self.p_buf[header_offset:header_offset + _len_ort[0]].tobytes()  # this is the actual ort model bytes
+        ort_raw = p_buf[header_offset:header_offset + _len_ort[0]].tobytes()  # this is the actual ort model bytes
 
         ort_session = ort.InferenceSession(
             ort_raw,
@@ -336,40 +431,89 @@ class Minion:
                        "CPUExecutionProvider", ]
         )
         output_names = [o.name for o in ort_session.get_outputs()]
-
         input_names = [i.name for i in ort_session.get_inputs()]
+
+        # Read MSE loss for filter model (stored after the weights as float32)
+        if model_type == 'filter':
+            mse_offset = header_offset + _len_ort[0]
+            mse_loss = struct.unpack_from("<f", p_buf, mse_offset)[0]
+            self.model_error = float(mse_loss)  # Store as float, not torch tensor
+            self.logger.debug(f"Minion: Loaded filter model with MSE={mse_loss:.6f}")
 
         toc = time.time()
         duration_ms = (toc - tic) * 1000.0
-        self.timing_recorder.record_timing('get_ort_session', duration_ms)
+        self.timing_recorder.record_timing(timing_name, duration_ms)
         return ort_session, input_names, output_names
 
-    def try_update_ort_weights(self) -> bool:
-        # update policy network weights if available and not being written to
-        if self.f_buf[1] == 1 and self.f_buf[0] == 0:
-            self.logger.debug("Minion: Updating ort session weights...")
-            self.f_buf[0] = 1  # set lock flag to locked
-            tic = time.time()
-            self.ort_session, self.input_names, self.output_names = self._get_ort_session()  # get ort session with new weights
-            toc = time.time()
-            self.logger.debug(f"Minion: Time to update ort weights is {(toc - tic)*1000:0.4f}ms")
-
-            # check if policy changed
-            try:
-                policy_changed = self._weights_changed(self.ort_session)
-                self.logger.debug(f"Minion: Policy weights changed? {policy_changed}")
-            except Exception as e:
-                self.logger.debug(f"Minion: Could not check policy weights due to error {e}")
-                raise RuntimeError from e
-
-            self.f_buf[0] = 0  # set lock flag to unlocked
-            self.f_buf[1] = 0  # reset weights-available flag to 0 (false, i.e. no new weights)
+    def try_update_weights(self, model_type: str = 'actor') -> bool:
+        """
+        Update model weights (actor or filter) if available and not being written to.
+        
+        Args:
+            model_type: 'actor' or 'filter' to specify which model to update
             
-            # Time the full update process (from lock to unlock, excluding the initial check)
+        Returns:
+            True if weights were updated, False otherwise
+        """
+        if model_type == 'actor':
+            weights_flag_idx = 1
+            lock_flag_idx = 0
+            log_prefix = "ort session"
+            timing_name = 'ort_weight_update'
+            check_weights_changed = True
+        elif model_type == 'filter':
+            weights_flag_idx = 3
+            lock_flag_idx = 2
+            log_prefix = "filter ort session"
+            timing_name = 'filter_ort_weight_update'
+            check_weights_changed = False
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}. Must be 'actor' or 'filter'")
+        
+        # Check if weights are available and buffer is not locked
+        if self.f_buf[weights_flag_idx] == 1 and self.f_buf[lock_flag_idx] == 0:
+            self.logger.debug(f"Minion: Updating {log_prefix} weights...")
+            self.f_buf[lock_flag_idx] = 1  # set lock flag to locked
+            tic = time.time()
+            
+            # Get ORT session with new weights
+            ort_session, input_names, output_names = self._get_ort_session(model_type=model_type)
+            
+            # Update instance attributes based on model type
+            if model_type == 'actor':
+                self.ort_session = ort_session
+                self.input_names = input_names
+                self.output_names = output_names
+            else:  # filter
+                self.filter_ort_session = ort_session
+                self.filter_input_names = input_names
+                self.filter_output_names = output_names
+                # Update SafetyFilter with new session
+                self.safety_filter.ort_session = ort_session
+                self.safety_filter.input_names = input_names
+                self.safety_filter.output_names = output_names
+                # model_error is already updated in _get_ort_session()
+            
+            toc = time.time()
+            self.logger.debug(f"Minion: Time to update {log_prefix} weights is {(toc - tic)*1000:0.4f}ms")
+
+            # Check if policy changed (only for actor)
+            if check_weights_changed:
+                try:
+                    policy_changed = self._weights_changed(ort_session)
+                    self.logger.debug(f"Minion: Policy weights changed? {policy_changed}")
+                except Exception as e:
+                    self.logger.debug(f"Minion: Could not check policy weights due to error {e}")
+                    raise RuntimeError from e
+
+            self.f_buf[lock_flag_idx] = 0  # set lock flag to unlocked
+            self.f_buf[weights_flag_idx] = 0  # reset weights-available flag to 0 (false, i.e. no new weights)
+            
+            # Time the full update process
             toc_full = time.time()
             duration_ms = (toc_full - tic) * 1000.0
-            self.timing_recorder.record_timing('ort_weight_update', duration_ms)
-            self.logger.debug("Minion: Ort weights updated.")
+            self.timing_recorder.record_timing(timing_name, duration_ms)
+            self.logger.debug(f"Minion: {log_prefix.capitalize()} weights updated.")
             
             # Save timing data after update completes
             self.timing_recorder.save_timing_data()
@@ -377,13 +521,22 @@ class Minion:
         else:
             return False
 
+    def try_update_ort_weights(self) -> bool:
+        """Convenience wrapper for backward compatibility."""
+        return self.try_update_weights(model_type='actor')
+
+    def try_update_filter_weights(self) -> bool:
+        """Convenience wrapper for backward compatibility."""
+        return self.try_update_weights(model_type='filter')
+
     def write_fragment(
             self,
             data: np.ndarray,
             is_initial_state: Optional[bool] = False,
-    ) -> np.ndarray:
+            buffer_type: str = 'actor',
+    ) -> Optional[np.ndarray]:
         """
-        Append ONE rollout into the ring buffer.
+        Append ONE rollout into the ring buffer (actor or filter).
         Drops the oldest slot if ring is full.
 
         Structure of the ring is as follows:
@@ -429,101 +582,137 @@ class Minion:
         │   └ rollout[batch_size − 1]:                         │
         │       └ same as rollout[0]                           │
         └──────────────────────────────────────────────────────┘
+        
+        Args:
+            data: Array containing rollout data
+            is_initial_state: Whether this is an initial state
+            buffer_type: 'actor' or 'filter' to specify which buffer to write to
         """
+        # Set up buffer-specific attributes
+        if buffer_type == 'actor':
+            ep_arr = self.ep_arr
+            shm_properties = self.episode_shm_properties
+            lock_index = 5
+            timing_name = 'write_fragment'
+            log_prefix = "write_fragment"
+        elif buffer_type == 'filter':
+            if not hasattr(self, 'filter_ep_arr') or self.filter_ep_arr is None:
+                return None
+            ep_arr = self.filter_ep_arr
+            shm_properties = self.filter_ep_shm_properties
+            lock_index = 6
+            timing_name = 'write_filter_fragment'
+            log_prefix = "write_filter_fragment"
+        else:
+            raise ValueError(f"Unknown buffer_type: {buffer_type}. Must be 'actor' or 'filter'")
+        
         tic = time.time()
         if is_initial_state:
-            assert data.shape == (
-                self.episode_shm_properties["STATE_ACTION_DIMS"]['state'],) and data.dtype == np.float32
+            if buffer_type == 'filter':
+                # Filter extracts state_dim from data
+                state_dim = shm_properties["STATE_ACTION_DIMS"]["state"]
+                assert data.shape == (state_dim,) and data.dtype == np.float32
+            else:
+                assert data.shape == (shm_properties["STATE_ACTION_DIMS"]['state'],) and data.dtype == np.float32
         else:
-            assert data.shape == (self.episode_shm_properties["ELEMENTS_PER_ROLLOUT"],) and data.dtype == np.float32
+            assert data.shape == (shm_properties["ELEMENTS_PER_ROLLOUT"],) and data.dtype == np.float32
 
         # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
         while True:
-            if self.f_buf[3] == 0:
-                write_idx, read_idx = get_indices(self.ep_arr, self.f_buf, logger=self.logger)
-                # self.logger.debug(f"Minion (write_fragment): Started writing fragment. "
-                #              f"Identified writing and reading indices: {write_idx}, {read_idx}.")
+            if self.f_buf[lock_index] == 0:
+                write_idx, read_idx = get_indices(ep_arr, self.f_buf, logger=self.logger, lock_index=lock_index)
                 break
             else:
                 time.sleep(0.0001)
 
-        slot_off = self.episode_shm_properties["HEADER_SIZE"] + write_idx * self.episode_shm_properties["SLOT_SIZE"]
+        slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
 
-        # self.logger.debug(f"Minion (write_fragment): identified writing and reading indices: {write_idx}, {read_idx}.")
-        # self.logger.debug(f"Minion (write_fragment): ELEMENTS_PER_ROLLOUT: {episode_shm_properties['ELEMENTS_PER_ROLLOUT']}.")
-        # self.logger.debug(f"Minion (write_fragment): data shape: {data.shape}.")
-
-        # only run this the very first time the episode buffer is started,
-        # for other iterations the function already handles adding the initial state
+        # Handle initial state
         if is_initial_state:
-            initial_state_off = slot_off + self.episode_shm_properties["HEADER_SLOT_SIZE"]
-            self.ep_arr[initial_state_off: initial_state_off + len(data)] = data
-            set_indices(self.ep_arr, write_idx, 'w', self.f_buf)  # to unlock episode buffer
-            self.logger.debug(f"Minion (write_fragment): Done writing initial state."
-                              f"Final writing index: {write_idx}.")
-            return self.ep_arr
+            initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
+            if buffer_type == 'filter':
+                # Filter extracts state from beginning of data
+                state_dim = shm_properties["STATE_ACTION_DIMS"]["state"]
+                initial_state = data[:state_dim]
+            else:
+                initial_state = data
+            ep_arr[initial_state_off: initial_state_off + len(initial_state)] = initial_state
+            set_indices(ep_arr, write_idx, 'w', self.f_buf, lock_index=lock_index)
+            self.logger.debug(f"Minion ({log_prefix}): Done writing initial state. Final writing index: {write_idx}.")
+            return ep_arr
 
         # get how many rollouts have been filled in the current episode
-        filled = int(self.ep_arr[slot_off])
-
-        # self.logger.debug(f"Minion (write_fragment): writing to slot {filled}.")
+        filled = int(ep_arr[slot_off])
 
         # Copy rollout into slot payload
-        episode_off = slot_off + self.episode_shm_properties["HEADER_SLOT_SIZE"] + filled * self.episode_shm_properties[
-            "ELEMENTS_PER_ROLLOUT"]
+        episode_off = slot_off + shm_properties["HEADER_SLOT_SIZE"] + filled * shm_properties["ELEMENTS_PER_ROLLOUT"]
         # Add initial state to offset
-        episode_off += self.episode_shm_properties["STATE_ACTION_DIMS"]['state']
-        self.ep_arr[episode_off: episode_off + self.episode_shm_properties["ELEMENTS_PER_ROLLOUT"]] = data
+        episode_off += shm_properties["STATE_ACTION_DIMS"]["state"]
+        ep_arr[episode_off: episode_off + shm_properties["ELEMENTS_PER_ROLLOUT"]] = data
 
         # Increment fill counter
         filled += 1
-        self.ep_arr[slot_off] = filled
+        ep_arr[slot_off] = filled
 
-        # If this is the last rollout that can be added to this slot -> move write_idx to next slot and populate the
-        # first elements as the initial state (equal to last state of current write_idx).
-        #
-        # Alternatively, can pass the env and set reset_env_each_batch flag to True. This will make initial observation
-        # of each batch equal to the output of reset.
-        if filled == self.episode_shm_properties["BATCH_SIZE"]:
-            next_w = (write_idx + 1) % self.episode_shm_properties["NUM_SLOTS"]
+        # If this is the last rollout that can be added to this slot -> move write_idx to next slot
+        if filled == shm_properties["BATCH_SIZE"]:
+            next_w = (write_idx + 1) % shm_properties["NUM_SLOTS"]
             if next_w == read_idx:  # ring full → drop oldest
-                self.logger.debug("Minion: ring buffer got filled, writing episodes faster than algorithm can read.")
-                read_idx = (read_idx + 1) % self.episode_shm_properties["NUM_SLOTS"]
+                buffer_name = "filter ring buffer" if buffer_type == 'filter' else "ring buffer"
+                self.logger.debug(f"Minion: {buffer_name} got filled, writing data faster than algorithm can read.")
+                read_idx = (read_idx + 1) % shm_properties["NUM_SLOTS"]
 
             # get offset for next slot
             write_idx = next_w
-            slot_off = self.episode_shm_properties["HEADER_SIZE"] + write_idx * self.episode_shm_properties["SLOT_SIZE"]
+            slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
 
-            if self.reset_env_each_n_batches and not self.batch_count % self.n_batches_for_env_reset:
-                # get next state from env.reset()
-                self.logger.debug(f"Minion: resetting env in batch {self.batch_count}")
-                obs, info = self.env.reset()
-                state = _flatten_obs_array(obs)
+            # Extract state for next slot's initial state
+            if buffer_type == 'filter':
+                # Filter: extract next_state (which is the last part of data)
+                state_dim = shm_properties["STATE_ACTION_DIMS"]["state"]
+                action_dim = shm_properties["STATE_ACTION_DIMS"]["action"]
+                next_state_start = state_dim + action_dim
+                next_state_end = next_state_start + state_dim
+                state = data[next_state_start:next_state_end]
             else:
-                # extract last state from current rollout to use as initial observation for buffer slot
-                state_off = (self.episode_shm_properties["STATE_ACTION_DIMS"]['action'] +
-                             self.episode_shm_properties["STATE_ACTION_DIMS"]['reward'])
-                state = data[state_off:state_off + self.episode_shm_properties["STATE_ACTION_DIMS"]['state']]
+                # Actor: either reset env or extract last state from current rollout
+                if self.reset_env_each_n_batches and not self.batch_count % self.n_batches_for_env_reset:
+                    # get next state from env.reset()
+                    self.logger.debug(f"Minion: resetting env in batch {self.batch_count}")
+                    obs, info = self.env.reset()
+                    state = _flatten_obs_array(obs)
+                else:
+                    # extract last state from current rollout to use as initial observation for buffer slot
+                    state_off = (shm_properties["STATE_ACTION_DIMS"]['action'] +
+                                 shm_properties["STATE_ACTION_DIMS"]['reward'])
+                    state = data[state_off:state_off + shm_properties["STATE_ACTION_DIMS"]['state']]
 
             # add initial state to next slot
-            initial_state_off = slot_off + self.episode_shm_properties["HEADER_SLOT_SIZE"]
-            self.ep_arr[initial_state_off: initial_state_off + len(state)] = state
+            initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
+            ep_arr[initial_state_off: initial_state_off + len(state)] = state
 
             # reset the fill counter
-            self.ep_arr[slot_off] = 0
+            ep_arr[slot_off] = 0
 
-            # increment batch count
-            self.batch_count += 1
+            # increment batch count (only for actor)
+            if buffer_type == 'actor':
+                self.batch_count += 1
 
         # Commit updated indices and unlock episode buffer (unlocking happens inside set_indices)
-        set_indices(self.ep_arr, write_idx, 'w', self.f_buf)
-        # logger.debug(f"Minion (write_fragment): Done writing fragment."
-        #              f"Final writing index: {write_idx}.")
+        set_indices(ep_arr, write_idx, 'w', self.f_buf, lock_index=lock_index)
 
         toc = time.time()
         duration_ms = (toc - tic) * 1000.0
-        self.timing_recorder.record_timing('write_fragment', duration_ms)
-        return self.ep_arr
+        self.timing_recorder.record_timing(timing_name, duration_ms)
+        return ep_arr
+
+    def write_filter_fragment(
+            self,
+            data: np.ndarray,
+            is_initial_state: Optional[bool] = False,
+    ) -> Optional[np.ndarray]:
+        """Convenience wrapper for backward compatibility."""
+        return self.write_fragment(data, is_initial_state=is_initial_state, buffer_type='filter')
 
     def collect_rollouts(
             self,
@@ -593,6 +782,18 @@ class Minion:
             # self.logger.debug(
             #     f"Minion: sampled action: action_raw={action_sampled}, logp={logp}, dist_inputs={dist_inputs}")
 
+            # Apply safety filter to action
+            if hasattr(self, 'safety_filter') and self.safety_filter is not None:
+                try:
+                    # SafetyFilter now uses numpy arrays directly (no torch conversion needed)
+                    action_sampled = self.safety_filter.compute_filtered_action(
+                        obs_for_model[0],  # numpy array: (state_dim,)
+                        action_sampled,    # numpy array: (action_dim,)
+                        self.model_error   # float scalar
+                    )
+                except Exception as e:
+                    self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
+
             if self.action_adapter.mode == "continuous":
                 action_for_env = np.concatenate(([550, ], self.action_adapter.get_action_in_env_range(action_sampled)),
                                                 dtype=np.float32)
@@ -607,6 +808,16 @@ class Minion:
             toc_env = time.time()
             duration_env_ms = (toc_env - tic_env) * 1000.0
             self.timing_recorder.record_timing('env_step', duration_env_ms)
+
+            # Collect filter training data: (current_state, action, next_state)
+            if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
+                try:
+                    current_state = obs_for_model[0]  # Current state before action
+                    next_state_flat = _flatten_obs_array(obs)  # Next state after action
+                    filter_data = np.concatenate([current_state, action_sampled, next_state_flat]).astype(np.float32)
+                    self.write_filter_fragment(filter_data)
+                except Exception as e:
+                    self.logger.debug(f"Minion: Failed to write filter training data: {e}")
 
             # self.logger.debug(f"Minion: sampled new rollout. obs={obs}")
 
@@ -643,6 +854,10 @@ class Minion:
         if not self.last_obs:
             obs, info = self.env.reset()
             self.write_fragment(_flatten_obs_array(obs), is_initial_state=True)
+            # Write initial state for filter buffer too
+            if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
+                initial_state = _flatten_obs_array(obs)
+                self.write_filter_fragment(initial_state, is_initial_state=True)
         else:
             obs = self.last_obs
 
@@ -758,8 +973,16 @@ def main(policy_shm_name: str,
 
             weights_updated = actor.try_update_ort_weights()
             if weights_updated:
-                actor.logger.debug(f"Minion: Update number -> {weight_updates}.")
+                actor.logger.debug(f"Minion: Actor update number -> {weight_updates}.")
                 weight_updates += 1
+
+            # Try to update filter weights
+            filter_weights_updated = actor.try_update_filter_weights()
+            if filter_weights_updated:
+                actor.logger.debug("Minion: Filter weights updated.")
+
+            # model_error is now read from filter_policy_shm along with weights in try_update_filter_weights()
+            # No need to read from flag buffer anymore
 
             # perform train and eval routine
             actor.train_and_eval_sequence(
@@ -768,7 +991,7 @@ def main(policy_shm_name: str,
             )
 
             # set minion rollout flag to true to enable the algo.train() calls
-            actor.f_buf[2] = 1
+            actor.f_buf[4] = 1  # minion data collection flag is now at index 4
 
             # logger.debug(f"Minion: Done with iteration {timesteps}")
 
