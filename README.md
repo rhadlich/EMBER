@@ -19,6 +19,14 @@ It is designed to enable learning-based control while **provably enforcing safet
 - Discrete + continuous engine environments backed by learned surrogate model weights
 
 ---
+## ⚠️ Current Limitations
+
+This project is under development and is not fully operational. These items will be fixed in future versions, but for now these are limitations to be aware of:
+
+- Only works with the two pre-built engine environments.
+- Has hardcoded values in the master.py and minion.py that are specific to the test case. This is meant to be a flexible framework when finished.
+
+---
 
 ## ⚙️ Getting Started
 
@@ -33,7 +41,7 @@ It is designed to enable learning-based control while **provably enforcing safet
 ### Clone the repository
 
 ```bash
-git clone <REPO_URL>
+git clone https://github.com/rhadlich/EMBER.git
 cd EMBER
 ```
 
@@ -42,7 +50,7 @@ cd EMBER
 This repo ships a pinned environment file (there is no `pyproject.toml`/`requirements.txt` at the moment).
 
 ```bash
-conda env create -f rayenv2_mac.yml
+conda env create -f environment.yml
 conda activate rayenv2
 ```
 
