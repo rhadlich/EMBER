@@ -12,7 +12,7 @@ import zmq
 import numpy as np
 
 import logging
-import logging_setup
+import src.utils.logging_setup as logging_setup
 
 
 # ---------- ZMQ subscriber thread ----------
