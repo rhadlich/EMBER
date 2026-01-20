@@ -106,15 +106,15 @@ if __name__ == "__main__":
         "reward": 1,
         "state": 1,                             # this will be the next state AFTER taking "action"
         "action_dist_size": action_dist_size,
-        "logp": 1                               # has to be scalar
+        "logp": 1                               # scalar by definition
     }  # the length of the vector of each component of the rollout
     BATCH_SIZE = 32  # number of rollouts per batch (episode)
-    NUM_SLOTS = 8  # ring depth
-    # increment rollout size to include action probability distribution
-    # (size of action one-hot representation) and log probability of
-    # selected action (size of action), all in float32 format
+    NUM_SLOTS = 8  # ring depth (i.e. number of episodes)
+
+    # the length of the vector of each component of the rollout
     ELEMENTS_PER_ROLLOUT = sum(dims.values())
     BYTES_PER_ROLLOUT = ELEMENTS_PER_ROLLOUT * bytes_per_float
+    
     # Added state to PAYLOAD_SIZE because need to include the starting state for each episode. This will be simply
     # the state observation at the end of the last episode/batch.
     PAYLOAD_SIZE = ELEMENTS_PER_ROLLOUT * BATCH_SIZE + dims["state"]
