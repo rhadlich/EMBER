@@ -802,6 +802,9 @@ class Minion:
             # self.logger.debug(
             #     f"Minion: sampled action: action_raw={action_sampled}, logp={logp}, dist_inputs={dist_inputs}")
 
+            # Keep a copy of the nominal action (pre-filter) for filter-training data.
+            action_nominal = action_sampled.copy()
+
             # Apply safety filter to action
             if hasattr(self, 'safety_filter') and self.safety_filter is not None:
                 try:
@@ -833,7 +836,8 @@ class Minion:
                 try:
                     current_state = obs_for_model[0]  # Current state before action
                     next_state_flat = _flatten_obs_array(obs)  # Next state after action
-                    filter_data = np.concatenate([current_state, action_sampled, next_state_flat]).astype(np.float32)
+                    # Store: (current_state, action_filtered, next_state, action_nominal)
+                    filter_data = np.concatenate([current_state, action_sampled, next_state_flat, action_nominal]).astype(np.float32)
                     self._write_fragment(filter_data, buffer_type='filter')
                 except Exception as e:
                     self.logger.debug(f"Minion: Failed to write filter training data: {e}")

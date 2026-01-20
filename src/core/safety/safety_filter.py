@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import onnxruntime as ort
-from typing import Optional, Tuple, List
+from typing import Callable, Optional, Tuple, List
 import random
 
 class StatePredictor(nn.Module):
@@ -49,32 +49,32 @@ class SafetyFilter:
     def __init__(self, 
                  state_dim: int, 
                  action_dim: int,
-                 ort_session: ort.InferenceSession,
-                 input_names: List[str],
-                 output_names: List[str]) -> None:
+                 ort_session: Optional[ort.InferenceSession] = None,
+                 input_names: Optional[List[str]] = None,
+                 output_names: Optional[List[str]] = None) -> None:
         """
-        Initialize SafetyFilter with ONNX Runtime session.
+        Initialize SafetyFilter.
         
-        This class only supports ORT models for inference. PyTorch models are handled
-        separately in custom_run.py for training, then converted to ORT format.
+        - If `ort_session` is provided, this instance can run inference and compute filtered actions.
+        - If `ort_session` is None, this instance can still be used for barrier computations
+          (e.g., `compute_h`, `_compute_alpha`), but inference-based methods will raise.
         
         Args:
             state_dim: Dimension of state space
             action_dim: Dimension of action space
-            ort_session: ONNXruntime inference session (required)
-            input_names: Names of input tensors for ONNX model (required)
-            output_names: Names of output tensors for ONNX model (required)
+            ort_session: ONNXruntime inference session (optional; required for inference)
+            input_names: Names of input tensors for ONNX model (required if ort_session is provided)
+            output_names: Names of output tensors for ONNX model (required if ort_session is provided)
         """
-        if ort_session is None:
-            raise ValueError("ort_session must be provided")
-        if input_names is None or output_names is None:
-            raise ValueError("input_names and output_names must be provided")
+        if ort_session is not None:
+            if input_names is None or output_names is None:
+                raise ValueError("input_names and output_names must be provided when ort_session is provided")
         
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.ort_session = ort_session
-        self.input_names = input_names
-        self.output_names = output_names
+        self.input_names = list(input_names) if input_names is not None else []
+        self.output_names = list(output_names) if output_names is not None else []
 
         # define constants for barrier function (using numpy)
         self.a = np.zeros(state_dim, dtype=np.float32)
@@ -95,6 +95,17 @@ class SafetyFilter:
             - f_x: (state_dim,) - drift term
             - G_x: (state_dim, action_dim) - control matrix
         """
+        if self.ort_session is None:
+            raise RuntimeError(
+                "SafetyFilter was constructed without an ONNX Runtime session; "
+                "inference-based methods are unavailable."
+            )
+        if len(self.input_names) < 2 or len(self.output_names) < 1:
+            raise RuntimeError(
+                "SafetyFilter is missing ONNX input/output tensor names; "
+                "cannot run inference."
+            )
+
         # Ensure inputs are 2D with batch dimension
         if x.ndim == 1:
             x = np.expand_dims(x, 0)
@@ -126,7 +137,7 @@ class SafetyFilter:
         
         return x_next, f_x, G_x
 
-    def _compute_h(self, x: np.ndarray) -> float:
+    def compute_h(self, x: np.ndarray) -> float:
         """
         Compute barrier function h(x).
         
@@ -150,7 +161,7 @@ class SafetyFilter:
         Returns:
             Scalar alpha value
         """
-        return self._compute_h(x) * 0.5
+        return self.compute_h(x) * 0.5
     
     def _compute_rho(self, delta: float) -> float:
         """
@@ -224,35 +235,144 @@ class SafetyFilter:
 
 class FilterStorageBuffer:
     """
-    FIFO ring buffer for accumulating filter training data with pre-allocated memory.
+    Dual FIFO ring buffers (Recent + Critical) for accumulating filter training data.
     
-    This buffer accumulates individual rollouts (state, action, next_state) in a 
-    pre-allocated ring buffer structure. When full, it uses FIFO retention (overwrites oldest).
+    - Recent: Larger buffer storing normal recent rollouts.
+    - Critical: Smaller buffer storing rollouts near the SafetyFilter boundary and/or with
+      large intervention magnitude.
+    
+    Expected sample layout (flat float32) for Critical classification:
+      (state, action_filtered, next_state, action_nominal)
+    where state_dim == next_state_dim and action_dim == action_nominal_dim.
     """
     
-    def __init__(self, max_samples: int = 50000, min_samples_for_training: int = 1000, sample_dim: Optional[int] = None):
+    class _RingBuffer:
+        """Simple pre-allocated FIFO ring buffer of flat float32 samples."""
+        def __init__(self, max_samples: int, sample_dim: int):
+            self.max_samples = int(max_samples)
+            self.sample_dim = int(sample_dim)
+            self.current_size = 0
+            self.write_index = 0
+            self.buffer = np.zeros((self.max_samples, self.sample_dim), dtype=np.float32)
+
+        def add(self, sample: np.ndarray) -> None:
+            self.buffer[self.write_index] = sample
+            self.write_index = (self.write_index + 1) % self.max_samples
+            if self.current_size < self.max_samples:
+                self.current_size += 1
+
+        def sample(self, n: int) -> np.ndarray:
+            if n <= 0:
+                return np.zeros((0, self.sample_dim), dtype=np.float32)
+            if self.current_size < n:
+                raise ValueError(f"Not enough samples to draw {n} (have {self.current_size})")
+            idx = random.sample(range(self.current_size), n)
+            return self.buffer[idx].copy()
+
+        def clear(self) -> None:
+            self.current_size = 0
+            self.write_index = 0
+            self.buffer.fill(0)
+
+    def __init__(
+        self,
+        max_samples: int = 50000,
+        min_samples_for_training: int = 1000,
+        sample_dim: Optional[int] = None,
+        *,
+        state_dim: Optional[int] = None,
+        action_dim: Optional[int] = None,
+        critical_fraction: float = 0.20,
+        critical_capacity_fraction: float = 0.20,
+        h_critical_threshold: float = 2.0,
+        intervention_l2_threshold: float = 0.10,
+        compute_h_fn: Optional[Callable[[np.ndarray], float]] = None,
+    ):
         """
         Initialize the storage buffer with pre-allocated memory.
         
         Args:
-            max_samples: Maximum number of samples to store (default: 50,000)
+            max_samples: Maximum number of samples to store in the Recent buffer (default: 50,000)
             min_samples_for_training: Minimum samples before training starts (default: 1,000)
-            sample_dim: Dimension of each sample (state_dim + action_dim + next_state_dim).
+            sample_dim: Dimension of each sample (flat vector). If None, inferred from first batch added.
                        If None, will be inferred from first batch added.
+            state_dim: State dimension (required for Critical classification).
+            action_dim: Action dimension (required for Critical classification).
+            critical_fraction: Fraction of each sampled batch to draw from the Critical buffer (default: 0.20).
+            critical_capacity_fraction: Critical buffer capacity as a fraction of Recent capacity (default: 0.20).
+            h_critical_threshold: Route to Critical if h(x) <= threshold (default: 2.0).
+            intervention_l2_threshold: Route to Critical if ||u_f - u_n||_2 >= threshold (default: 0.10).
+            compute_h_fn: Callable used to compute h(x) from a state vector x.
+                          Required when `state_dim` and `action_dim` are provided.
         """
-        self.max_samples = max_samples
+        self.max_samples = int(max_samples)
         self.min_samples_for_training = min_samples_for_training
         self.sample_dim = sample_dim
-        self.current_size = 0  # Number of samples currently in buffer
-        self.write_index = 0  # Ring buffer write position
-        
-        # Pre-allocate buffer if sample_dim is known, otherwise allocate on first add
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.critical_fraction = float(critical_fraction)
+        self.critical_capacity_fraction = float(critical_capacity_fraction)
+        self.h_critical_threshold = float(h_critical_threshold)
+        self.intervention_l2_threshold = float(intervention_l2_threshold)
+        self.compute_h_fn = compute_h_fn
+
+        # Critical classification requires state/action dims and a barrier function h(x).
+        if (self.state_dim is None) != (self.action_dim is None):
+            raise ValueError("FilterStorageBuffer requires both state_dim and action_dim (or neither)")
+        if self.state_dim is not None and self.action_dim is not None:
+            if self.compute_h_fn is None:
+                raise ValueError(
+                    "FilterStorageBuffer requires compute_h_fn when state_dim/action_dim are provided "
+                    "(needed to compute h(x) for Critical classification)"
+                )
+
+        # Buffers are allocated once sample_dim is known.
+        self.recent_buffer: Optional[FilterStorageBuffer._RingBuffer] = None
+        self.critical_buffer: Optional[FilterStorageBuffer._RingBuffer] = None
+        self._initialized = False
         if sample_dim is not None:
-            self.buffer = np.zeros((max_samples, sample_dim), dtype=np.float32)
-            self._initialized = True
-        else:
-            self.buffer = None
-            self._initialized = False
+            self._initialize_buffers(sample_dim)
+
+    def _initialize_buffers(self, sample_dim: int) -> None:
+        self.sample_dim = int(sample_dim)
+        recent_max = int(self.max_samples)
+        critical_max = max(1, int(round(recent_max * self.critical_capacity_fraction)))
+        self.recent_buffer = FilterStorageBuffer._RingBuffer(recent_max, self.sample_dim)
+        self.critical_buffer = FilterStorageBuffer._RingBuffer(critical_max, self.sample_dim)
+        self._initialized = True
+
+    def _classify_sample(self, sample: np.ndarray) -> bool:
+        """Return True if sample should go to Critical, else Recent."""
+        if self.state_dim is None or self.action_dim is None:
+            return False
+        if self.compute_h_fn is None:
+            raise RuntimeError(
+                "FilterStorageBuffer is configured for Critical classification "
+                "(state_dim/action_dim set) but compute_h_fn is missing"
+            )
+
+        sdim = int(self.state_dim)
+        adim = int(self.action_dim)
+        if sample.shape[0] != self.sample_dim:
+            raise ValueError(f"Sample dim {sample.shape[0]} doesn't match buffer dim {self.sample_dim}")
+
+        # Expected layout: [state (sdim), action_filtered (adim), next_state (sdim), action_nominal (adim)]
+        u_f_start = sdim
+        u_f_end = u_f_start + adim
+        u_n_start = u_f_end + sdim
+        u_n_end = u_n_start + adim
+        if u_n_end != self.sample_dim:
+            raise ValueError(
+                f"Sample layout mismatch: expected dim {u_n_end} from state_dim={sdim}, action_dim={adim}, got {self.sample_dim}"
+            )
+
+        x = sample[:sdim]
+        u_f = sample[u_f_start:u_f_end]
+        u_n = sample[u_n_start:u_n_end]
+
+        h = float(self.compute_h_fn(x))
+        delta = float(np.linalg.norm(u_f - u_n, ord=2))
+        return (h <= self.h_critical_threshold) or (delta >= self.intervention_l2_threshold)
     
     def add_batch(self, batch: np.ndarray) -> None:
         """
@@ -262,37 +382,33 @@ class FilterStorageBuffer:
         Uses FIFO retention: when full, overwrites oldest samples.
         
         Args:
-            batch: NumPy array of shape (batch_size, state_dim + action_dim + next_state_dim)
+            batch: NumPy array of shape (batch_size, sample_dim)
         """
         batch_size = batch.shape[0]
         sample_dim = batch.shape[1]
         
         # Initialize buffer on first call if sample_dim wasn't provided
         if not self._initialized:
-            if self.sample_dim is None:
-                self.sample_dim = sample_dim
-            self.buffer = np.zeros((self.max_samples, self.sample_dim), dtype=np.float32)
-            self._initialized = True
+            self._initialize_buffers(sample_dim)
         
         # Verify sample dimension matches
         if sample_dim != self.sample_dim:
             raise ValueError(f"Batch sample dimension {sample_dim} doesn't match buffer dimension {self.sample_dim}")
         
-        # Add each rollout from the batch individually
+        if self.recent_buffer is None or self.critical_buffer is None:
+            raise RuntimeError("FilterStorageBuffer buffers are not initialized")
+
+        # Add each rollout from the batch individually, routing to Recent/Critical
         for i in range(batch_size):
-            # Write to current position in ring buffer
-            self.buffer[self.write_index] = batch[i]
-            
-            # Advance write index (ring buffer wraps around)
-            self.write_index = (self.write_index + 1) % self.max_samples
-            
-            # Update current size (stops growing once buffer is full)
-            if self.current_size < self.max_samples:
-                self.current_size += 1
+            sample = batch[i]
+            if self._classify_sample(sample):
+                self.critical_buffer.add(sample)
+            else:
+                self.recent_buffer.add(sample)
     
     def sample_batches(self, n_batches: int, batch_size: int) -> Optional[List[np.ndarray]]:
         """
-        Sample random batches from storage buffer for training.
+        Sample random mixed batches from storage buffers for training.
         
         Args:
             n_batches: Number of batches to sample
@@ -302,39 +418,73 @@ class FilterStorageBuffer:
             List of batches, each of shape (batch_size, sample_dim),
             or None if not enough samples available
         """
-        if self.current_size < self.min_samples_for_training:
+        if not self._initialized or self.recent_buffer is None or self.critical_buffer is None:
             return None
-        
-        if self.current_size < batch_size:
+
+        total = self.size()
+        if total < self.min_samples_for_training:
             return None
-        
-        if not self._initialized or self.buffer is None:
+
+        if total < batch_size:
             return None
-        
-        sampled_indices = random.sample(range(self.current_size), n_batches * batch_size)
-        samples = self.buffer[sampled_indices].copy()
-        sampled_batches = []
-        for i in range(n_batches):
-            batch = samples[i * batch_size:(i + 1) * batch_size]
-            sampled_batches.append(batch)
+
+        crit_target = int(round(batch_size * self.critical_fraction))
+        crit_target = max(0, min(batch_size, crit_target))
+
+        sampled_batches: List[np.ndarray] = []
+        for _ in range(n_batches):
+            crit_size = self.critical_buffer.current_size
+            recent_size = self.recent_buffer.current_size
+
+            n_crit = min(crit_target, crit_size)
+            n_recent = min(batch_size - n_crit, recent_size)
+
+            # If Recent couldn't fill the remainder, backfill from Critical.
+            if n_crit + n_recent < batch_size:
+                needed = batch_size - (n_crit + n_recent)
+                n_crit = min(crit_size, n_crit + needed)
+
+            # If still short, we can't produce a full batch.
+            if n_crit + n_recent < batch_size:
+                return None
+
+            crit_samples = self.critical_buffer.sample(n_crit)
+            recent_samples = self.recent_buffer.sample(n_recent)
+            mixed = np.concatenate([crit_samples, recent_samples], axis=0)
+            # Shuffle to avoid ordering bias (crit first).
+            if mixed.shape[0] > 1:
+                mixed = mixed[np.random.permutation(mixed.shape[0])]
+            sampled_batches.append(mixed)
 
         return sampled_batches
     
     def size(self) -> int:
         """
-        Return current number of samples in the buffer.
+        Return current number of samples in both buffers (Recent + Critical).
         
         Returns:
             Number of samples currently stored
         """
-        return self.current_size
+        if not self._initialized or self.recent_buffer is None or self.critical_buffer is None:
+            return 0
+        return int(self.recent_buffer.current_size + self.critical_buffer.current_size)
+
+    def recent_size(self) -> int:
+        if not self._initialized or self.recent_buffer is None:
+            return 0
+        return int(self.recent_buffer.current_size)
+
+    def critical_size(self) -> int:
+        if not self._initialized or self.critical_buffer is None:
+            return 0
+        return int(self.critical_buffer.current_size)
     
     def clear(self) -> None:
         """Clear all stored data (reset to empty state)."""
-        self.current_size = 0
-        self.write_index = 0
-        if self.buffer is not None:
-            self.buffer.fill(0)
+        if self.recent_buffer is not None:
+            self.recent_buffer.clear()
+        if self.critical_buffer is not None:
+            self.critical_buffer.clear()
 
 
 if __name__ == "__main__":

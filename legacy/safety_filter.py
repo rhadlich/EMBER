@@ -49,32 +49,32 @@ class SafetyFilter:
     def __init__(self, 
                  state_dim: int, 
                  action_dim: int,
-                 ort_session: ort.InferenceSession,
-                 input_names: List[str],
-                 output_names: List[str]) -> None:
+                 ort_session: Optional[ort.InferenceSession] = None,
+                 input_names: Optional[List[str]] = None,
+                 output_names: Optional[List[str]] = None) -> None:
         """
-        Initialize SafetyFilter with ONNX Runtime session.
+        Initialize SafetyFilter.
         
-        This class only supports ORT models for inference. PyTorch models are handled
-        separately in custom_run.py for training, then converted to ORT format.
+        - If `ort_session` is provided, this instance can run inference and compute filtered actions.
+        - If `ort_session` is None, this instance can still be used for barrier computations
+          (e.g., `_compute_h`, `_compute_alpha`), but inference-based methods will raise.
         
         Args:
             state_dim: Dimension of state space
             action_dim: Dimension of action space
-            ort_session: ONNXruntime inference session (required)
-            input_names: Names of input tensors for ONNX model (required)
-            output_names: Names of output tensors for ONNX model (required)
+            ort_session: ONNXruntime inference session (optional; required for inference)
+            input_names: Names of input tensors for ONNX model (required if ort_session is provided)
+            output_names: Names of output tensors for ONNX model (required if ort_session is provided)
         """
-        if ort_session is None:
-            raise ValueError("ort_session must be provided")
-        if input_names is None or output_names is None:
-            raise ValueError("input_names and output_names must be provided")
+        if ort_session is not None:
+            if input_names is None or output_names is None:
+                raise ValueError("input_names and output_names must be provided when ort_session is provided")
         
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.ort_session = ort_session
-        self.input_names = input_names
-        self.output_names = output_names
+        self.input_names = list(input_names) if input_names is not None else []
+        self.output_names = list(output_names) if output_names is not None else []
 
         # define constants for barrier function (using numpy)
         self.a = np.zeros(state_dim, dtype=np.float32)
@@ -95,6 +95,17 @@ class SafetyFilter:
             - f_x: (state_dim,) - drift term
             - G_x: (state_dim, action_dim) - control matrix
         """
+        if self.ort_session is None:
+            raise RuntimeError(
+                "SafetyFilter was constructed without an ONNX Runtime session; "
+                "inference-based methods are unavailable."
+            )
+        if len(self.input_names) < 2 or len(self.output_names) < 1:
+            raise RuntimeError(
+                "SafetyFilter is missing ONNX input/output tensor names; "
+                "cannot run inference."
+            )
+
         # Ensure inputs are 2D with batch dimension
         if x.ndim == 1:
             x = np.expand_dims(x, 0)

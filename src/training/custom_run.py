@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 from configs.args import custom_args
 from onnxruntime.tools import convert_onnx_models_to_ort as c2o
 from pathlib import Path
-from src.core.safety.safety_filter import StatePredictor, FilterStorageBuffer
+from src.core.safety.safety_filter import StatePredictor, FilterStorageBuffer, SafetyFilter
 from scripts.minion import get_indices, set_indices
 
 import logging
@@ -496,9 +496,20 @@ def run_rllib_shared_memory(
         filter_storage_max_samples = config.env_config.get("filter_storage_max_samples", 50000)
         filter_storage_min_samples = config.env_config.get("filter_storage_min_samples", 1000)
         filter_storage_training_batch_size = config.env_config.get("filter_storage_training_batch_size", None)
+        filter_storage_critical_fraction = config.env_config.get("filter_storage_critical_fraction", 0.20)
+        filter_storage_critical_capacity_fraction = config.env_config.get("filter_storage_critical_capacity_fraction", 0.20)
+        filter_storage_h_critical_threshold = config.env_config.get("filter_storage_h_critical_threshold", 2.0)
+        filter_storage_intervention_l2_threshold = config.env_config.get("filter_storage_intervention_l2_threshold", 0.10)
         
         logger.debug(f"custom_run: Filter storage buffer config: max_samples={filter_storage_max_samples}, "
                     f"min_samples={filter_storage_min_samples}")
+        logger.debug(
+            "custom_run: Filter storage critical config: "
+            f"critical_fraction={filter_storage_critical_fraction}, "
+            f"critical_capacity_fraction={filter_storage_critical_capacity_fraction}, "
+            f"h_critical_threshold={filter_storage_h_critical_threshold}, "
+            f"intervention_l2_threshold={filter_storage_intervention_l2_threshold}"
+        )
         
         # Create PyTorch StatePredictor model
         filter_model = StatePredictor(
@@ -575,18 +586,35 @@ def run_rllib_shared_memory(
             logger.warning("custom_run: filter_ep_shm_properties not found in config, filter training will be disabled")
 
         # Initialize filter storage buffer
-        # Calculate sample dimension: state + action + next_state = 2*state_dim + action_dim
+        # Calculate sample dimension: state + action_filtered + next_state + action_nominal
         filter_storage_sample_dim = None
+        barrier_only_safety_filter = None
         if filter_ep_shm_properties is not None:
             state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
             action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
-            filter_storage_sample_dim = 2 * state_dim + action_dim  # state + action + next_state
+            filter_storage_sample_dim = sum(filter_ep_shm_properties["filter_dims"].values())
             logger.debug(f"custom_run: Filter storage sample_dim={filter_storage_sample_dim} (state={state_dim}, action={action_dim})")
+
+            # ORT-free SafetyFilter instance used only for compute_h() during Critical classification.
+            barrier_only_safety_filter = SafetyFilter(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                ort_session=None,
+                input_names=None,
+                output_names=None,
+            )
         
         filter_storage_buffer = FilterStorageBuffer(
             max_samples=filter_storage_max_samples,
             min_samples_for_training=filter_storage_min_samples,
-            sample_dim=filter_storage_sample_dim
+            sample_dim=filter_storage_sample_dim,
+            state_dim=state_dim if filter_ep_shm_properties is not None else None,
+            action_dim=action_dim if filter_ep_shm_properties is not None else None,
+            critical_fraction=filter_storage_critical_fraction,
+            critical_capacity_fraction=filter_storage_critical_capacity_fraction,
+            h_critical_threshold=filter_storage_h_critical_threshold,
+            intervention_l2_threshold=filter_storage_intervention_l2_threshold,
+            compute_h_fn=barrier_only_safety_filter.compute_h if barrier_only_safety_filter is not None else None,
         )
         logger.debug("custom_run: Initialized filter storage buffer")
         
@@ -806,7 +834,10 @@ def run_rllib_shared_memory(
                 
                 states = torch.from_numpy(batch[:, :state_dim]).float()
                 actions = torch.from_numpy(batch[:, state_dim:state_dim + action_dim]).float()
-                next_states = torch.from_numpy(batch[:, state_dim + action_dim:]).float()
+                # next_state is the segment immediately following action_filtered (ignore appended action_nominal)
+                next_state_start = state_dim + action_dim
+                next_state_end = next_state_start + state_dim
+                next_states = torch.from_numpy(batch[:, next_state_start:next_state_end]).float()
                 
                 # Forward pass
                 predicted_next_states, _, _ = model(states, actions)
@@ -978,143 +1009,3 @@ def run_rllib_shared_memory(
                 ray.shutdown()
 
         return results
-
-    # Run the experiment using Ray Tune.
-
-    # Log results using WandB.
-    tune_callbacks = tune_callbacks or []
-    if hasattr(args, "wandb_key") and (
-            args.wandb_key is not None or WANDB_ENV_VAR in os.environ
-    ):
-        wandb_key = args.wandb_key or os.environ[WANDB_ENV_VAR]
-        project = args.wandb_project or (
-                args.algo.lower() + "-" + re.sub("\\W+", "-", str(config.env).lower())
-        )
-        tune_callbacks.append(
-            WandbLoggerCallback(
-                api_key=wandb_key,
-                project=project,
-                upload_checkpoints=True,
-                **({"name": args.wandb_run_name} if args.wandb_run_name else {}),
-            )
-        )
-    # Auto-configure a CLIReporter (to log the results to the console).
-    # Use better ProgressReporter for multi-agent cases: List individual policy rewards.
-    if progress_reporter is None and args.num_agents > 0:
-        progress_reporter = CLIReporter(
-            metric_columns={
-                **{
-                    TRAINING_ITERATION: "iter",
-                    "time_total_s": "total time (s)",
-                    NUM_ENV_STEPS_SAMPLED_LIFETIME: "ts",
-                    f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": "combined return",
-                },
-                **{
-                    (
-                        f"{ENV_RUNNER_RESULTS}/module_episode_returns_mean/" f"{pid}"
-                    ): f"return {pid}"
-                    for pid in config.policies
-                },
-            },
-        )
-
-    # Force Tuner to use old progress output as the new one silently ignores our custom
-    # `CLIReporter`.
-    os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
-
-    # Run the actual experiment (using Tune).
-    start_time = time.time()
-    results = tune.Tuner(
-        trainable or config.algo_class,
-        param_space=config,
-        run_config=tune.RunConfig(
-            stop=stop,
-            verbose=args.verbose,
-            callbacks=tune_callbacks,
-            checkpoint_config=tune.CheckpointConfig(
-                checkpoint_frequency=args.checkpoint_freq,
-                checkpoint_at_end=args.checkpoint_at_end,
-            ),
-            progress_reporter=progress_reporter,
-        ),
-        tune_config=tune.TuneConfig(
-            num_samples=args.num_samples,
-            max_concurrent_trials=args.max_concurrent_trials,
-            scheduler=scheduler,
-        ),
-    ).fit()
-    time_taken = time.time() - start_time
-
-    if not keep_ray_up:
-        ray.shutdown()
-
-    # Error out, if Tuner.fit() failed to run. Otherwise, erroneous examples might pass
-    # the CI tests w/o us knowing that they are broken (b/c some examples do not have
-    # a --as-test flag and/or any passing criteris).
-    if results.errors:
-        raise RuntimeError(
-            "Running the example script resulted in one or more errors! "
-            f"{[e.args[0].args[2] for e in results.errors]}"
-        )
-
-    # If run as a test, check whether we reached the specified success criteria.
-    test_passed = False
-    if args.as_test:
-        # Success metric not provided, try extracting it from `stop`.
-        if success_metric is None:
-            for try_it in [
-                f"{EVALUATION_RESULTS}/{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}",
-                f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}",
-            ]:
-                if try_it in stop:
-                    success_metric = {try_it: stop[try_it]}
-                    break
-            if success_metric is None:
-                success_metric = {
-                    f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
-                }
-        # Get maximum value of `metric` over all trials
-        # (check if at least one trial achieved some learning, not just the final one).
-        success_metric_key, success_metric_value = next(iter(success_metric.items()))
-        best_value = max(
-            row[success_metric_key] for _, row in results.get_dataframe().iterrows()
-        )
-        if best_value >= success_metric_value:
-            test_passed = True
-            print(f"`{success_metric_key}` of {success_metric_value} reached! ok")
-
-        if args.as_release_test:
-            trial = results._experiment_analysis.trials[0]
-            stats = trial.last_result
-            stats.pop("config", None)
-            json_summary = {
-                "time_taken": float(time_taken),
-                "trial_states": [trial.status],
-                "last_update": float(time.time()),
-                "stats": stats,
-                "passed": [test_passed],
-                "not_passed": [not test_passed],
-                "failures": {str(trial): 1} if not test_passed else {},
-            }
-            with open(
-                    os.environ.get("TEST_OUTPUT_JSON", "/tmp/learning_test.json"),
-                    "wt",
-            ) as f:
-                try:
-                    json.dump(json_summary, f)
-                # Something went wrong writing json. Try again w/ simplified stats.
-                except Exception:
-                    from ray.rllib.algorithms.algorithm import Algorithm
-
-                    simplified_stats = {
-                        k: stats[k] for k in Algorithm._progress_metrics if k in stats
-                    }
-                    json_summary["stats"] = simplified_stats
-                    json.dump(json_summary, f)
-
-        if not test_passed:
-            raise ValueError(
-                f"`{success_metric_key}` of {success_metric_value} not reached!"
-            )
-
-    return results

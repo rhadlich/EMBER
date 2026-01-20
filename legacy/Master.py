@@ -147,7 +147,7 @@ if __name__ == "__main__":
     }
 
     # Define filter training data ring buffer properties (4x larger than actor buffer)
-    # Filter data format: (current_state, action, next_state)
+    # Filter data format: (current_state, action_filtered, next_state, action_nominal)
     filter_state_dim = obs_space_onehot.shape[0] if obs_space_onehot is not None else obs_space.shape[0]
     filter_action_dim = action_space.shape[0]
     
@@ -155,10 +155,11 @@ if __name__ == "__main__":
         "state": filter_state_dim,
         "action": filter_action_dim,
         "next_state": filter_state_dim,
+        "nominal_action": filter_action_dim,
     }
     FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
     FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)
-    FILTER_ELEMENTS_PER_ROLLOUT = sum(filter_dims.values())  # state + action + next_state
+    FILTER_ELEMENTS_PER_ROLLOUT = sum(filter_dims.values())  # state + action_filtered + next_state + action_nominal
     FILTER_BYTES_PER_ROLLOUT = FILTER_ELEMENTS_PER_ROLLOUT * bytes_per_float
     FILTER_PAYLOAD_SIZE = FILTER_ELEMENTS_PER_ROLLOUT * FILTER_BATCH_SIZE + filter_dims["state"]  # + initial state
     FILTER_HEADER_SIZE = HEADER_SIZE  # same structure
