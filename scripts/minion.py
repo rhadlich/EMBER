@@ -274,7 +274,7 @@ class Minion:
             self.logger.debug(f"Minion: filter_ep_arr shape -> {self.filter_ep_arr.shape}")
             self.logger.debug("Minion: connected to filter episode memory block")
 
-        # initialize environment (gym.Env or socket to LabVIEW)
+        # initialize environment
         env_type = self.config.env_config['env_type']
         if env_type == 'continuous':
             self.env = EngineEnvContinuous(reward=reward_fn)
@@ -521,15 +521,15 @@ class Minion:
         else:
             return False
 
-    def try_update_ort_weights(self) -> bool:
+    def _try_update_ort_weights(self) -> bool:
         """Convenience wrapper for backward compatibility."""
         return self.try_update_weights(model_type='actor')
 
-    def try_update_filter_weights(self) -> bool:
+    def _try_update_filter_weights(self) -> bool:
         """Convenience wrapper for backward compatibility."""
         return self.try_update_weights(model_type='filter')
 
-    def write_fragment(
+    def _write_fragment(
             self,
             data: np.ndarray,
             is_initial_state: Optional[bool] = False,
@@ -712,7 +712,34 @@ class Minion:
             is_initial_state: Optional[bool] = False,
     ) -> Optional[np.ndarray]:
         """Convenience wrapper for backward compatibility."""
-        return self.write_fragment(data, is_initial_state=is_initial_state, buffer_type='filter')
+        return self._write_fragment(data, is_initial_state=is_initial_state, buffer_type='filter')
+    
+    def _get_obs_for_model(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Helper function to format observation for model inference.
+        """
+        if self.obs_is_discrete:
+            # one-hot encode observation
+            obs_for_model = np.array([flatten_obs_onehot(obs, self.env.imep_space, self.env.mprr_space)],
+                                        np.float32)
+        else:
+            obs_for_model = np.array([obs], np.float32)
+
+        if obs_for_model.ndim == 1:
+            obs_for_model = np.expand_dims(obs_for_model, axis=0)
+
+        return obs_for_model
+    
+    def _get_action_for_env(self, action: np.ndarray) -> np.ndarray:
+        """
+        Helper function to format action for environment.
+        """
+        if self.action_adapter.mode == "continuous":
+            action_for_env = np.concatenate(([550, ], self.action_adapter.get_action_in_env_range(action)),
+                                            dtype=np.float32)
+        else:
+            action_for_env = np.concatenate(([1, ], action), dtype=np.int32)
+        return action_for_env
 
     def collect_rollouts(
             self,
@@ -746,21 +773,14 @@ class Minion:
 
             # self.logger.debug("Minion: in loop to collect rollouts")
 
-            if self.obs_is_discrete:
-                # one-hot encode observation
-                obs_for_model = np.array([flatten_obs_onehot(obs, self.env.imep_space, self.env.mprr_space)],
-                                         np.float32)
-            else:
-                obs_for_model = np.array([obs], np.float32)
-
-            if obs_for_model.ndim == 1:
-                obs_for_model = np.expand_dims(obs_for_model, axis=0)
+            # format observation for model
+            obs_for_model = self._get_obs_for_model(obs)
 
             # self.logger.debug(f"Minion: obs_for_model: {obs_for_model}")
 
             tic2 = time.time()
+            # perform inference to get action distribution
             try:
-                # inference pass through actor network
                 # first [0] -> selects "output". second [0] -> selects 0th batch
                 net_out = self._ort_session_run(self.ort_session, obs_for_model)[0][0]
             except Exception as e:
@@ -771,8 +791,8 @@ class Minion:
 
             # self.logger.debug(f"Minion: performed action inference, net_out={net_out}, type={type(net_out)}")
 
-            # Time policy sampling
             tic_policy = time.time()
+            # sample action from policy distribution
             action_sampled, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
                                                                                        deterministic=deterministic)
             toc_policy = time.time()
@@ -794,11 +814,8 @@ class Minion:
                 except Exception as e:
                     self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
 
-            if self.action_adapter.mode == "continuous":
-                action_for_env = np.concatenate(([550, ], self.action_adapter.get_action_in_env_range(action_sampled)),
-                                                dtype=np.float32)
-            else:
-                action_for_env = np.concatenate(([1, ], action_sampled), dtype=np.int32)
+            # format action for environment
+            action_for_env = self._get_action_for_env(action_sampled)
 
             # self.logger.debug(f"Minion: made action vector: action_for_env={action_for_env}")
 
@@ -809,13 +826,15 @@ class Minion:
             duration_env_ms = (toc_env - tic_env) * 1000.0
             self.timing_recorder.record_timing('env_step', duration_env_ms)
 
-            # Collect filter training data: (current_state, action, next_state)
+            # Collect filter training data (current_state, action, next_state) and write to filter buffer.
+            # This is done here to make sure all sampled data is written to buffer, independent of whether
+            # sampling is deterministic or not.
             if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
                 try:
                     current_state = obs_for_model[0]  # Current state before action
                     next_state_flat = _flatten_obs_array(obs)  # Next state after action
                     filter_data = np.concatenate([current_state, action_sampled, next_state_flat]).astype(np.float32)
-                    self.write_filter_fragment(filter_data)
+                    self._write_fragment(filter_data, buffer_type='filter')
                 except Exception as e:
                     self.logger.debug(f"Minion: Failed to write filter training data: {e}")
 
@@ -853,11 +872,11 @@ class Minion:
 
         if not self.last_obs:
             obs, info = self.env.reset()
-            self.write_fragment(_flatten_obs_array(obs), is_initial_state=True)
+            self._write_fragment(_flatten_obs_array(obs), is_initial_state=True, buffer_type='actor')
             # Write initial state for filter buffer too
             if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
                 initial_state = _flatten_obs_array(obs)
-                self.write_filter_fragment(initial_state, is_initial_state=True)
+                self._write_fragment(initial_state, is_initial_state=True, buffer_type='filter')
         else:
             obs = self.last_obs
 
@@ -889,7 +908,7 @@ class Minion:
             # self.logger.debug(f"Minion (train_and_eval_sequence): built packet.")
 
             # write it into the buffer
-            self.write_fragment(current_packet)
+            self._write_fragment(current_packet, is_initial_state=False, buffer_type='actor')
 
             # self.logger.debug(f"Minion (train_and_eval_sequence): wrote to buffer.")
 
@@ -971,13 +990,13 @@ def main(policy_shm_name: str,
     try:
         while True:
 
-            weights_updated = actor.try_update_ort_weights()
+            weights_updated = actor.try_update_weights(model_type='actor')
             if weights_updated:
                 actor.logger.debug(f"Minion: Actor update number -> {weight_updates}.")
                 weight_updates += 1
 
             # Try to update filter weights
-            filter_weights_updated = actor.try_update_filter_weights()
+            filter_weights_updated = actor.try_update_weights(model_type='filter')
             if filter_weights_updated:
                 actor.logger.debug("Minion: Filter weights updated.")
 
