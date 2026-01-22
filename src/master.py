@@ -9,9 +9,9 @@ import numpy as np
 import os
 
 from gymnasium import spaces
-from src.core.environments.engine_env import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
+from core.environments.engine_env import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
 
-from src.training.env_runner import SharedMemoryEnvRunner
+from env_runner import SharedMemoryEnvRunner
 # from ray.rllib.utils.test_utils import (
 #     add_rllib_example_script_args,
 #     run_rllib_example_script_experiment,
@@ -20,10 +20,10 @@ from ray.tune.registry import get_trainable_cls
 from ray.rllib.core.rl_module import RLModuleSpec
 
 from configs.args import get_full_parser
-from src.training.custom_run import run_rllib_shared_memory
+from custom_run import run_rllib_shared_memory
 
-from src.utils.utils import ActionAdapter
-from src.core.rl_modules.impala_rl_modules import ImpalaMlpModule
+from utils.utils import ActionAdapter
+from core.rl_modules.impala_rl_modules import ImpalaMlpModule
 
 import logging
 
@@ -148,14 +148,12 @@ if __name__ == "__main__":
 
     # Define filter training data ring buffer properties (4x larger than actor buffer)
     # Filter data format: (current_state, action_filtered, next_state, action_nominal)
-    filter_state_dim = obs_space_onehot.shape[0] if obs_space_onehot is not None else obs_space.shape[0]
-    filter_action_dim = action_space.shape[0]
     
     filter_dims = {
-        "state": filter_state_dim,
-        "action": filter_action_dim,
-        "next_state": filter_state_dim,
-        "nominal_action": filter_action_dim,
+        "state": dims["state"],
+        "action": dims["action"],
+        "next_state": dims["state"],
+        "nominal_action": dims["action"],
     }
     FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
     FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)

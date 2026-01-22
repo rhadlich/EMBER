@@ -8,10 +8,10 @@ from ray.rllib.core.rl_module.apis.value_function_api import ValueFunctionAPI
 from ray.rllib.core.rl_module.torch import TorchRLModule
 from ray.rllib.models.torch.torch_distributions import TorchMultiCategorical
 
-from ...utils.utils import ActionAdapter
+from utils.utils import ActionAdapter
 
 import logging
-from ...utils import logging_setup
+import utils.logging_setup as logging_setup
 
 
 class ImpalaMlpModule(TorchRLModule, ValueFunctionAPI):

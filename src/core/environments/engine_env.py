@@ -4,10 +4,10 @@ from .reward_typing import RewardFn
 import numpy as np
 from typing import Union
 
-from .predictor import Predictor
+from core.environments.predictor import Predictor
 
 import logging
-import src.utils.logging_setup as logging_setup
+import utils.logging_setup as logging_setup
 
 
 class EngineEnvDiscrete(gym.Env):
@@ -76,7 +76,7 @@ class EngineEnvDiscrete(gym.Env):
         dropout = 0.1
         self.predictor = Predictor()
         # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
-        path = 'assets/models/model_weights_mac.pth'
+        path = 'src/assets/models/model_weights_mac.pth'
         self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
 
         self.logger = logging.getLogger("MyRLApp.Environment")

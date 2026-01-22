@@ -1,4 +1,4 @@
-from src.core.rl_modules.impala_rl_modules import ImpalaMlpModule
+from core.rl_modules.impala_rl_modules import ImpalaMlpModule
 from ray.rllib.core.rl_module import RLModuleSpec
 
 

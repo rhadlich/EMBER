@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from .define_models import MLP
+from core.environments.define_models import MLP
 
 
 class Predictor:

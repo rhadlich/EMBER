@@ -1,4 +1,4 @@
-from src.core.rl_modules.appo_rl_modules import AppoMlpModule
+from core.rl_modules.appo_rl_modules import AppoMlpModule
 from ray.rllib.core.rl_module import RLModuleSpec
 from ray.rllib.core.rl_module.default_model_config import DefaultModelConfig
 

@@ -15,7 +15,7 @@ from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
 from ray.rllib.models.distributions import Distribution
 
 import logging
-import src.utils.logging_setup as logging_setup
+import utils.logging_setup as logging_setup
 import csv
 import time
 from datetime import datetime

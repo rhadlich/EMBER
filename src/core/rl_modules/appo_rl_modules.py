@@ -16,10 +16,10 @@ from ray.rllib.core.rl_module.apis import (
 )
 from ray.rllib.utils.typing import NetworkType
 
-from ...utils.utils import ActionAdapter
+from utils.utils import ActionAdapter
 
 import logging
-from ...utils import logging_setup
+import utils.logging_setup as logging_setup
 
 
 class AppoMlpModule(TorchRLModule, ValueFunctionAPI, TargetNetworkAPI):

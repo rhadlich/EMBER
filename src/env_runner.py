@@ -45,19 +45,19 @@ from ray.rllib.policy.policy_map import PolicyMap
 from ray.rllib.policy.policy import Policy
 
 from multiprocessing import shared_memory
-import scripts.minion as minion
-from src.training.custom_run import _get_current_onnx_model
+import minion
+from custom_run import _get_current_onnx_model
 import struct
 import ray
-from scripts.minion import (
+from utils.shared_memory_utils import (
     get_indices,
     set_indices,
     flatten_obs_onehot
 )
-from src.utils.utils import ActionAdapter
+from utils.utils import ActionAdapter
 
 import logging
-import src.utils.logging_setup as logging_setup
+import utils.logging_setup as logging_setup
 from pprint import pformat
 
 

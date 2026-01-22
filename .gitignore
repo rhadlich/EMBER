@@ -1,1 +1,4 @@
 migrate_repo.py
+*.onnx
+*.ort
+*.config

@@ -55,11 +55,11 @@ if TYPE_CHECKING:
 from configs.args import custom_args
 from onnxruntime.tools import convert_onnx_models_to_ort as c2o
 from pathlib import Path
-from src.core.safety.safety_filter import StatePredictor, FilterStorageBuffer, SafetyFilter
-from scripts.minion import get_indices, set_indices
+from core.safety.safety_filter import StatePredictor, FilterStorageBuffer, SafetyFilter
+from utils.shared_memory_utils import get_indices, set_indices
 
 import logging
-import src.utils.logging_setup as logging_setup
+import utils.logging_setup as logging_setup
 
 # Try to import zmq, but make it optional
 try:
