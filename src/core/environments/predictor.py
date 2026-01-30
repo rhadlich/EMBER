@@ -12,10 +12,13 @@ class Predictor:
         self.mean = np.array([6.5101062e+02, -7.2337663e-01, 4.4961038e-01])
         self.std = np.array([1.4219507e+02, 1.6561491e+00, 6.6634133e-02])
 
-        # create cad vector and tensor for appending to data
-        cad = np.arange(-360, 360, 0.1)
-        self.cad_plt = cad
-        self.res = 720 / self.cad_plt.size      # resolution of pressure trace
+        # create crank-angle degree (CAD) vectors
+        # Full cycle (-360..360) at 0.1 CAD resolution -> 7200 samples.
+        self.cad_plt = np.arange(-360, 360, 0.1)
+        # For IMEP/work computations we use the center window (-180..180) -> 3600 samples,
+        # which matches the predictor network output size used elsewhere.
+        self.cad_window = self.cad_plt[1800:-1800]
+        self.res = 720 / self.cad_plt.size      # resolution of pressure trace (CAD/sample)
         self.cad = np.reshape(self.cad_plt, [1, -1, 1])
 
         # engine parameters for IMEP calc.
@@ -66,7 +69,8 @@ class Predictor:
     def model_predict(self, values, *, noise_in_percent=None):
         # case of no injection
         if values[2] == 0:
-            p = np.zeros(self.cad_plt.size)
+            # Must match the volume vectors (self.V*) used below (length 3600 -> diffs 3599).
+            p = np.zeros(self.V.size, dtype=np.float32)
 
         # if injection
         else:
@@ -90,7 +94,9 @@ class Predictor:
         if noise_in_percent is not None:
             imep = imep + np.random.normal(0, imep * noise_in_percent / 100)
             mprr = mprr + np.random.normal(0, mprr * noise_in_percent / 100)
-        return p, imep, mprr, self.cad_plt
+        # Return a CAD vector aligned with `p`
+        cad = self.cad_window if p.shape[0] == self.V.shape[0] else self.cad_plt
+        return p, imep, mprr, cad
 
 # For RL, the states would have to be (assuming only IMEP matters) the current IMEP and the desired IMEP, and the
 # reward would be a negative of the MAE between current and desired IMEP.

@@ -46,7 +46,7 @@ from ray.rllib.policy.policy import Policy
 
 from multiprocessing import shared_memory
 import minion
-from custom_run import _get_current_onnx_model
+from run_algorithm import _get_current_onnx_model
 import struct
 import ray
 from utils.shared_memory_utils import (
@@ -553,7 +553,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                 self.logger.debug("EnvRunner: Created shm references.")
                 break
             except FileNotFoundError:
-                # could reach here before Master has created the shm. if so, wait and try again
+                # could reach here before setup_run has created the shm. if so, wait and try again
                 time.sleep(0.05)
 
     def _update_policy_shm(self, ort_raw: bytes):

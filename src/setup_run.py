@@ -2,7 +2,7 @@
 
 How to run this script
 ----------------------
-`python master.py --algo "algo_name (like PPO, SAC, etc.)" --no-tune
+`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --no-tune
 
 """
 import numpy as np
@@ -20,7 +20,7 @@ from ray.tune.registry import get_trainable_cls
 from ray.rllib.core.rl_module import RLModuleSpec
 
 from configs.args import get_full_parser
-from custom_run import run_rllib_shared_memory
+from run_algorithm import run_rllib_shared_memory
 
 from utils.utils import ActionAdapter
 from core.rl_modules.impala_rl_modules import ImpalaMlpModule
@@ -56,8 +56,8 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    logger = logging.getLogger("MyRLApp.Master")
-    logger.info(f"MASTER, PID={os.getpid()}")
+    logger = logging.getLogger("MyRLApp.setup_run")
+    logger.info(f"setup_run, PID={os.getpid()}")
 
     # make environment to have access to observation and action spaces
     if args.env_type.lower() == 'continuous':
@@ -159,12 +159,13 @@ if __name__ == "__main__":
     FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)
     FILTER_ELEMENTS_PER_ROLLOUT = sum(filter_dims.values())  # state + action_filtered + next_state + action_nominal
     FILTER_BYTES_PER_ROLLOUT = FILTER_ELEMENTS_PER_ROLLOUT * bytes_per_float
-    FILTER_PAYLOAD_SIZE = FILTER_ELEMENTS_PER_ROLLOUT * FILTER_BATCH_SIZE + filter_dims["state"]  # + initial state
+    FILTER_PAYLOAD_SIZE = FILTER_ELEMENTS_PER_ROLLOUT * FILTER_BATCH_SIZE  # filter buffer does not need initial state
     FILTER_HEADER_SIZE = HEADER_SIZE  # same structure
     FILTER_HEADER_SLOT_SIZE = HEADER_SLOT_SIZE
     FILTER_SLOT_SIZE = FILTER_HEADER_SLOT_SIZE + FILTER_PAYLOAD_SIZE
     FILTER_TOTAL_SIZE = FILTER_HEADER_SIZE + FILTER_NUM_SLOTS * FILTER_SLOT_SIZE
     FILTER_TOTAL_SIZE_BYTES = int(FILTER_TOTAL_SIZE * bytes_per_float)
+    FILTER_N_BATCHES_FOR_TRAINING_ITERATION = 16
     
     logger.debug(f"Filter buffer: BATCH_SIZE={FILTER_BATCH_SIZE}, NUM_SLOTS={FILTER_NUM_SLOTS}")
     logger.debug(f"Filter ELEMENTS_PER_ROLLOUT: {FILTER_ELEMENTS_PER_ROLLOUT}")
@@ -184,11 +185,12 @@ if __name__ == "__main__":
         "TOTAL_SIZE_BYTES": FILTER_TOTAL_SIZE_BYTES,
         "STATE_ACTION_DIMS": filter_dims,
         "BYTES_PER_FLOAT": bytes_per_float,
+        "N_BATCHES_FOR_TRAINING_ITERATION": FILTER_N_BATCHES_FOR_TRAINING_ITERATION,
         "name": "filter_episodes",
         "filter_dims": filter_dims,
     }
 
-    # Define the RLlib (Master) config.
+    # Define the RLlib config.
     base_config = (
         get_trainable_cls(args.algo)
         # IMPALAConfig(algo_class=IMPALADebug)

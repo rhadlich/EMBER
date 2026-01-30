@@ -169,6 +169,7 @@ class ActionAdapter:
         Normalize the action to match what the learner expects according to the action distribution class.
         """
         if self.action_dist_cls == TorchDiagGaussian:
+            # TODO: Check if this is correct.
             return torch.clamp(action, min=-1.0, max=1.0)
         elif self.action_dist_cls == TorchSquashedGaussian:
             # squashed gaussian already squashes to the env range
@@ -178,7 +179,10 @@ class ActionAdapter:
 
     def get_action_in_env_range(self, action: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
         """
-        Get the action to be in the environment range if it is not already.
+        Get the action to be in the environment range if it is not already. These are the
+        action_dist_classes that each algorithm uses in RLlib so it's necessary to implement
+        exactly as such. When adding a new algorithm, the action distribution class should be
+        checked and implemented accordingly.
         """
         if isinstance(action, torch.Tensor):
             action = action.numpy().astype(np.float32)

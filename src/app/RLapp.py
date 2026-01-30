@@ -74,17 +74,17 @@ class MainWindow(QtWidgets.QMainWindow):
         #========= DEFINE WHICH ALGO TO RUN HERE ==========================================
         algo = 'IMPALA'
 
-        # launch Master.py (which is set up to spawn custom_run.py, shared_memory_env_runner.py, minion.py)
+        # launch setup_run.py (which is set up to spawn custom_run.py, shared_memory_env_runner.py, minion.py)
         script_dir = os.path.dirname('/Users/rodrigohadlich/PycharmProjects/RayProject/')
-        master_path = os.path.join(script_dir, "Master.py")
+        setup_run_path = os.path.join(script_dir, "setup_run.py")
         cmd = [
             sys.executable,
-            master_path,
+            setup_run_path,
             "--algo", algo,
             "--enable-zmq", "True",
         ]
         # use the same Python interpreter
-        self.master_proc = subprocess.Popen(cmd)
+        self.setup_run_proc = subprocess.Popen(cmd)
 
         # create containers for plot parameters
         self.plot_colors = ["#e60049", "#0bb4ff", "#50e991", "#ffa300", "#9b19f5", "#dc0ab4", "#b3d4ff", "#00bfa0"]
@@ -263,19 +263,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.listener.isRunning():
             self.listener.stop()
 
-        if self.master_proc.poll() is None:
-            self.master_proc.terminate()
+        if self.setup_run_proc.poll() is None:
+            self.setup_run_proc.terminate()
             try:
-                self.master_proc.wait(timeout=2)
+                self.setup_run_proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                self.master_proc.kill()
+                self.setup_run_proc.kill()
 
     def closeEvent(self, event):
         # Clean up ZMQ thread
         self.listener.stop()
-        # Terminate Master.py (and thus its children)
-        if self.master_proc.poll() is None:
-            self.master_proc.terminate()
+        # Terminate setup_run.py (and thus its children)
+        if self.setup_run_proc.poll() is None:
+            self.setup_run_proc.terminate()
         super().closeEvent(event)
 
     @QtCore.pyqtSlot()

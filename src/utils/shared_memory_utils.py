@@ -1,6 +1,6 @@
 """Utility functions for shared memory buffer operations.
 
-These functions are used for managing shared memory buffers between the master
+These functions are used for managing shared memory buffers between the learner
 and minion processes.
 """
 from multiprocessing import shared_memory

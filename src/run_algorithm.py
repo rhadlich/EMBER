@@ -11,6 +11,7 @@ import gzip
 import base64
 import struct
 import signal
+from gymnasium import spaces
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -261,8 +262,8 @@ def run_rllib_shared_memory(
     if args.as_release_test:
         args.as_test = True
 
-    logger = logging.getLogger("MyRLApp.custom_runner")
-    logger.info(f"custom_runner, PID={os.getpid()}")
+    logger = logging.getLogger("MyRLApp.run_algorithm")
+    logger.info(f"run_algorithm, PID={os.getpid()}")
 
     # Pin to CPU core if specified
     if args.cpu_core_learner is not None:
@@ -272,7 +273,7 @@ def run_rllib_shared_memory(
 
     # pass main driver PID down to EnvRunner
 
-    logger.debug("custom_run: Started custom run function")
+    logger.debug("run_algorithm: Started custom run function")
 
     # Initialize Ray.
     ray.init(
@@ -282,7 +283,7 @@ def run_rllib_shared_memory(
         runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}},
     )
 
-    logger.debug("custom_run: Concluded ray.init()")
+    logger.debug("run_algorithm: Concluded ray.init()")
 
     # Define one or more stopping criteria.
     if stop is None:
@@ -407,7 +408,7 @@ def run_rllib_shared_memory(
         if args.output is not None:
             config.offline_data(output=args.output)
 
-    logger.debug("custom_run: Done with setting config. Going into args.no_tune")
+    logger.debug("run_algorithm: Done with setting config. Going into args.no_tune")
 
     signal.signal(signal.SIGTERM, on_sigterm)
 
@@ -442,18 +443,18 @@ def run_rllib_shared_memory(
         f_buf[6] = 0  # set filter episode lock flag to unlocked
         f_buf[7] = 0  # reserved
 
-        logger.debug("custom_run: created flag memory buffer")
+        logger.debug("run_algorithm: created flag memory buffer")
 
         # build algorithm, EnvRunner is created in this call
         algo = config.build()
 
-        logger.debug("custom_run: done with config.build()")
+        logger.debug("run_algorithm: done with config.build()")
 
         # extract dimensions of weights in the networks
         ort_raw = _get_current_onnx_model(algo.get_module(), logger=logger)
         policy_nbytes = len(ort_raw)
 
-        logger.debug(f"custom_run: ort_raw length is {policy_nbytes}")
+        logger.debug(f"run_algorithm: ort_raw length is {policy_nbytes}")
 
         # create policy shared memory blocks
         # need to include one more float32 as the buffer header to contain length of ort_compressed.
@@ -466,12 +467,12 @@ def run_rllib_shared_memory(
             size=policy_nbytes + header_offset
         )
 
-        logger.debug("custom_run: created policy memory buffer")
+        logger.debug("run_algorithm: created policy memory buffer")
 
         # get reference to policy buffer
         p_buf = p_shm.buf
 
-        logger.debug(f"custom_run: buffer length is {len(p_buf)}")
+        logger.debug(f"run_algorithm: buffer length is {len(p_buf)}")
 
         # store initial weights and remove lock flags
         struct.pack_into("<I", p_buf, 0, policy_nbytes)
@@ -479,16 +480,36 @@ def run_rllib_shared_memory(
         f_buf[0] = 0  # set lock flag to unlocked
         f_buf[1] = 1  # set weights-available flag to 1 (true)
 
-        logger.debug("custom_run: stored initial model weights")
+        logger.debug("run_algorithm: stored initial model weights")
 
         # Initialize filter model (StatePredictor)
-        filter_state_dim = config.observation_space.shape[0]
-        filter_action_dim = config.action_space.shape[0]
+        filter_dims = config.env_config.get("filter_ep_shm_properties", None).get("filter_dims", None)
+        filter_state_dim = filter_dims.get("state", None)
+        filter_action_dim = filter_dims.get("action", None)
+        # if isinstance(config.observation_space, spaces.Discrete):
+        #     filter_state_dim = config.observation_space.n.size
+        # elif isinstance(config.observation_space, spaces.Tuple):
+        #     filter_state_dim = len(config.observation_space)
+        # elif isinstance(config.observation_space, spaces.Box):
+        #     filter_state_dim = len(config.observation_space.shape)
+        # else:
+        #     raise NotImplementedError(f"Observation space type not supported or not provided.")
+        
+        # if isinstance(config.action_space, spaces.Discrete):
+        #     filter_action_dim = config.action_space.n.size
+        # elif isinstance(config.action_space, spaces.Tuple):
+        #     filter_action_dim = len(config.action_space)
+        # else:
+        #     raise NotImplementedError(f"Action space type not supported or not provided.")
+        
+        if filter_state_dim is None or filter_action_dim is None:
+            raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
+        
         filter_num_hidden = config.env_config.get("filter_num_hidden", 2)
         filter_hidden_exp = config.env_config.get("filter_hidden_exp", 7)
         filter_dropout = config.env_config.get("filter_dropout", 0.0)
         
-        logger.debug(f"custom_run: Initializing filter model with state_dim={filter_state_dim}, "
+        logger.debug(f"run_algorithm: Initializing filter model with state_dim={filter_state_dim}, "
                     f"action_dim={filter_action_dim}, num_hidden={filter_num_hidden}, "
                     f"hidden_exp={filter_hidden_exp}, dropout={filter_dropout}")
         
@@ -501,10 +522,10 @@ def run_rllib_shared_memory(
         filter_storage_h_critical_threshold = config.env_config.get("filter_storage_h_critical_threshold", 2.0)
         filter_storage_intervention_l2_threshold = config.env_config.get("filter_storage_intervention_l2_threshold", 0.10)
         
-        logger.debug(f"custom_run: Filter storage buffer config: max_samples={filter_storage_max_samples}, "
+        logger.debug(f"run_algorithm: Filter storage buffer config: max_samples={filter_storage_max_samples}, "
                     f"min_samples={filter_storage_min_samples}")
         logger.debug(
-            "custom_run: Filter storage critical config: "
+            "run_algorithm: Filter storage critical config: "
             f"critical_fraction={filter_storage_critical_fraction}, "
             f"critical_capacity_fraction={filter_storage_critical_capacity_fraction}, "
             f"h_critical_threshold={filter_storage_h_critical_threshold}, "
@@ -525,7 +546,7 @@ def run_rllib_shared_memory(
         filter_ort_raw = _get_filter_onnx_model(filter_model, logger=logger, outdir="filter_model.onnx")
         filter_policy_nbytes = len(filter_ort_raw)
         
-        logger.debug(f"custom_run: filter_ort_raw length is {filter_policy_nbytes}")
+        logger.debug(f"run_algorithm: filter_ort_raw length is {filter_policy_nbytes}")
         
         # Create filter policy shared memory block
         # Size: header (4 bytes) + ORT model + MSE loss (4 bytes float32)
@@ -536,12 +557,12 @@ def run_rllib_shared_memory(
             size=filter_policy_nbytes + header_offset + 4  # +4 for MSE float32
         )
         
-        logger.debug("custom_run: created filter policy memory buffer")
+        logger.debug("run_algorithm: created filter policy memory buffer")
         
         # Get reference to filter policy buffer
         filter_p_buf = filter_p_shm.buf
         
-        logger.debug(f"custom_run: filter buffer length is {len(filter_p_buf)}")
+        logger.debug(f"run_algorithm: filter buffer length is {len(filter_p_buf)}")
         
         # Store initial filter weights and remove lock flags
         struct.pack_into("<I", filter_p_buf, 0, filter_policy_nbytes)
@@ -552,7 +573,7 @@ def run_rllib_shared_memory(
         f_buf[2] = 0  # set filter lock flag to unlocked
         f_buf[3] = 1  # set filter weights-available flag to 1 (true)
         
-        logger.debug("custom_run: stored initial filter model weights with MSE=0.0")
+        logger.debug("run_algorithm: stored initial filter model weights with MSE=0.0")
 
         # Create filter episode shared memory block for training data
         filter_ep_shm_properties = config.env_config.get("filter_ep_shm_properties")
@@ -567,7 +588,7 @@ def run_rllib_shared_memory(
                 filter_ep_arr = np.ndarray(shape=(filter_ep_shm_properties["TOTAL_SIZE"],),
                                            dtype=np.float32,
                                            buffer=filter_ep_buf)
-                logger.debug(f"custom_run: Connected to existing filter episode shared memory: {filter_ep_arr.shape}")
+                logger.debug(f"run_algorithm: Connected to existing filter episode shared memory: {filter_ep_arr.shape}")
             except FileNotFoundError:
                 # Create if it doesn't exist
                 filter_ep_shm = shared_memory.SharedMemory(
@@ -581,9 +602,9 @@ def run_rllib_shared_memory(
                                            buffer=filter_ep_buf)
                 # Initialize write and read indices to 0
                 filter_ep_arr[:2] = 0
-                logger.debug(f"custom_run: Created filter episode shared memory: {filter_ep_arr.shape}")
+                logger.debug(f"run_algorithm: Created filter episode shared memory: {filter_ep_arr.shape}")
         else:
-            logger.warning("custom_run: filter_ep_shm_properties not found in config, filter training will be disabled")
+            logger.warning("run_algorithm: filter_ep_shm_properties not found in config, filter training will be disabled")
 
         # Initialize filter storage buffer
         # Calculate sample dimension: state + action_filtered + next_state + action_nominal
@@ -593,7 +614,7 @@ def run_rllib_shared_memory(
             state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
             action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
             filter_storage_sample_dim = sum(filter_ep_shm_properties["filter_dims"].values())
-            logger.debug(f"custom_run: Filter storage sample_dim={filter_storage_sample_dim} (state={state_dim}, action={action_dim})")
+            logger.debug(f"run_algorithm: Filter storage sample_dim={filter_storage_sample_dim} (state={state_dim}, action={action_dim})")
 
             # ORT-free SafetyFilter instance used only for compute_h() during Critical classification.
             barrier_only_safety_filter = SafetyFilter(
@@ -616,7 +637,7 @@ def run_rllib_shared_memory(
             intervention_l2_threshold=filter_storage_intervention_l2_threshold,
             compute_h_fn=barrier_only_safety_filter.compute_h if barrier_only_safety_filter is not None else None,
         )
-        logger.debug("custom_run: Initialized filter storage buffer")
+        logger.debug("run_algorithm: Initialized filter storage buffer")
         
         # Store filter model and shared memory references for training loop
         filter_model_refs = {
@@ -632,28 +653,28 @@ def run_rllib_shared_memory(
 
         results = None
 
-        logger.debug("custom_run: waiting until minion starts collecting rollouts.")
+        logger.debug("run_algorithm: waiting until minion starts collecting rollouts.")
         # wait until the minion has started collecting rollouts
         while f_buf[4] == 0:  # minion data collection flag is now at index 4
             time.sleep(0.1)
-        logger.debug("custom_run: minion is now collecting rollouts")
+        logger.debug("run_algorithm: minion is now collecting rollouts")
 
         # debugging
-        # logger.debug(f"custom_run: circular_buffer_num_batches -> {algo.config.circular_buffer_num_batches}")
+        # logger.debug(f"run_algorithm: circular_buffer_num_batches -> {algo.config.circular_buffer_num_batches}")
         # logger.debug(
-        #     f"custom_run: circular_buffer_iterations_per_batch -> {algo.config.circular_buffer_iterations_per_batch}")
-        # logger.debug(f"custom_run: target_network_update_freq -> {algo.config.target_network_update_freq}")
+        #     f"run_algorithm: circular_buffer_iterations_per_batch -> {algo.config.circular_buffer_iterations_per_batch}")
+        # logger.debug(f"run_algorithm: target_network_update_freq -> {algo.config.target_network_update_freq}")
         # logger.debug(
-        #     f"custom_run: num_aggregator_actors_per_learner -> {algo.config.num_aggregator_actors_per_learner}")
+        #     f"run_algorithm: num_aggregator_actors_per_learner -> {algo.config.num_aggregator_actors_per_learner}")
         # logger.debug(
-        #     f"custom_run: num_envs_per_env_runner -> {algo.config.num_envs_per_env_runner}")
-        # logger.debug(f"custom_run: _skip_learners -> {algo.config._skip_learners}")
-        # logger.debug(f"custom_run: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
-        # logger.debug(f"custom_run: broadcast_env_runner_states? {algo.config.broadcast_env_runner_states}")
-        # logger.debug(f"custom_run: num_learners -> {algo.config.num_learners}")
-        # logger.debug(f"custom_run: min_sample_timesteps_per_iteration -> {algo.config.min_sample_timesteps_per_iteration}")
-        # logger.debug(f"custom_run: min_env_steps_per_iteration -> {algo.config.min_env_steps_per_iteration}")
-        # logger.debug(f"custom_run: min_time_s_per_iteration -> {algo.config.min_time_s_per_iteration}")
+        #     f"run_algorithm: num_envs_per_env_runner -> {algo.config.num_envs_per_env_runner}")
+        # logger.debug(f"run_algorithm: _skip_learners -> {algo.config._skip_learners}")
+        # logger.debug(f"run_algorithm: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
+        # logger.debug(f"run_algorithm: broadcast_env_runner_states? {algo.config.broadcast_env_runner_states}")
+        # logger.debug(f"run_algorithm: num_learners -> {algo.config.num_learners}")
+        # logger.debug(f"run_algorithm: min_sample_timesteps_per_iteration -> {algo.config.min_sample_timesteps_per_iteration}")
+        # logger.debug(f"run_algorithm: min_env_steps_per_iteration -> {algo.config.min_env_steps_per_iteration}")
+        # logger.debug(f"run_algorithm: min_time_s_per_iteration -> {algo.config.min_time_s_per_iteration}")
 
         merge = (
                         not algo.config.enable_env_runner_and_connector_v2
@@ -675,8 +696,8 @@ def run_rllib_shared_memory(
                             algo.config.enable_env_runner_and_connector_v2
                             and algo.config.broadcast_env_runner_states
                     )
-        logger.debug(f"custom_run: merge -> {merge}")
-        logger.debug(f"custom_run: broadcast -> {broadcast}")
+        logger.debug(f"run_algorithm: merge -> {merge}")
+        logger.debug(f"run_algorithm: broadcast -> {broadcast}")
 
         module = algo.get_module()
         dist_cls = module.get_inference_action_dist_cls()
@@ -707,6 +728,7 @@ def run_rllib_shared_memory(
             or None if no complete batch available.
             Also adds batches to storage buffer for accumulation.
             """
+            logger.debug("run_algorithm: Starting _read_filter_batch().")
             if filter_ep_arr is None or filter_ep_shm_properties is None:
                 return None
 
@@ -722,12 +744,16 @@ def run_rllib_shared_memory(
             if write_idx == read_idx:
                 set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
                 return None  # ring empty
+            
+            logger.debug(f"run_algorithm: write_idx: {write_idx}, read_idx: {read_idx}")
 
             # Calculate number of batches
             if write_idx < read_idx:
                 num_batches = ((filter_ep_shm_properties["NUM_SLOTS"] - 1) - read_idx) + write_idx + 1
             else:
                 num_batches = write_idx - read_idx
+
+            logger.debug(f"run_algorithm: num_batches: {num_batches}")
 
             batches = []
             for i in range(num_batches):
@@ -742,11 +768,6 @@ def run_rllib_shared_memory(
                 # Extract data from ring
                 data_start = slot_off + filter_ep_shm_properties["HEADER_SLOT_SIZE"]
                 payload = np.copy(filter_ep_arr[data_start: data_start + filter_ep_shm_properties["PAYLOAD_SIZE"]])
-                
-                # Extract initial state and remove it
-                state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
-                initial_state = payload[:state_dim]
-                payload = payload[state_dim:]
                 
                 # Reshape to (batch_size, elements_per_rollout)
                 batch = payload.reshape(filter_ep_shm_properties["BATCH_SIZE"], 
@@ -765,7 +786,10 @@ def run_rllib_shared_memory(
             set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
             return batches
 
-        def _sample_from_storage_buffer():
+        def _sample_from_storage_buffer(
+            n_batches: Optional[int] = 1,
+            batch_size: Optional[int] = None,
+        ):
             """Sample batches from storage buffer for training.
             Returns batches as numpy arrays or None if not enough samples available.
             """
@@ -774,16 +798,17 @@ def run_rllib_shared_memory(
                 return None
             
             # Determine batch size for sampling
-            training_batch_size = filter_model_refs.get('storage_training_batch_size')
-            if training_batch_size is None:
-                # Use ring buffer batch size as default
-                if filter_ep_shm_properties is not None:
-                    training_batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
-                else:
-                    training_batch_size = 128
+            if batch_size is None:
+                batch_size = filter_model_refs.get('storage_training_batch_size')
+                if batch_size is None:
+                    # Use ring buffer batch size as default
+                    if filter_ep_shm_properties is not None:
+                        batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
+                    else:
+                        batch_size = 128
             
             # Sample batches from storage buffer
-            sampled_batches = storage_buffer.sample_batches(n_batches=1, batch_size=training_batch_size)
+            sampled_batches = storage_buffer.sample_batches(n_batches=n_batches, batch_size=batch_size)
             return sampled_batches
 
         def _train_filter_model():
@@ -792,27 +817,36 @@ def run_rllib_shared_memory(
             for training if enough samples are available. Falls back to ring buffer batches if storage buffer is too small.
             Returns loss value or None if no data available.
             """
+            logger.debug("run_algorithm: Starting filter model training.")
+
             if filter_model_refs['model'] is None:
                 return None
 
             # First, read from ring buffer and accumulate in storage buffer
             ring_batches = _read_filter_batch()  # This also adds batches to storage buffer
+
+            logger.debug(f"run_algorithm: Read {len(ring_batches)} batches from ring buffer.")
             
             # Try to sample from storage buffer first
             batches = None
             storage_buffer = filter_model_refs.get('storage_buffer')
             if storage_buffer is not None and storage_buffer.size() >= storage_buffer.min_samples_for_training:
-                sampled = _sample_from_storage_buffer()
+                batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
+                n_batches = filter_ep_shm_properties.get("N_BATCHES_FOR_TRAINING_ITERATION", 1)
+                n_batches = n_batches if storage_buffer.size() >= batch_size*n_batches else 1
+                sampled = _sample_from_storage_buffer(n_batches=n_batches, batch_size=batch_size)
                 if sampled is not None and len(sampled) > 0:
                     batches = sampled
-                    logger.debug(f"custom_run: Using storage buffer for training ({storage_buffer.size()} samples)")
+                    logger.debug(f"run_algorithm: Using storage buffer for training ({storage_buffer.size()} samples)")
             
             # Fall back to ring buffer batches if storage buffer doesn't have enough samples
             if batches is None or len(batches) == 0:
                 batches = ring_batches
                 if batches is None or len(batches) == 0:
                     return None
-                logger.debug(f"custom_run: Using ring buffer for training (storage buffer has {storage_buffer.size() if storage_buffer else 0} samples)")
+                logger.debug(f"run_algorithm: Using ring buffer for training (storage buffer has {storage_buffer.size() if storage_buffer else 0} samples)")
+
+            logger.debug(f"run_algorithm: Using {len(batches)} batches for training.")
 
             model = filter_model_refs['model']
             model.train()  # Set to training mode
@@ -826,6 +860,8 @@ def run_rllib_shared_memory(
             
             total_loss = 0.0
             num_samples = 0
+
+            logger.debug("run_algorithm: Starting training loop in _train_filter_model().")
             
             for batch in batches:
                 # Split batch into state, action, next_state
@@ -853,10 +889,12 @@ def run_rllib_shared_memory(
                 total_loss += loss.item()
                 num_samples += states.shape[0]
             
+            logger.debug("run_algorithm: Training loop in _train_filter_model() completed.")
+            
             model.eval()  # Set back to eval mode
             
             avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
-            logger.debug(f"custom_run: Filter model training loss: {avg_loss:.6f}")
+            logger.debug(f"run_algorithm: Filter model training loss: {avg_loss:.6f}")
             
             return avg_loss
 
@@ -902,22 +940,28 @@ def run_rllib_shared_memory(
             f_buf[2] = 0  # set lock flag to unlocked
             f_buf[3] = 1  # set filter weights-available flag to 1 (true)
             
-            logger.debug(f"custom_run: Updated filter policy weights in shared memory with MSE={mse_loss:.6f}")
+            logger.debug(f"run_algorithm: Updated filter policy weights in shared memory with MSE={mse_loss:.6f}")
 
         try:
             # start counter
             train_iter = 0
             while True:
-                logger.debug("custom_run: in the train loop now.")
+                logger.debug("run_algorithm: in the train loop now.")
 
                 # perform one logical iteration of actor training
                 results = algo.train()
 
-                # Train filter model (alternating training)
-                filter_loss = _train_filter_model()
-                if filter_loss is not None:
-                    _update_filter_policy_shm(filter_loss)
-                    logger.debug(f"custom_run: Filter training completed, loss={filter_loss:.6f}")
+                logger.debug(f"run_algorithm: Completed iteration {train_iter} of actor training. Moving on to filter training.")
+
+                try:
+                    # Train filter model (alternating training)
+                    filter_loss = _train_filter_model()
+                    if filter_loss is not None:
+                        _update_filter_policy_shm(filter_loss)
+                        logger.debug(f"run_algorithm: Filter training completed, loss={filter_loss:.6f}")
+                except Exception as e:
+                    logger.debug(f"run_algorithm: Failed to train filter model: {e}")
+                    raise RuntimeError(f"Failed to train filter model: {e}")
 
                 state = algo.learner_group.get_state(components="learner")
                 if 'metrics_logger' in state['learner']:
@@ -935,12 +979,12 @@ def run_rllib_shared_memory(
 
                 seq_learn = state["learner"]["weights_seq_no"]
 
-                logger.debug(f"custom_run: learner weights_seq_no="
+                logger.debug(f"run_algorithm: learner weights_seq_no="
                              f"{seq_learn}")
 
                 # walk_keys(results)
-                # logger.debug(f"custom_run: results.keys()={results.keys()}.")
-                logger.debug("custom_run: printing BehaviourAudit.")
+                # logger.debug(f"run_algorithm: results.keys()={results.keys()}.")
+                logger.debug("run_algorithm: printing BehaviourAudit.")
                 try:
                     msg = {
                         "topic": "policy",
@@ -958,7 +1002,7 @@ def run_rllib_shared_memory(
 
 
                 # attempt at debugging
-                # logger.debug("custom_run: ran algo.train()")
+                # logger.debug("run_algorithm: ran algo.train()")
                 # target_updates = algo._counters["num_target_updates"]
                 # last_update = algo._counters["last_target_update_ts"]
                 # cur_ts = algo._counters[
@@ -968,15 +1012,15 @@ def run_rllib_shared_memory(
                 #         else "num_env_steps_sampled"
                 #     )
                 # ]
-                # logger.debug(f"custom_run: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
-                # logger.debug(f"custom_run: tentative update frequency: {algo.config.num_epochs * algo.config.minibatch_buffer_size}")
-                # logger.debug(f"custom_run: update math: {cur_ts - last_update}")
-                # logger.debug(f"custom_run: number of target updates: {target_updates}")
+                # logger.debug(f"run_algorithm: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
+                # logger.debug(f"run_algorithm: tentative update frequency: {algo.config.num_epochs * algo.config.minibatch_buffer_size}")
+                # logger.debug(f"run_algorithm: update math: {cur_ts - last_update}")
+                # logger.debug(f"run_algorithm: number of target updates: {target_updates}")
                 # last_synch = algo.metrics.peek(
                 #     "num_training_step_calls_since_last_synch_worker_weights",
                 # )
-                # logger.debug(f"custom_run: num training steps since last synch: {last_synch}")
-                # logger.debug(f"custom_run: num_weights_broadcast -> {algo.metrics.peek('num_weight_broadcasts')}")
+                # logger.debug(f"run_algorithm: num training steps since last synch: {last_synch}")
+                # logger.debug(f"run_algorithm: num_weights_broadcast -> {algo.metrics.peek('num_weight_broadcasts')}")
 
                 msg = {"topic": "training", "iteration": train_iter}  # to send to GUI
 

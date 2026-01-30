@@ -4,6 +4,8 @@ import numpy as np
 import onnxruntime as ort
 from typing import Callable, Optional, Tuple, List
 import random
+import logging
+import utils.logging_setup as logging_setup
 
 class StatePredictor(nn.Module):
     def __init__(self,
@@ -66,6 +68,9 @@ class SafetyFilter:
             input_names: Names of input tensors for ONNX model (required if ort_session is provided)
             output_names: Names of output tensors for ONNX model (required if ort_session is provided)
         """
+        self.logger = logging.getLogger("MyRLApp.safety_filter")
+        self.logger.info(f"SafetyFilter initialized with state_dim={state_dim}, action_dim={action_dim}")
+        
         if ort_session is not None:
             if input_names is None or output_names is None:
                 raise ValueError("input_names and output_names must be provided when ort_session is provided")
@@ -197,11 +202,15 @@ class SafetyFilter:
         Returns:
             Filtered action of shape (action_dim,)
         """
+        self.logger.debug(f"compute_filtered_action called with x={x}, kn={kn}, model_error={model_error}")
         # Ensure inputs are 1D arrays
         if x.ndim == 2:
             x = x[0]
         if kn.ndim == 2:
             kn = kn[0]
+        
+        # Get kn data type to match output
+        kn_dtype = kn.dtype
         
         # Ensure float32 dtype
         x = x.astype(np.float32)
@@ -218,19 +227,25 @@ class SafetyFilter:
         # In the case that the action does not affect the barrier function, return the original action
         # This implementation is more robust than only if it equals zero.
         if denom < self.eps:
-            return kn
+            return kn.astype(kn_dtype)
 
         # Compute remaining terms
         lie_F = float(np.dot(self.a, f_x - x))  # scalar
         alpha = self._compute_alpha(x)  # scalar
         rho = self._compute_rho(model_error)  # scalar
+
         
         # Compute correction term
         correction_term = -(lie_F + np.dot(lie_G, kn) + alpha - rho) / (denom + self.eps)  # scalar
         
         # Apply correction and return filtered action
         correction = max(correction_term, 0.0) * lie_G  # (action_dim,)
-        return kn + correction  # (action_dim,)
+
+        # print out intermediate values for debugging
+        self.logger.debug(f"compute_filtered_action: lie_G={lie_G}, denom={denom}, lie_F={lie_F}, alpha={alpha}, rho={rho}")
+        self.logger.debug(f"compute_filtered_action: correction_term={correction_term}, correction={correction}")
+
+        return (kn + correction).astype(kn_dtype)  # (action_dim,)
 
 
 class FilterStorageBuffer:

@@ -105,17 +105,16 @@ class EngineEnvDiscrete(gym.Env):
         return observation, info
 
     def step(self,
-             action_ind: Union[list, np.ndarray] = None,):
-
-        # get actions from indices to values
-        inj_p = self.inj_p_space[action_ind[0]]
-        soi = self.soi_space[action_ind[1]]
-        inj_d = self.inj_d_space[action_ind[2]]
-        action_arr = np.array([inj_p, soi, inj_d])
+             action_vals: Union[list, np.ndarray] = None,):
+        """
+        action_vals is expected to be in the order -> [inj_p, soi, inj_d] and to be
+        values rather than indices. Helper functions are provided to convert between
+        the two formats, but must be done prior to calling this function.
+        """
 
         # send action values to torch model and get new state
         pressure, self._current_imep, self._current_mprr, cad = (
-            self.predictor.model_predict(action_arr, noise_in_percent=1))
+            self.predictor.model_predict(action_vals, noise_in_percent=1))
 
         # get observation in the right format
         observation = self._get_obs()
@@ -138,6 +137,23 @@ class EngineEnvDiscrete(gym.Env):
 
     # def _get_obs(self):
     #     return {"state": np.array([self._current_imep, self._current_mprr]), "target": self._desired_imep}
+    def action_ind_to_vals(self, action_ind: Union[list, np.ndarray]) -> np.ndarray:
+        # inj_p = self.inj_p_space[action_ind[0]]
+        soi = self.soi_space[action_ind[0]]
+        inj_d = self.inj_d_space[action_ind[1]]
+        # return np.array([inj_p, soi, inj_d]).astype(np.float32)
+        return np.array([soi, inj_d]).astype(np.float32)
+    
+    def _find_nearest_index(self, value: Union[float, np.float32], array: np.ndarray) -> int:
+        value = np.float32(value)
+        return np.argmin(np.abs(array - value))
+    
+    def action_vals_to_ind(self, action_vals: np.ndarray) -> Union[list, np.ndarray]:
+        inj_p_ind = self._find_nearest_index(action_vals[0], self.inj_p_space)
+        soi_ind = self._find_nearest_index(action_vals[1], self.soi_space)
+        inj_d_ind = self._find_nearest_index(action_vals[2], self.inj_d_space)
+        return np.array([inj_p_ind, soi_ind, inj_d_ind])
+
     def _get_obs(self):
         return np.array(self._desired_imep)
 

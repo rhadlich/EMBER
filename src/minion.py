@@ -165,52 +165,6 @@ class Minion:
 
         self.logger.debug("Minion: Initialized actor ORT session")
 
-        # Connect to filter policy shared memory block
-        while self.f_buf[2] == 1:  # wait until filter policy shared memory block has been created (lock flag)
-            time.sleep(0.01)
-        self.filter_p_shm = shared_memory.SharedMemory(name=self.filter_policy_shm_name, create=False)
-        self.filter_p_buf = self.filter_p_shm.buf
-
-        self.logger.debug("Minion: Getting initial filter network weights")
-        self.filter_ort_session = None
-        # get initial filter network weights
-        while self.f_buf[3] == 0:  # wait until filter weights-available flag is set to true
-            time.sleep(0.01)
-        self.filter_ort_session, self.filter_input_names, self.filter_output_names = self._get_ort_session(model_type='filter')
-        self.logger.debug(f"Minion: filter_input_names: {self.filter_input_names}, filter_output_names: {self.filter_output_names}")
-        self.f_buf[3] = 0  # change filter new-weights-available flag to false
-
-        self.logger.debug("Minion: Initialized filter ORT session")
-
-        # Initialize SafetyFilter with ORT session
-        if self.obs_is_discrete:
-            state_dim = self.len_imep
-        else:
-            state_dim = self.episode_shm_properties["STATE_ACTION_DIMS"]["state"]
-        action_dim = self.config.action_space.shape[0]
-        
-        self.safety_filter = SafetyFilter(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            ort_session=self.filter_ort_session,
-            input_names=self.filter_input_names,
-            output_names=self.filter_output_names
-        )
-        self.model_error = 0.0  # Initial model error, will be updated from shared memory (float, not torch tensor)
-        
-        self.logger.debug("Minion: Initialized SafetyFilter")
-
-        # Connect to filter episode shared memory if available
-        if self.filter_ep_shm_properties is not None:
-            self.filter_ep_shm = shared_memory.SharedMemory(name=self.filter_ep_shm_name, create=False)
-            self.filter_ep_buf = self.filter_ep_shm.buf
-            self.filter_ep_arr = np.ndarray(shape=(self.filter_ep_shm_properties["TOTAL_SIZE"],),
-                                            dtype=np.float32,
-                                            buffer=self.filter_ep_buf,
-                                            )
-            self.logger.debug(f"Minion: filter_ep_arr shape -> {self.filter_ep_arr.shape}")
-            self.logger.debug("Minion: connected to filter episode memory block")
-
         # initialize environment
         env_type = self.config.env_config['env_type']
         if env_type == 'continuous':
@@ -260,6 +214,56 @@ class Minion:
 
         self.logger.debug("Minion: Initialized ENV.")
 
+        # Connect to filter policy shared memory block
+        while self.f_buf[2] == 1:  # wait until filter policy shared memory block has been created (lock flag)
+            time.sleep(0.01)
+        self.filter_p_shm = shared_memory.SharedMemory(name=self.filter_policy_shm_name, create=False)
+        self.filter_p_buf = self.filter_p_shm.buf
+
+        self.logger.debug("Minion: Getting initial filter network weights")
+        self.filter_ort_session = None
+        # get initial filter network weights
+        while self.f_buf[3] == 0:  # wait until filter weights-available flag is set to true
+            time.sleep(0.01)
+        self.filter_ort_session, self.filter_input_names, self.filter_output_names = self._get_ort_session(model_type='filter')
+        self.logger.debug(f"Minion: filter_input_names: {self.filter_input_names}, filter_output_names: {self.filter_output_names}")
+        self.f_buf[3] = 0  # change filter new-weights-available flag to false
+
+        self.logger.debug("Minion: Initialized filter ORT session")
+
+        try:
+            # Initialize SafetyFilter with ORT session
+            filter_dims = self.filter_ep_shm_properties.get("filter_dims", None)
+            filter_state_dim = filter_dims.get("state", None)
+            filter_action_dim = filter_dims.get("action", None)
+            if filter_state_dim is None or filter_action_dim is None:
+                raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
+            
+            self.safety_filter = SafetyFilter(
+                state_dim=filter_state_dim,
+                action_dim=filter_action_dim,
+                ort_session=self.filter_ort_session,
+                input_names=self.filter_input_names,
+                output_names=self.filter_output_names
+            )
+            self.model_error = 0.0  # Initial model error, will be updated from shared memory (float, not torch tensor)
+        except Exception as e:
+            self.logger.error(f"Minion: Could not initialize SafetyFilter: {e}")
+            raise RuntimeError(f"Minion: Could not initialize SafetyFilter: {e}")
+
+        self.logger.debug("Minion: Initialized SafetyFilter")
+
+        # Connect to filter episode shared memory if available
+        if self.filter_ep_shm_properties is not None:
+            self.filter_ep_shm = shared_memory.SharedMemory(name=self.filter_ep_shm_name, create=False)
+            self.filter_ep_buf = self.filter_ep_shm.buf
+            self.filter_ep_arr = np.ndarray(shape=(self.filter_ep_shm_properties["TOTAL_SIZE"],),
+                                            dtype=np.float32,
+                                            buffer=self.filter_ep_buf,
+                                            )
+            self.logger.debug(f"Minion: filter_ep_arr shape -> {self.filter_ep_arr.shape}")
+            self.logger.debug("Minion: connected to filter episode memory block")
+
         # set up data broadcasting to GUI (optional)
         self.pub = None
         self.zmq_ctx = None
@@ -281,6 +285,7 @@ class Minion:
 
         # start count
         self.batch_count = 0
+        self.rollout_count = 0
         self.last_obs = None
 
         self.logger.debug("Minion: Done with __init__().")
@@ -533,6 +538,7 @@ class Minion:
             timing_name = 'write_fragment'
             log_prefix = "write_fragment"
         elif buffer_type == 'filter':
+            self.logger.debug("Minion: Writing filter fragment")
             if not hasattr(self, 'filter_ep_arr') or self.filter_ep_arr is None:
                 return None
             ep_arr = self.filter_ep_arr
@@ -564,32 +570,37 @@ class Minion:
 
         slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
 
+        self.logger.debug(f"Minion: Writing fragment to slot {write_idx} of buffer {buffer_type}")
+
         # Handle initial state
         if is_initial_state:
-            initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
-            if buffer_type == 'filter':
-                # Filter extracts state from beginning of data
-                state_dim = shm_properties["STATE_ACTION_DIMS"]["state"]
-                initial_state = data[:state_dim]
+            if buffer_type == 'actor':
+                initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
+                ep_arr[initial_state_off: initial_state_off + len(data)] = data
+                set_indices(ep_arr, write_idx, 'w', self.f_buf, lock_index=lock_index)
+                self.logger.debug(f"Minion ({log_prefix}): Done writing initial state. Final writing index: {write_idx}.")
+                return ep_arr
             else:
-                initial_state = data
-            ep_arr[initial_state_off: initial_state_off + len(initial_state)] = initial_state
-            set_indices(ep_arr, write_idx, 'w', self.f_buf, lock_index=lock_index)
-            self.logger.debug(f"Minion ({log_prefix}): Done writing initial state. Final writing index: {write_idx}.")
-            return ep_arr
+                return None
 
         # get how many rollouts have been filled in the current episode
         filled = int(ep_arr[slot_off])
 
         # Copy rollout into slot payload
         episode_off = slot_off + shm_properties["HEADER_SLOT_SIZE"] + filled * shm_properties["ELEMENTS_PER_ROLLOUT"]
-        # Add initial state to offset
-        episode_off += shm_properties["STATE_ACTION_DIMS"]["state"]
+        # Actor buffer stores an initial state at the beginning of each slot payload.
+        # Filter buffer does NOT (its payload is exactly BATCH_SIZE * ELEMENTS_PER_ROLLOUT).
+        if buffer_type == 'actor':
+            episode_off += shm_properties["STATE_ACTION_DIMS"]["state"]
         ep_arr[episode_off: episode_off + shm_properties["ELEMENTS_PER_ROLLOUT"]] = data
+
+        self.logger.debug(f"Minion: Wrote data to slot {write_idx} of buffer {buffer_type}")
 
         # Increment fill counter
         filled += 1
         ep_arr[slot_off] = filled
+
+        self.logger.debug(f"Minion: Incremented fill counter to {filled}")
 
         # If this is the last rollout that can be added to this slot -> move write_idx to next slot
         if filled == shm_properties["BATCH_SIZE"]:
@@ -604,14 +615,7 @@ class Minion:
             slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
 
             # Extract state for next slot's initial state
-            if buffer_type == 'filter':
-                # Filter: extract next_state (which is the last part of data)
-                state_dim = shm_properties["STATE_ACTION_DIMS"]["state"]
-                action_dim = shm_properties["STATE_ACTION_DIMS"]["action"]
-                next_state_start = state_dim + action_dim
-                next_state_end = next_state_start + state_dim
-                state = data[next_state_start:next_state_end]
-            else:
+            if buffer_type == 'actor':
                 # Actor: either reset env or extract last state from current rollout
                 if self.reset_env_each_n_batches and not self.batch_count % self.n_batches_for_env_reset:
                     # get next state from env.reset()
@@ -624,9 +628,12 @@ class Minion:
                                  shm_properties["STATE_ACTION_DIMS"]['reward'])
                     state = data[state_off:state_off + shm_properties["STATE_ACTION_DIMS"]['state']]
 
-            # add initial state to next slot
-            initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
-            ep_arr[initial_state_off: initial_state_off + len(state)] = state
+            self.logger.debug(f"Minion: Past reset and state extraction")
+
+            if buffer_type == 'actor':
+                # add initial state to next slot
+                initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
+                ep_arr[initial_state_off: initial_state_off + len(state)] = state
 
             # reset the fill counter
             ep_arr[slot_off] = 0
@@ -651,32 +658,62 @@ class Minion:
         """Convenience wrapper for backward compatibility."""
         return self._write_fragment(data, is_initial_state=is_initial_state, buffer_type='filter')
     
-    def _get_obs_for_model(self, obs: np.ndarray) -> np.ndarray:
+    def _get_obs_from_env_to_actor(self, obs: np.ndarray) -> np.ndarray:
         """
         Helper function to format observation for model inference.
         """
         if self.obs_is_discrete:
             # one-hot encode observation
-            obs_for_model = np.array([flatten_obs_onehot(obs, self.env.imep_space, self.env.mprr_space)],
+            obs_for_actor = np.array([flatten_obs_onehot(obs, self.env.imep_space, self.env.mprr_space)],
                                         np.float32)
         else:
-            obs_for_model = np.array([obs], np.float32)
+            obs_for_actor = np.array([obs], np.float32)
 
-        if obs_for_model.ndim == 1:
-            obs_for_model = np.expand_dims(obs_for_model, axis=0)
+        if obs_for_actor.ndim == 1:
+            obs_for_actor = np.expand_dims(obs_for_actor, axis=0)
 
-        return obs_for_model
-    
-    def _get_action_for_env(self, action: np.ndarray) -> np.ndarray:
+        return obs_for_actor
+
+    def _get_obs_from_env_to_filter(self, obs: np.ndarray) -> np.ndarray:
         """
-        Helper function to format action for environment.
+        Helper function to format observation for filter model inference.
+        """
+        if self.obs_is_discrete:
+            # already in values, so just return
+            obs_for_filter = np.array([obs], np.float32)
+        else:
+            # already in values, so just return
+            obs_for_filter = np.array([obs], np.float32)
+
+        return obs_for_filter
+    
+    def _get_action_from_actor_to_filter(self, action: np.ndarray) -> np.ndarray:
+        """
+        Helper function to format action for filter.
+        """
+        
+        if self.obs_is_discrete:
+            # outputs in indices, so need to convert to values
+            action_for_filter = self.env.action_ind_to_vals(action)
+        else:
+            # already in values, so just return
+            action_for_filter = np.array([action], np.float32)
+
+        return action_for_filter
+    
+    def _get_action_from_filter_to_env(self, action: np.ndarray) -> np.ndarray:
+        """
+        Helper function to format action for environment. Directly takes the output of the
+        safety filter (numpy array of values) and converts it to the format expected by the 
+        environment.
         """
         if self.action_adapter.mode == "continuous":
             action_for_env = np.concatenate(([550, ], self.action_adapter.get_action_in_env_range(action)),
                                             dtype=np.float32)
         else:
-            action_for_env = np.concatenate(([1, ], action), dtype=np.int32)
+            action_for_env = self.env.action_vals_to_ind(np.concatenate(([550, ], action), dtype=np.float32))
         return action_for_env
+    
 
     def collect_rollouts(
             self,
@@ -708,18 +745,29 @@ class Minion:
 
         for i in range(n_rollouts):
 
-            # self.logger.debug("Minion: in loop to collect rollouts")
+            self.logger.debug("Minion: in loop to collect rollouts")
 
-            # format observation for model
-            obs_for_model = self._get_obs_for_model(obs)
+            # format observation for actor and filter models
+            try:
+                obs_for_actor_model = self._get_obs_from_env_to_actor(obs)
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to get observation from environment to actor model: {e}")
+                raise RuntimeError(f"Failed to get observation from environment to actor model: {e}")
 
-            # self.logger.debug(f"Minion: obs_for_model: {obs_for_model}")
+            try:
+                obs_for_filter_model = self._get_obs_from_env_to_filter(obs)
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to get observation from environment to filter model: {e}")
+                raise RuntimeError(f"Failed to get observation from environment to filter model: {e}")
+
+            self.logger.debug(f"Minion: obs_for_actor_model: {obs_for_actor_model}")
+            self.logger.debug(f"Minion: obs_for_filter_model: {obs_for_filter_model}")
 
             tic2 = time.time()
             # perform inference to get action distribution
             try:
                 # first [0] -> selects "output". second [0] -> selects 0th batch
-                net_out = self._ort_session_run(self.ort_session, obs_for_model)[0][0]
+                net_out = self._ort_session_run(self.ort_session, obs_for_actor_model)[0][0]
             except Exception as e:
                 raise RuntimeError(f"Could not perform action inference due to error {e}")
 
@@ -730,56 +778,72 @@ class Minion:
 
             tic_policy = time.time()
             # sample action from policy distribution
-            action_sampled, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
+            action_from_actor, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
                                                                                        deterministic=deterministic)
             toc_policy = time.time()
             duration_policy_ms = (toc_policy - tic_policy) * 1000.0
             self.timing_recorder.record_timing('policy_sampling', duration_policy_ms, deterministic=deterministic)
 
-            # self.logger.debug(
-            #     f"Minion: sampled action: action_raw={action_sampled}, logp={logp}, dist_inputs={dist_inputs}")
-
-            # Keep a copy of the nominal action (pre-filter) for filter-training data.
-            action_nominal = action_sampled.copy()
+            self.logger.debug(
+                f"Minion: sampled action: action_raw={action_from_actor}, logp={logp}, dist_inputs={dist_inputs}")
+            
+            try:
+                # Keep a copy of the nominal action (pre-filter) for filter-training data.
+                action_from_actor_nominal = self._get_action_from_actor_to_filter(action_from_actor)
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to get action from actor to filter: {e}")
+                raise RuntimeError(f"Failed to get action from actor to filter: {e}")
 
             # Apply safety filter to action
             if hasattr(self, 'safety_filter') and self.safety_filter is not None:
                 try:
                     # SafetyFilter now uses numpy arrays directly (no torch conversion needed)
-                    action_sampled = self.safety_filter.compute_filtered_action(
-                        obs_for_model[0],  # numpy array: (state_dim,)
-                        action_sampled,    # numpy array: (action_dim,)
+                    action_filtered = self.safety_filter.compute_filtered_action(
+                        obs_for_filter_model,       # numpy array: (state_dim,)
+                        action_from_actor_nominal,  # numpy array: (action_dim,)
                         self.model_error   # float scalar
                     )
+                    self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
                 except Exception as e:
                     self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
+            
+            try:
+            # Format action for environment
+                action_for_env_filtered = self._get_action_from_filter_to_env(action_filtered)
+                self.logger.debug(f"Minion: action_for_env_filtered: {action_for_env_filtered}")
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to get action from filter to environment: {e}")
+                raise RuntimeError(f"Failed to get action from filter to environment: {e}")
 
-            # format action for environment
-            action_for_env = self._get_action_for_env(action_sampled)
-
-            # self.logger.debug(f"Minion: made action vector: action_for_env={action_for_env}")
-
+            try:
             # Time environment step
-            tic_env = time.time()
-            obs, reward, terminated, truncated, info = self.env.step(action_for_env)
-            toc_env = time.time()
-            duration_env_ms = (toc_env - tic_env) * 1000.0
-            self.timing_recorder.record_timing('env_step', duration_env_ms)
-
-            # Collect filter training data (current_state, action, next_state) and write to filter buffer.
+                tic_env = time.time()
+                new_obs, reward, terminated, truncated, info = self.env.step(action_for_env_filtered)
+                toc_env = time.time()
+                duration_env_ms = (toc_env - tic_env) * 1000.0
+                self.timing_recorder.record_timing('env_step', duration_env_ms)
+                self.logger.debug(f"Minion: Stepped environment.")
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to step environment: {e}")
+                raise RuntimeError(f"Failed to step environment: {e}")
+            
+            # Collect filter training data (current_state, action, next_state, nominal_action) and write 
+            # to filter buffer.
             # This is done here to make sure all sampled data is written to buffer, independent of whether
             # sampling is deterministic or not.
             if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
                 try:
-                    current_state = obs_for_model[0]  # Current state before action
-                    next_state_flat = _flatten_obs_array(obs)  # Next state after action
+                    current_state = obs_for_filter_model        # Current state before action
+                    next_state = self._get_obs_from_env_to_filter(new_obs)   # Next state after action
                     # Store: (current_state, action_filtered, next_state, action_nominal)
-                    filter_data = np.concatenate([current_state, action_sampled, next_state_flat, action_nominal]).astype(np.float32)
+                    filter_data = np.concatenate([current_state, action_filtered, next_state, action_from_actor_nominal]).astype(np.float32)
                     self._write_fragment(filter_data, buffer_type='filter')
+                    self.logger.debug(f"Minion: Wrote the following data to filter buffer: {filter_data}")
                 except Exception as e:
                     self.logger.debug(f"Minion: Failed to write filter training data: {e}")
 
-            # self.logger.debug(f"Minion: sampled new rollout. obs={obs}")
+            # Increment rollout count
+            self.rollout_count += 1
 
             if n_rollouts == 1:
                 toc_collect = time.time()
@@ -787,16 +851,17 @@ class Minion:
                 self.timing_recorder.record_timing('collect_rollouts', duration_collect_ms, deterministic=deterministic)
                 # Save timing data after collect_rollouts completes
                 self.timing_recorder.save_timing_data()
-                return [obs, action_sampled, reward, terminated, truncated, logp, net_out, info]
+                return [new_obs, action_from_actor, reward, terminated, truncated, logp, net_out, info]
             else:
                 rollouts["obs"].append(obs)
-                rollouts["actions"].append(action_sampled)
+                rollouts["actions"].append(action_from_actor)
                 rollouts["rewards"].append(reward)
                 rollouts["terminateds"].append(terminated)
                 rollouts["truncateds"].append(truncated)
                 rollouts["action_logps"].append(logp)
                 rollouts["action_dist_inputs"].append(net_out)
                 rollouts["info"].append(info)
+
 
         toc_collect = time.time()
         duration_collect_ms = (toc_collect - tic_collect) * 1000.0
@@ -810,16 +875,16 @@ class Minion:
             train_batches: int = 1,
             eval_rollouts: int = 1,
     ):
+        self.logger.debug("Minion: in train_and_eval_sequence")
 
+        # Write initial state for actor buffer (filter does not need initial state)
         if not self.last_obs:
             obs, info = self.env.reset()
             self._write_fragment(_flatten_obs_array(obs), is_initial_state=True, buffer_type='actor')
-            # Write initial state for filter buffer too
-            if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
-                initial_state = _flatten_obs_array(obs)
-                self._write_fragment(initial_state, is_initial_state=True, buffer_type='filter')
         else:
             obs = self.last_obs
+        
+        self.logger.debug("Minion: going to collect train batches")
 
         for i in range(int(train_batches * self.episode_shm_properties["BATCH_SIZE"])):
             # self.logger.debug(f"Minion: in loop to collect batch, iter={i}")
@@ -931,15 +996,21 @@ def main(policy_shm_name: str,
     try:
         while True:
 
+            actor.logger.debug(f"Minion: Rollout count -> {actor.rollout_count}.")
+
             weights_updated = actor.try_update_weights(model_type='actor')
             if weights_updated:
                 actor.logger.debug(f"Minion: Actor update number -> {weight_updates}.")
                 weight_updates += 1
+            else:
+                actor.logger.debug("Minion: Actor weights not updated.")
 
             # Try to update filter weights
             filter_weights_updated = actor.try_update_weights(model_type='filter')
             if filter_weights_updated:
                 actor.logger.debug("Minion: Filter weights updated.")
+            else:
+                actor.logger.debug("Minion: Filter weights not updated.")
 
             # model_error is now read from filter_policy_shm along with weights in try_update_filter_weights()
             # No need to read from flag buffer anymore

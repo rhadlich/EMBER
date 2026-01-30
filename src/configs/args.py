@@ -319,7 +319,7 @@ def custom_args(
         "--enable-zmq",
         type=str_to_bool,
         default=False,
-        help="Enable ZMQ publishing for GUI communication (default: False when running Master.py directly).",
+        help="Enable ZMQ publishing for GUI communication (default: False when running setup_run.py directly).",
     )
     parser.add_argument(
         "--local-mode",
