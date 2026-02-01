@@ -54,40 +54,35 @@ conda env create -f environment.yml
 conda activate rayenv2
 ```
 
-Tip: The scripts are now at the root level, so you can run them directly from the repo root. Imports like `import src...` will work automatically.
-
 ### Quickstart: run a local training loop
 
-The primary entrypoint is `master.py`. It configures an RLlib algorithm, spins up a custom `EnvRunner`, and schedules a “minion” worker that collects rollouts via shared memory.
+The primary entrypoint is `setup_run.py`. It configures an RLlib algorithm, spins up a custom `EnvRunner`, and schedules a “minion” worker that collects rollouts via shared memory.
 
 #### IMPALA (discrete env by default)
 
 ```bash
-python master.py \
-  --algo IMPALA \
+python src/setup_run.py \
+  --algo 'IMPALA' \
   --env-type discrete \
   --stop-iters 10 \
-  --local-mode
 ```
 
 #### SAC (continuous env by default)
 
 ```bash
-python master.py \
-  --algo SAC \
+python src/setup_run.py \
+  --algo 'SAC' \
   --env-type continuous \
   --stop-iters 10 \
-  --local-mode
 ```
 
 #### APPO (continuous env by default)
 
 ```bash
-python master.py \
-  --algo APPO \
+python src/setup_run.py \
+  --algo 'APPO' \
   --env-type continuous \
   --stop-iters 10 \
-  --local-mode
 ```
 
 ### Optional: enable telemetry for the GUI
@@ -95,7 +90,7 @@ python master.py \
 Both the minion (“engine”) side and the trainer can publish telemetry over ZMQ when enabled:
 
 ```bash
-python master.py \
+python src/setup_run.py \
   --algo IMPALA \
   --env-type discrete \
   --enable-zmq True
@@ -110,8 +105,8 @@ Note: `app/RLapp.py` is currently a research/monitoring script and may need smal
 ### Where to look (repo layout)
 
 - **`src/`**: main source code directory
-  - **`src/master.py`**, **`src/minion.py`**: entrypoint scripts
-  - **`src/custom_run.py`**, **`src/env_runner.py`**: RLlib training harness and shared-memory env runner
+  - **`src/setup_run.py`**, **`src/minion.py`**: entrypoint scripts
+  - **`src/run_algorithm.py`**, **`src/env_runner.py`**: RLlib training harness and shared-memory env runner
   - **`src/configs/`**: CLI + algorithm presets (`src/configs/args.py`, `src/configs/algorithms/*_cfg.py`)
   - **`src/core/environments/`**: engine environments and learned surrogate model interface (`engine_env.py`, `predictor.py`, `define_models.py`, `reward_typing.py`)
   - **`src/core/rl_modules/`**: custom RL modules for APPO and IMPALA (`appo_rl_modules.py`, `impala_rl_modules.py`)
