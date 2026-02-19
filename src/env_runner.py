@@ -580,16 +580,20 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
     def _unlink_mem_blocks_if_necessary(self):
         """Close all shared memory blocks and terminate minion subprocess."""
-        if self.policy_shm:
-            self.policy_shm.close()
-            self.policy_shm.unlink()
-        if self.flag_shm:
-            self.flag_shm.close()
-            self.flag_shm.unlink()
-        if self.episode_shm:
-            del self.ep_arr
-            self.episode_shm.close()
-            self.episode_shm.unlink()
+        try:
+            if self.policy_shm:
+                self.policy_shm.close()
+                self.policy_shm.unlink()
+            if self.flag_shm:
+                self.flag_shm.close()
+                self.flag_shm.unlink()
+            if self.episode_shm:
+                del self.ep_arr
+                self.episode_shm.close()
+                self.episode_shm.unlink()
+        except Exception as e:
+            self.logger.debug(f"EnvRunner: Failed to unlink shared memory blocks: {e}")
+
         if ray.wait([self._minion_ref], timeout=0)[0]:
             ray.cancel(self._minion_ref)
 
