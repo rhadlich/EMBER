@@ -3,3 +3,4 @@ migrate_repo.py
 *.ort
 *.config
 *.csv
+.DS_Store

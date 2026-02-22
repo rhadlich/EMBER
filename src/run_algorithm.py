@@ -289,7 +289,7 @@ def run_rllib_shared_memory(
 
     # Pin to CPU core if specified
     if args.cpu_core_learner is not None:
-        from ray_primitives import pin_to_core
+        from utils.ray_primitives import pin_to_core
         pin_to_core(args.cpu_core_learner)
         logger.info(f"Pinned learner process to CPU core {args.cpu_core_learner}")
 
