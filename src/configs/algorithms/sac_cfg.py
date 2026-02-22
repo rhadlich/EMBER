@@ -39,7 +39,7 @@ def update_config(cfg, args):
         cfg.training(
             model={"free_log_std": True},
             q_model_config={
-                "fcnet_hiddens": [128, 128],
+                "fcnet_hiddens": [256, 256],
                 "fcnet_activation": "relu",
                 "post_fcnet_hiddens": [],
                 "post_fcnet_activation": None,

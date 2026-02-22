@@ -303,5 +303,5 @@ def reward_fn(inputs):
     l3 = -1.0
     load_tracking = np.tanh(l1*l)*l2 + l*l3
     safety = (max(0, inputs["mprr"]-7)**2) * -0.0
-    filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -0.01
+    filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -0.0
     return np.array([load_tracking, safety, filter_interference])

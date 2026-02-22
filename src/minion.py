@@ -135,8 +135,8 @@ class Minion:
             self.filter_ep_shm_name = None
 
         # set parameters for training and evaluation
-        self.reset_env_each_n_batches = False
-        self.n_batches_for_env_reset = 50
+        self.reset_env_each_n_batches = True
+        self.n_batches_for_env_reset = 5
 
         # connect to shared memory blocks
         self.f_shm = shared_memory.SharedMemory(name=self.flag_shm_name, create=False)  # this one has to be first
@@ -887,7 +887,7 @@ class Minion:
             obs_flat = _flatten_obs_array(obs)  # flatten to shape needed by memory buffer
             current_packet = np.concatenate((
                 action,
-                np.array([adjusted_reward], dtype=np.float32),
+                np.array([reward], dtype=np.float32),
                 obs_flat,
                 np.array([logp], dtype=np.float32),
                 net_out.astype(np.float32),

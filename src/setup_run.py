@@ -7,6 +7,8 @@ How to run this script
 """
 import numpy as np
 import os
+import subprocess
+import sys
 
 from gymnasium import spaces
 from core.environments.engine_env import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
@@ -58,6 +60,15 @@ if __name__ == "__main__":
 
     logger = logging.getLogger("MyRLApp.setup_run")
     logger.info(f"setup_run, PID={os.getpid()}")
+
+    # Spawn GUI if requested (implies enable_zmq for telemetry)
+    if getattr(args, "gui", False):
+        args.enable_zmq = True
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        rlapp_path = os.path.join(script_dir, "RLapp.py")
+        cmd = [sys.executable, rlapp_path, "--subscriber-only"]
+        subprocess.Popen(cmd)
+        logger.info("Spawned GUI in subscriber-only mode")
 
     # make environment to have access to observation and action spaces
     if args.env_type.lower() == 'continuous':

@@ -1120,14 +1120,27 @@ def run_rllib_shared_memory(
             # close and unlink shared memory blocks owned by this process
             try:
                 if filter_ep_shm is not None:
-                    filter_ep_shm.close()
-                    filter_ep_shm.unlink()
-                filter_p_shm.close()
-                filter_p_shm.unlink()
-                p_shm.close()
-                p_shm.unlink()
-                f_shm.close()
-                f_shm.unlink()
+                    try:
+                        filter_ep_shm.close()
+                        filter_ep_shm.unlink()
+                    except FileNotFoundError:
+                        # Already unlinked elsewhere; safe to ignore.
+                        pass
+                try:
+                    filter_p_shm.close()
+                    filter_p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    p_shm.close()
+                    p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    f_shm.close()
+                    f_shm.unlink()
+                except FileNotFoundError:
+                    pass
                 logger.debug("run_algorithm: Closed and unlinked shared memory blocks.")
             except Exception as e:
                 logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks: {e}")
@@ -1159,14 +1172,26 @@ def run_rllib_shared_memory(
             # close and unlink shared memory blocks
             try:
                 if filter_ep_shm is not None:
-                    filter_ep_shm.close()
-                    filter_ep_shm.unlink()
-                filter_p_shm.close()
-                filter_p_shm.unlink()
-                p_shm.close()
-                p_shm.unlink()
-                f_shm.close()
-                f_shm.unlink()
+                    try:
+                        filter_ep_shm.close()
+                        filter_ep_shm.unlink()
+                    except FileNotFoundError:
+                        pass
+                try:
+                    filter_p_shm.close()
+                    filter_p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    p_shm.close()
+                    p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    f_shm.close()
+                    f_shm.unlink()
+                except FileNotFoundError:
+                    pass
                 logger.debug(f"run_algorithm: Closed and unlinked shared memory blocks on {type(e).__name__}.")
             except Exception as e:
                 logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks on {type(e).__name__}: {e}")
