@@ -322,6 +322,12 @@ def custom_args(
         help="Enable ZMQ publishing for GUI communication (default: False when running setup_run.py directly).",
     )
     parser.add_argument(
+        "--gui",
+        type=str_to_bool,
+        default=False,
+        help="Spawn the PyQt6 monitoring GUI (implies --enable-zmq True).",
+    )
+    parser.add_argument(
         "--local-mode",
         action="store_true",
         help="Init Ray in local mode for easier debugging.",

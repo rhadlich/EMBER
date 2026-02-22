@@ -105,7 +105,9 @@ class EngineEnvDiscrete(gym.Env):
         return observation, info
 
     def step(self,
-             action_vals: Union[list, np.ndarray] = None,):
+             filtered_action_vals: Union[list, np.ndarray] = None,
+             nominal_action_vals: Union[list, np.ndarray] = None,
+             ):
         """
         action_vals is expected to be in the order -> [inj_p, soi, inj_d] and to be
         values rather than indices. Helper functions are provided to convert between
@@ -114,16 +116,23 @@ class EngineEnvDiscrete(gym.Env):
 
         # send action values to torch model and get new state
         pressure, self._current_imep, self._current_mprr, cad = (
-            self.predictor.model_predict(action_vals, noise_in_percent=1))
+            self.predictor.model_predict(filtered_action_vals, noise_in_percent=1))
 
         # get observation in the right format
         observation = self._get_obs()
 
         # package inputs for reward
-        reward_inputs = {"target": self._desired_imep, "current imep": self._current_imep, "mprr": self._current_mprr}
+        reward_inputs = {
+            "target": self._desired_imep,
+            "current imep": self._current_imep,
+            "mprr": self._current_mprr,
+            "filtered action": filtered_action_vals,
+            "nominal action": nominal_action_vals
+            }
 
         # calculate reward
-        reward = self.reward(reward_inputs)
+        reward_vec = self.reward(reward_inputs)
+        reward = np.sum(reward_vec) + 18.0
 
         # clip observation values to make sure it is within the expected space
         self._current_imep = np.clip(self._current_imep, self.imep_space[0], self.imep_space[-1])
@@ -133,7 +142,7 @@ class EngineEnvDiscrete(gym.Env):
         terminated = 0      # will decide in the controller if it is terminated or not
         info = {"current imep": self._current_imep, "mprr": self._current_mprr, "pressure": pressure}
 
-        return observation, reward, terminated, False, info
+        return observation, reward, reward_vec, terminated, False, info
 
     # def _get_obs(self):
     #     return {"state": np.array([self._current_imep, self._current_mprr]), "target": self._desired_imep}
@@ -219,7 +228,7 @@ class EngineEnvContinuous(gym.Env):
         self.predictor = Predictor()
         # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
 
-        path = 'assets/models/model_weights_mac.pth'
+        path = 'src/assets/models/model_weights_mac.pth'
         self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
@@ -248,19 +257,28 @@ class EngineEnvContinuous(gym.Env):
         return observation, info
 
     def step(self,
-             action_vals: np.ndarray = None,):
+            filtered_action_vals: Union[list, np.ndarray] = None,
+            nominal_action_vals: Union[list, np.ndarray] = None,
+             ):
 
         # action_vals should be in the order -> [inj_p, soi, inj_d]
 
         # send action values to torch model and get new state
         pressure, self._current_imep, self._current_mprr, cad = (
-            self.predictor.model_predict(action_vals, noise_in_percent=1))
+            self.predictor.model_predict(filtered_action_vals, noise_in_percent=1))
 
         # package inputs for reward
-        reward_inputs = {"target": self._desired_imep, "current imep": self._current_imep, "mprr": self._current_mprr}
+        reward_inputs = {
+            "target": self._desired_imep,
+            "current imep": self._current_imep,
+            "mprr": self._current_mprr,
+            "filtered action": filtered_action_vals,
+            "nominal action": nominal_action_vals
+            }
 
         # calculate reward
-        reward = self.reward(reward_inputs)
+        reward_vec = self.reward(reward_inputs)
+        reward = np.sum(reward_vec) + 18.0
 
         # clip observation values to make sure it is within the expected space
         self._current_imep = np.clip(self._current_imep, self.imep_lims[0], self.imep_lims[-1])
@@ -270,7 +288,7 @@ class EngineEnvContinuous(gym.Env):
         terminated = 0      # will decide in the controller if it is terminated or not
         info = {"current imep": self._current_imep, "mprr": self._current_mprr, "pressure": pressure}
 
-        return observation, reward, terminated, False, info
+        return observation, reward, reward_vec, terminated, False, info
 
     # def _get_obs(self):
     #     return {"state": np.array([self._current_imep, self._current_mprr]), "target": self._desired_imep}
@@ -279,13 +297,11 @@ class EngineEnvContinuous(gym.Env):
 
 
 def reward_fn(inputs):
-    imep = inputs["current imep"]
-    mprr = inputs["mprr"]
-    target = inputs["target"]
-    l = (imep - target)**2
+    l = (inputs["current imep"] - inputs["target"])**2
     l1 = 3
     l2 = -15
     l3 = -1.0
     load_tracking = np.tanh(l1*l)*l2 + l*l3
-    safety = (max(0, mprr-7)**2) * -0.0
-    return load_tracking + safety + 18
+    safety = (max(0, inputs["mprr"]-7)**2) * -0.0
+    filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -0.0
+    return np.array([load_tracking, safety, filter_interference])

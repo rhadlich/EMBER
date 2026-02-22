@@ -2,12 +2,14 @@ from multiprocessing import shared_memory
 from typing import Optional, Union
 
 import numpy as np
+import pandas as pd
 import struct
 import onnxruntime as ort
 import time
 import gzip
 import os
 import torch
+import copy
 
 from ray.rllib.utils.numpy import softmax
 import gymnasium as gym
@@ -133,8 +135,8 @@ class Minion:
             self.filter_ep_shm_name = None
 
         # set parameters for training and evaluation
-        self.reset_env_each_n_batches = False
-        self.n_batches_for_env_reset = 50
+        self.reset_env_each_n_batches = True
+        self.n_batches_for_env_reset = 5
 
         # connect to shared memory blocks
         self.f_shm = shared_memory.SharedMemory(name=self.flag_shm_name, create=False)  # this one has to be first
@@ -287,6 +289,12 @@ class Minion:
         self.batch_count = 0
         self.rollout_count = 0
         self.last_obs = None
+
+        # Set EMA settings for reward scaling
+        H = 50.0  # number of steps to reach 99% of the value, or half life of the exponential decay
+        self.ema_beta = np.exp(-np.log(2) / H)
+        self.current_var_ema = 1.0
+        self.current_reward_scale = 1.0
 
         self.logger.debug("Minion: Done with __init__().")
 
@@ -697,7 +705,7 @@ class Minion:
             action_for_filter = self.env.action_ind_to_vals(action)
         else:
             # already in values, so just return
-            action_for_filter = np.array([action], np.float32)
+            action_for_filter = action.astype(np.float32)
 
         return action_for_filter
     
@@ -713,16 +721,14 @@ class Minion:
         else:
             action_for_env = self.env.action_vals_to_ind(np.concatenate(([550, ], action), dtype=np.float32))
         return action_for_env
-    
 
-    def collect_rollouts(
+    def collect_rollout(
             self,
-            n_rollouts: int = 1,
             initial_obs: Optional[np.ndarray] = None,
             deterministic: Optional[bool] = False,
     ) -> Union[dict, list]:
         """
-        function to collect a set number of rollouts
+        function to collect a single rollout
         """
         tic_collect = time.time()
 
@@ -731,144 +737,115 @@ class Minion:
         else:
             obs = initial_obs
 
-        if n_rollouts > 1:
-            rollouts = {
-                "obs": [],
-                "actions": [],
-                "rewards": [],
-                "terminateds": [],
-                "truncateds": [],
-                "action_dist_inputs": [],
-                "action_logps": [],
-                "info": []
-            }  # dict to store the rollouts
+        self.logger.debug("Minion: in collect_rollout")
 
-        for i in range(n_rollouts):
+        # format observation for actor and filter models
+        try:
+            obs_for_actor_model = self._get_obs_from_env_to_actor(obs)
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to get observation from environment to actor model: {e}")
+            raise RuntimeError(f"Failed to get observation from environment to actor model: {e}")
 
-            self.logger.debug("Minion: in loop to collect rollouts")
+        try:
+            obs_for_filter_model = self._get_obs_from_env_to_filter(obs)
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to get observation from environment to filter model: {e}")
+            raise RuntimeError(f"Failed to get observation from environment to filter model: {e}")
 
-            # format observation for actor and filter models
+        self.logger.debug(f"Minion: obs_for_actor_model: {obs_for_actor_model}")
+        self.logger.debug(f"Minion: obs_for_filter_model: {obs_for_filter_model}")
+
+        tic2 = time.time()
+        # perform inference to get action distribution
+        try:
+            # first [0] -> selects "output". second [0] -> selects 0th batch
+            net_out = self._ort_session_run(self.ort_session, obs_for_actor_model)[0][0]
+        except Exception as e:
+            raise RuntimeError(f"Could not perform action inference due to error {e}")
+
+        toc2 = time.time()
+        # self.logger.debug(f"Minion time for inference only is {(toc2 - tic2)*1000:0.4f}ms")
+
+        # self.logger.debug(f"Minion: performed action inference, net_out={net_out}, type={type(net_out)}")
+
+        tic_policy = time.time()
+        # sample action from policy distribution
+        action_from_actor, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
+                                                                                    deterministic=deterministic)
+        toc_policy = time.time()
+        duration_policy_ms = (toc_policy - tic_policy) * 1000.0
+        self.timing_recorder.record_timing('policy_sampling', duration_policy_ms, deterministic=deterministic)
+
+        self.logger.debug(
+            f"Minion: sampled action: action_raw={action_from_actor}, logp={logp}, dist_inputs={dist_inputs}")
+        
+        try:
+            # Keep a copy of the nominal action (pre-filter) for filter-training data.
+            action_from_actor_for_filter_nominal = self._get_action_from_actor_to_filter(action_from_actor)
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to get action from actor to filter: {e}")
+            raise RuntimeError(f"Failed to get action from actor to filter: {e}")
+
+        # Apply safety filter to action
+        if hasattr(self, 'safety_filter') and self.safety_filter is not None:
             try:
-                obs_for_actor_model = self._get_obs_from_env_to_actor(obs)
+                # SafetyFilter now uses numpy arrays directly (no torch conversion needed)
+                action_filtered = self.safety_filter.compute_filtered_action(
+                    obs_for_filter_model,       # numpy array: (state_dim,)
+                    action_from_actor_for_filter_nominal,  # numpy array: (action_dim,)
+                    self.model_error   # float scalar
+                )
+                self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
             except Exception as e:
-                self.logger.debug(f"Minion: Failed to get observation from environment to actor model: {e}")
-                raise RuntimeError(f"Failed to get observation from environment to actor model: {e}")
+                self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
+        
+        try:
+        # Format action for environment
+            action_for_env_filtered = self._get_action_from_filter_to_env(action_filtered)
+            nominal_action_for_env = self._get_action_from_filter_to_env(action_from_actor)
+            self.logger.debug(f"Minion: action_for_env_filtered: {action_for_env_filtered}")
+            self.logger.debug(f"Minion: nominal_action_for_env: {nominal_action_for_env}")
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to get action from filter to environment: {e}")
+            raise RuntimeError(f"Failed to get action from filter to environment: {e}")
 
+        try:
+        # Time environment step
+            tic_env = time.time()
+            new_obs, reward, reward_vec, terminated, truncated, info = self.env.step(action_for_env_filtered, nominal_action_for_env)
+            toc_env = time.time()
+            duration_env_ms = (toc_env - tic_env) * 1000.0
+            self.timing_recorder.record_timing('env_step', duration_env_ms)
+            self.logger.debug(f"Minion: Stepped environment.")
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to step environment: {e}")
+            raise RuntimeError(f"Failed to step environment: {e}")
+        
+        # Collect filter training data (current_state, action, next_state, nominal_action) and write 
+        # to filter buffer.
+        # This is done here to make sure all sampled data is written to filter buffer, independent of whether
+        # sampling is deterministic or not.
+        if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
             try:
-                obs_for_filter_model = self._get_obs_from_env_to_filter(obs)
+                current_state = obs_for_filter_model        # Current state before action
+                next_state = self._get_obs_from_env_to_filter(new_obs)   # Next state after action
+                # Store: (current_state, action_filtered, next_state, action_nominal)
+                filter_data = np.concatenate([current_state, action_filtered, next_state, action_from_actor_for_filter_nominal]).astype(np.float32)
+                self._write_fragment(filter_data, buffer_type='filter')
+                self.logger.debug(f"Minion: Wrote the following data to filter buffer: {filter_data}")
             except Exception as e:
-                self.logger.debug(f"Minion: Failed to get observation from environment to filter model: {e}")
-                raise RuntimeError(f"Failed to get observation from environment to filter model: {e}")
+                self.logger.debug(f"Minion: Failed to write filter training data: {e}")
 
-            self.logger.debug(f"Minion: obs_for_actor_model: {obs_for_actor_model}")
-            self.logger.debug(f"Minion: obs_for_filter_model: {obs_for_filter_model}")
+        # Increment rollout count
+        self.rollout_count += 1
 
-            tic2 = time.time()
-            # perform inference to get action distribution
-            try:
-                # first [0] -> selects "output". second [0] -> selects 0th batch
-                net_out = self._ort_session_run(self.ort_session, obs_for_actor_model)[0][0]
-            except Exception as e:
-                raise RuntimeError(f"Could not perform action inference due to error {e}")
-
-            toc2 = time.time()
-            # self.logger.debug(f"Minion time for inference only is {(toc2 - tic2)*1000:0.4f}ms")
-
-            # self.logger.debug(f"Minion: performed action inference, net_out={net_out}, type={type(net_out)}")
-
-            tic_policy = time.time()
-            # sample action from policy distribution
-            action_from_actor, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
-                                                                                       deterministic=deterministic)
-            toc_policy = time.time()
-            duration_policy_ms = (toc_policy - tic_policy) * 1000.0
-            self.timing_recorder.record_timing('policy_sampling', duration_policy_ms, deterministic=deterministic)
-
-            self.logger.debug(
-                f"Minion: sampled action: action_raw={action_from_actor}, logp={logp}, dist_inputs={dist_inputs}")
-            
-            try:
-                # Keep a copy of the nominal action (pre-filter) for filter-training data.
-                action_from_actor_nominal = self._get_action_from_actor_to_filter(action_from_actor)
-            except Exception as e:
-                self.logger.debug(f"Minion: Failed to get action from actor to filter: {e}")
-                raise RuntimeError(f"Failed to get action from actor to filter: {e}")
-
-            # Apply safety filter to action
-            if hasattr(self, 'safety_filter') and self.safety_filter is not None:
-                try:
-                    # SafetyFilter now uses numpy arrays directly (no torch conversion needed)
-                    action_filtered = self.safety_filter.compute_filtered_action(
-                        obs_for_filter_model,       # numpy array: (state_dim,)
-                        action_from_actor_nominal,  # numpy array: (action_dim,)
-                        self.model_error   # float scalar
-                    )
-                    self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
-                except Exception as e:
-                    self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
-            
-            try:
-            # Format action for environment
-                action_for_env_filtered = self._get_action_from_filter_to_env(action_filtered)
-                self.logger.debug(f"Minion: action_for_env_filtered: {action_for_env_filtered}")
-            except Exception as e:
-                self.logger.debug(f"Minion: Failed to get action from filter to environment: {e}")
-                raise RuntimeError(f"Failed to get action from filter to environment: {e}")
-
-            try:
-            # Time environment step
-                tic_env = time.time()
-                new_obs, reward, terminated, truncated, info = self.env.step(action_for_env_filtered)
-                toc_env = time.time()
-                duration_env_ms = (toc_env - tic_env) * 1000.0
-                self.timing_recorder.record_timing('env_step', duration_env_ms)
-                self.logger.debug(f"Minion: Stepped environment.")
-            except Exception as e:
-                self.logger.debug(f"Minion: Failed to step environment: {e}")
-                raise RuntimeError(f"Failed to step environment: {e}")
-            
-            # Collect filter training data (current_state, action, next_state, nominal_action) and write 
-            # to filter buffer.
-            # This is done here to make sure all sampled data is written to buffer, independent of whether
-            # sampling is deterministic or not.
-            if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
-                try:
-                    current_state = obs_for_filter_model        # Current state before action
-                    next_state = self._get_obs_from_env_to_filter(new_obs)   # Next state after action
-                    # Store: (current_state, action_filtered, next_state, action_nominal)
-                    filter_data = np.concatenate([current_state, action_filtered, next_state, action_from_actor_nominal]).astype(np.float32)
-                    self._write_fragment(filter_data, buffer_type='filter')
-                    self.logger.debug(f"Minion: Wrote the following data to filter buffer: {filter_data}")
-                except Exception as e:
-                    self.logger.debug(f"Minion: Failed to write filter training data: {e}")
-
-            # Increment rollout count
-            self.rollout_count += 1
-
-            if n_rollouts == 1:
-                toc_collect = time.time()
-                duration_collect_ms = (toc_collect - tic_collect) * 1000.0
-                self.timing_recorder.record_timing('collect_rollouts', duration_collect_ms, deterministic=deterministic)
-                # Save timing data after collect_rollouts completes
-                self.timing_recorder.save_timing_data()
-                return [new_obs, action_from_actor, reward, terminated, truncated, logp, net_out, info]
-            else:
-                rollouts["obs"].append(obs)
-                rollouts["actions"].append(action_from_actor)
-                rollouts["rewards"].append(reward)
-                rollouts["terminateds"].append(terminated)
-                rollouts["truncateds"].append(truncated)
-                rollouts["action_logps"].append(logp)
-                rollouts["action_dist_inputs"].append(net_out)
-                rollouts["info"].append(info)
-
-
+        # Finish timing the rollout and return the results
         toc_collect = time.time()
         duration_collect_ms = (toc_collect - tic_collect) * 1000.0
-        self.timing_recorder.record_timing('collect_rollouts', duration_collect_ms, deterministic=deterministic)
+        self.timing_recorder.record_timing('collect_rollout', duration_collect_ms, deterministic=deterministic)
         # Save timing data after collect_rollouts completes
         self.timing_recorder.save_timing_data()
-        return rollouts
+        return [new_obs, action_from_actor, reward, reward_vec, terminated, truncated, logp, net_out, info]
 
     def train_and_eval_sequence(
             self,
@@ -886,22 +863,27 @@ class Minion:
         
         self.logger.debug("Minion: going to collect train batches")
 
+        rewards_raw = []
+        rewards_adjusted = []
+        sigmas = []
+        reward_vecs = []
+
         for i in range(int(train_batches * self.episode_shm_properties["BATCH_SIZE"])):
-            # self.logger.debug(f"Minion: in loop to collect batch, iter={i}")
+
             tic = time.time()
-            obs, action, reward, terminated, truncated, logp, net_out, info = (
-                self.collect_rollouts(initial_obs=obs))
+            obs, action, reward, reward_vec, _, _, logp, net_out, info = (
+                self.collect_rollout(initial_obs=obs))
             toc = time.time()
-            # self.logger.debug(f"Minion: time to collect full rollout is {(toc - tic)*1000:0.4f}ms")
 
+            adjusted_reward = self._scale_reward(reward)
 
-            # self.logger.debug(f"Minion (train_and_eval_sequence): received new rollout.")
-            # self.logger.debug(f"Minion (train_and_eval_sequence): obs: {obs}.")
-            # self.logger.debug(f"Minion (train_and_eval_sequence): action: {action}.")
-            # self.logger.debug(f"Minion (train_and_eval_sequence): reward: {reward}.")
-            # self.logger.debug(f"Minion (train_and_eval_sequence): logp: {logp}.")
-            # self.logger.debug(f"Minion (train_and_eval_sequence): info: {info}.")
+            # Gather data for performance metrics
+            rewards_raw.append(reward)
+            rewards_adjusted.append(adjusted_reward)
+            sigmas.append(np.sqrt(self.current_reward_scale))
+            reward_vecs.append(reward_vec)
 
+            # Collect data to send to Learner
             obs_flat = _flatten_obs_array(obs)  # flatten to shape needed by memory buffer
             current_packet = np.concatenate((
                 action,
@@ -911,21 +893,18 @@ class Minion:
                 net_out.astype(np.float32),
             )).astype(np.float32)
 
-            # self.logger.debug(f"Minion (train_and_eval_sequence): built packet.")
-
-            # write it into the buffer
+            # Write data into the buffer
             self._write_fragment(current_packet, is_initial_state=False, buffer_type='actor')
 
-            # self.logger.debug(f"Minion (train_and_eval_sequence): wrote to buffer.")
-
-            # send training results to be logged in the GUI
+            # Send training results to be logged in the GUI
             msg = {
                 "topic": "engine",
                 "current imep": float(info["current imep"]),
                 "mprr": float(info["mprr"]),
                 "target": float(obs)
             }
-            # self.logger.debug(f"Minion (train_and_eval_sequence): msg: {msg}.")
+
+            # Send message to GUI (if enabled)
             if self.pub is not None:
                 try:
                     self.pub.send_json(msg)
@@ -933,13 +912,31 @@ class Minion:
                     self.logger.debug(f"Minion (train_and_eval_sequence): {e}")
 
             # self.logger.debug(f"Minion (train_and_eval_sequence): sent to GUI.")
+        
+        # Compute performance metrics
+        try:
+            train_rollouts_df = self._compute_performance_metrics(rewards_raw, rewards_adjusted, sigmas, np.vstack(reward_vecs))
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to compute performance metrics for train rollouts: {e}")
+            raise RuntimeError(f"Failed to compute performance metrics for train rollouts: {e}")
 
         # set last observation
-        self.last_obs = obs
+        self.last_obs = copy.deepcopy(obs)
+
+        rewards_raw_eval = []
+        rewards_adjusted_eval = []
+        sigmas_eval = []
+        reward_vecs_eval = []
 
         for i in range(eval_rollouts):
-            obs, action, _, _, _, _, _, info = (
-                self.collect_rollouts(initial_obs=obs, deterministic=True))
+            obs, action, reward, reward_vec, _, _, _, _, info = (
+                self.collect_rollout(initial_obs=obs, deterministic=True))
+
+            # Gather data for performance metrics
+            rewards_raw_eval.append(reward)
+            rewards_adjusted_eval.append(self._scale_reward(reward))
+            sigmas_eval.append(np.sqrt(self.current_reward_scale))
+            reward_vecs_eval.append(reward_vec)
 
             # send evaluation results to be logged in the GUI
             msg = {
@@ -952,8 +949,71 @@ class Minion:
             if self.pub is not None:
                 self.pub.send_json(msg)
         
+        # Compute performance metrics for evaluation
+        try:
+            eval_rollouts_df = self._compute_performance_metrics(rewards_raw_eval, rewards_adjusted_eval, sigmas_eval, np.vstack(reward_vecs_eval))
+        except Exception as e:
+            self.logger.debug(f"Minion: Failed to compute performance metrics for eval rollouts: {e}")
+            raise RuntimeError(f"Failed to compute performance metrics for eval rollouts: {e}")
+
+        # Update reward scale
+        self._update_reward_scale(rewards_raw)
+        
         # Save timing data after train_and_eval_sequence completes
         self.timing_recorder.save_timing_data()
+
+        return train_rollouts_df, eval_rollouts_df
+    
+    def _scale_reward(self, reward: float) -> float:
+        """
+        Helper function to scale reward. The current_reward_scale is the EMA of the reward variance.
+        """
+        return reward/self.current_reward_scale
+
+    def _update_reward_scale(self, rewards: list) -> None:
+        """
+        Helper function to update reward scale. Small epsilon to avoid division by zero.
+        """
+        reward_variance = np.var(rewards)
+        self.current_var_ema = np.max([self.ema_beta * self.current_var_ema + (1 - self.ema_beta) * reward_variance, 1e-6])
+        self.current_reward_scale = np.sqrt(self.current_var_ema)
+    
+    def _compute_performance_metrics(
+        self,
+        rewards_raw: list,
+        rewards_adjusted: list,
+        sigmas: list,
+        reward_vecs: np.ndarray,
+    ) -> dict:
+        """
+        Helper function to compute performance metrics from rollouts.
+        """
+        return pd.DataFrame([{
+            "reward_raw_mean": np.mean(rewards_raw),
+            "reward_raw_std": np.std(rewards_raw),
+            "reward_raw_min": np.min(rewards_raw),
+            "reward_raw_max": np.max(rewards_raw),
+            "reward_adjusted_mean": np.mean(rewards_adjusted),
+            "reward_adjusted_std": np.std(rewards_adjusted),
+            "reward_adjusted_min": np.min(rewards_adjusted),
+            "reward_adjusted_max": np.max(rewards_adjusted),
+            "sigma_mean": np.mean(sigmas),
+            "sigma_std": np.std(sigmas),
+            "sigma_min": np.min(sigmas),
+            "sigma_max": np.max(sigmas),
+            "load_tracking_mean": np.mean(reward_vecs[:, 0]),
+            "load_tracking_std": np.std(reward_vecs[:, 0]),
+            "load_tracking_min": np.min(reward_vecs[:, 0]),
+            "load_tracking_max": np.max(reward_vecs[:, 0]),
+            "safety_mean": np.mean(reward_vecs[:, 1]),
+            "safety_std": np.std(reward_vecs[:, 1]),
+            "safety_min": np.min(reward_vecs[:, 1]),
+            "safety_max": np.max(reward_vecs[:, 1]),
+            "filter_interference_mean": np.mean(reward_vecs[:, 2]),
+            "filter_interference_std": np.std(reward_vecs[:, 2]),
+            "filter_interference_min": np.min(reward_vecs[:, 2]),
+            "filter_interference_max": np.max(reward_vecs[:, 2]),
+        }])
 
 
 def main(policy_shm_name: str,
@@ -993,8 +1053,20 @@ def main(policy_shm_name: str,
     weight_updates = 0
     # store_rollout = True
 
+    # cumulative performance metrics over the full run
+    total_train_rollouts_df = None
+    total_eval_rollouts_df = None
+
     try:
         while True:
+            # check for termination request from driver (f_buf[7] == 1)
+            try:
+                if actor.f_buf[7] == 1:
+                    actor.logger.debug("Minion: Termination flag detected (f_buf[7]=1), exiting main loop.")
+                    break
+            except Exception as e:
+                actor.logger.debug(f"Minion: Failed to read termination flag, exiting loop: {e}")
+                break
 
             actor.logger.debug(f"Minion: Rollout count -> {actor.rollout_count}.")
 
@@ -1011,19 +1083,35 @@ def main(policy_shm_name: str,
                 actor.logger.debug("Minion: Filter weights updated.")
             else:
                 actor.logger.debug("Minion: Filter weights not updated.")
+            
+            actor.logger.debug(f"Minion: Starting train and eval sequence.")
 
             # model_error is now read from filter_policy_shm along with weights in try_update_filter_weights()
             # No need to read from flag buffer anymore
 
             # perform train and eval routine
-            actor.train_and_eval_sequence(
-                train_batches=1,
-                eval_rollouts=1,
-            )
+            try:
+                train_rollouts_df, eval_rollouts_df = actor.train_and_eval_sequence(
+                    train_batches=1,
+                    eval_rollouts=5,
+                )
+            except Exception as e:
+                actor.logger.debug(f"Minion: Failed to perform train and eval sequence: {e}")
+                raise RuntimeError(f"Failed to perform train and eval sequence: {e}")
+
+            actor.logger.debug(f"Minion: Train and eval sequence completed.")
 
             # set minion rollout flag to true to enable the algo.train() calls
             actor.f_buf[4] = 1  # minion data collection flag is now at index 4
 
+            # Append performance metrics
+            try:
+                total_train_rollouts_df = pd.concat([total_train_rollouts_df, train_rollouts_df])
+                total_eval_rollouts_df = pd.concat([total_eval_rollouts_df, eval_rollouts_df])
+            except Exception as e:
+                actor.logger.debug(f"Minion: Failed to append performance metrics: {e}")
+                total_train_rollouts_df = train_rollouts_df
+                total_eval_rollouts_df = eval_rollouts_df
             # logger.debug(f"Minion: Done with iteration {timesteps}")
 
             # if environment is the physical engine, wait for new state update and reward (simulated with a sleep)
@@ -1032,8 +1120,57 @@ def main(policy_shm_name: str,
             timesteps += 1
 
     except KeyboardInterrupt:
+        actor.logger.debug("Minion: Program interrupted via KeyboardInterrupt.")
+    finally:
+        # Check to see if this process was terminated by the driver or if it crashed
+        if actor.f_buf[7] != 1:
+            # This means this process crashed, so terminate the driver process.
+            actor.f_buf[7] = 1  # set termination flag to true
+
+        actor.logger.debug("Minion: Cleaning up on exit.")
+        # Persist aggregated rollout statistics, if any were collected
+        try:
+            if total_train_rollouts_df is not None:
+                total_train_rollouts_df.to_csv("minion_train_rollouts.csv", index=False)
+                actor.logger.debug("Minion: Saved total_train_rollouts_df to minion_train_rollouts.csv")
+            if total_eval_rollouts_df is not None:
+                total_eval_rollouts_df.to_csv("minion_eval_rollouts.csv", index=False)
+                actor.logger.debug("Minion: Saved total_eval_rollouts_df to minion_eval_rollouts.csv")
+        except Exception as e:
+            actor.logger.debug(f"Minion: Failed to save rollout CSVs on exit: {e}")
+
         # Save any remaining timing data before exit
-        actor.timing_recorder.save_timing_data()
-        # close socket connection
-        del actor.ep_arr
-        actor.logger.debug("Program interrupted")
+        try:
+            actor.timing_recorder.save_timing_data()
+        except Exception as e:
+            actor.logger.debug(f"Minion: Failed to save timing data on exit: {e}")
+
+        # Close shared memory buffers and release numpy views
+        try:
+            if hasattr(actor, "ep_arr"):
+                del actor.ep_arr
+            if hasattr(actor, "filter_ep_arr"):
+                del actor.filter_ep_arr
+        except Exception as e:
+            actor.logger.debug(f"Minion: Failed to delete numpy views on exit: {e}")
+
+        try:
+            actor.ep_shm.close()
+            actor.p_shm.close()
+            actor.f_shm.close()
+            actor.filter_p_shm.close()
+            if hasattr(actor, "filter_ep_shm") and actor.filter_ep_shm is not None:
+                actor.filter_ep_shm.close()
+        except Exception as e:
+            actor.logger.debug(f"Minion: Failed to close shared memory blocks on exit: {e}")
+
+        # Close ZMQ resources if enabled
+        try:
+            if getattr(actor, "pub", None) is not None:
+                actor.pub.close()
+            if getattr(actor, "zmq_ctx", None) is not None:
+                actor.zmq_ctx.term()
+        except Exception as e:
+            actor.logger.debug(f"Minion: Failed to close ZMQ resources on exit: {e}")
+
+        actor.logger.debug("Minion: Clean exit completed.")

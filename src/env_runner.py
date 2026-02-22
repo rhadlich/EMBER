@@ -579,19 +579,27 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         self.f_buf[1] = 1  # set weights-available flag to 1 (true)
 
     def _unlink_mem_blocks_if_necessary(self):
-        """Close all shared memory blocks and terminate minion subprocess."""
-        if self.policy_shm:
-            self.policy_shm.close()
-            self.policy_shm.unlink()
-        if self.flag_shm:
-            self.flag_shm.close()
-            self.flag_shm.unlink()
-        if self.episode_shm:
-            del self.ep_arr
-            self.episode_shm.close()
-            self.episode_shm.unlink()
-        if ray.wait([self._minion_ref], timeout=0)[0]:
-            ray.cancel(self._minion_ref)
+        """Close all shared memory blocks and terminate minion subprocess.
+
+        Note:
+            - `policy_shm` and `flag_shm` are created and unlinked by the driver
+              in `run_algorithm.py`, so we only close them here.
+            - `episode_shm` is created by this EnvRunner, so we both close and
+              unlink it.
+        """
+        try:
+            if self.policy_shm:
+                self.policy_shm.close()
+            if self.flag_shm:
+                self.flag_shm.close()
+            if self.episode_shm:
+                del self.ep_arr
+                self.episode_shm.close()
+                self.episode_shm.unlink()
+            if ray.wait([self._minion_ref], timeout=0)[0]:
+                ray.cancel(self._minion_ref)
+        except Exception as e:
+            self.logger.debug(f"EnvRunner: Failed to close/unlink shared memory blocks: {e}")
 
     def _log_episode_metrics(self, length, ret, sec, **kwargs):
         # Log general episode metrics.

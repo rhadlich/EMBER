@@ -24,6 +24,7 @@ from typing import (
 )
 
 import numpy as np
+import pandas as pd
 from multiprocessing import shared_memory
 
 import ray
@@ -42,6 +43,20 @@ from ray.rllib.utils.metrics import (
     EVALUATION_RESULTS,
     NUM_ENV_STEPS_TRAINED,
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
+)
+from ray.rllib.algorithms.sac.sac_learner import (
+    LOGPS_KEY,
+    QF_LOSS_KEY,
+    QF_MEAN_KEY,
+    QF_MAX_KEY,
+    QF_MIN_KEY,
+    QF_PREDS,
+    QF_TWIN_LOSS_KEY,
+    QF_TWIN_PREDS,
+    TD_ERROR_MEAN_KEY,
+)
+from ray.rllib.core.learner.learner import (
+    POLICY_LOSS_KEY,
 )
 from ray.rllib.utils.typing import ResultDict
 from ray.rllib.utils.error import UnsupportedSpaceException
@@ -70,6 +85,13 @@ except ImportError:
     zmq_available = False
     zmq = None
 
+
+def remove_nested_dicts(dictionary: dict) -> dict:
+    keys_to_keep = []
+    for key in dictionary.keys():
+        if not isinstance(dictionary[key], dict):
+            keys_to_keep.append(key)
+    return {key: dictionary[key] for key in keys_to_keep}
 
 def on_sigterm(signum, frame):
     raise KeyboardInterrupt
@@ -426,7 +448,7 @@ def run_rllib_shared_memory(
         #   4 -> minion data collection flag (has it started collecting data?, true_state=1)
         #   5 -> actor episode buffer lock flag (needed because of race conditions with reading and writing, locked_state=1)
         #   6 -> filter episode buffer lock flag (locked_state=1)
-        #   7 -> reserved (can be used for model_error or other purposes)
+        #   7 -> termination flag (1 -> request all external processes to stop)
         f_shm = shared_memory.SharedMemory(
             create=True,
             name=args.flag_shm_name,
@@ -441,7 +463,7 @@ def run_rllib_shared_memory(
         f_buf[4] = 0  # set minion flag to false (minion has not started collecting rollouts)
         f_buf[5] = 0  # set actor episode lock flag to unlocked
         f_buf[6] = 0  # set filter episode lock flag to unlocked
-        f_buf[7] = 0  # reserved
+        f_buf[7] = 0  # termination flag (0 -> keep running, 1 -> stop)
 
         logger.debug("run_algorithm: created flag memory buffer")
 
@@ -656,6 +678,9 @@ def run_rllib_shared_memory(
         logger.debug("run_algorithm: waiting until minion starts collecting rollouts.")
         # wait until the minion has started collecting rollouts
         while f_buf[4] == 0:  # minion data collection flag is now at index 4
+            if f_buf[7] == 1:  # termination flag is now at index 7
+                logger.debug("run_algorithm: termination flag is set, exiting")
+                raise RuntimeError("run_algorithm: termination flag is set, exiting")
             time.sleep(0.1)
         logger.debug("run_algorithm: minion is now collecting rollouts")
 
@@ -943,9 +968,17 @@ def run_rllib_shared_memory(
             logger.debug(f"run_algorithm: Updated filter policy weights in shared memory with MSE={mse_loss:.6f}")
 
         try:
+            # determine maximum number of training iterations
+            if stop is not None and TRAINING_ITERATION in stop and stop[TRAINING_ITERATION]:
+                max_iters = int(stop[TRAINING_ITERATION])
+            elif getattr(args, "stop_iters", None):
+                max_iters = int(args.stop_iters)
+            else:
+                max_iters = 200
+
             # start counter
             train_iter = 0
-            while True:
+            while train_iter < max_iters:
                 logger.debug("run_algorithm: in the train loop now.")
 
                 # perform one logical iteration of actor training
@@ -962,6 +995,20 @@ def run_rllib_shared_memory(
                 except Exception as e:
                     logger.debug(f"run_algorithm: Failed to train filter model: {e}")
                     raise RuntimeError(f"Failed to train filter model: {e}")
+                
+                # start logging results
+                if 'learners' in results.keys():
+                    env_runners_df = pd.DataFrame([remove_nested_dicts(results['env_runners'])])
+                    learners_df = pd.DataFrame([remove_nested_dicts(results['learners']['default_policy'])])
+                    try:
+                        env_runners_df_stored = pd.concat([env_runners_df_stored, env_runners_df], ignore_index=True)
+                        learners_df_stored = pd.concat([learners_df_stored, learners_df], ignore_index=True)
+                        logger.debug(f"run_algorithm: Concatenated env_runners_df and env_runners_df_prev: {env_runners_df_stored.shape}, {learners_df_stored.shape}")
+                    except Exception as e:
+                        env_runners_df_stored = env_runners_df.copy()
+                        learners_df_stored = learners_df.copy()
+                        logger.debug(f"run_algorithm: Failed to concatenate env_runners_df and env_runners_df_prev: {e}")
+
 
                 state = algo.learner_group.get_state(components="learner")
                 if 'metrics_logger' in state['learner']:
@@ -1047,9 +1094,113 @@ def run_rllib_shared_memory(
                 # increment counter
                 train_iter += 1
 
-        except KeyboardInterrupt:
+            logger.debug(f"run_algorithm: Done with the training loop on iteration {train_iter}.")
+
+            # signal external processes (EnvRunner/Minion) to stop via shared flag
+            try:
+                f_buf[7] = 1
+                logger.debug("run_algorithm: Set termination flag in shared memory (f_buf[7]=1).")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to set termination flag: {e}")
+
+            # persist collected metrics if available
+            try:
+                env_runners_df_stored.to_csv('env_runners_df.csv', index=False)
+                learners_df_stored.to_csv('learners_df.csv', index=False)
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to write metrics CSVs: {e}")
+
+            # stop RLlib algorithm and shut down Ray/SHM resources
+            try:
+                algo.stop()
+                logger.debug("run_algorithm: Called algo.stop() successfully.")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to stop algorithm cleanly: {e}")
+
+            # close and unlink shared memory blocks owned by this process
+            try:
+                if filter_ep_shm is not None:
+                    try:
+                        filter_ep_shm.close()
+                        filter_ep_shm.unlink()
+                    except FileNotFoundError:
+                        # Already unlinked elsewhere; safe to ignore.
+                        pass
+                try:
+                    filter_p_shm.close()
+                    filter_p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    p_shm.close()
+                    p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    f_shm.close()
+                    f_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                logger.debug("run_algorithm: Closed and unlinked shared memory blocks.")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks: {e}")
+
             if not keep_ray_up:
-                # del f_arr
-                ray.shutdown()
+                try:
+                    ray.shutdown()
+                    logger.debug("run_algorithm: Ray shutdown completed.")
+                except Exception as e:
+                    logger.debug(f"run_algorithm: Failed to shut down Ray: {e}")
+
+        except (KeyboardInterrupt, RuntimeError) as e:
+            logger.debug(f"run_algorithm: Caught {type(e).__name__}, initiating graceful shutdown.")
+
+            # signal external processes to stop
+            try:
+                f_buf[7] = 1
+                logger.debug(f"run_algorithm: Set termination flag in shared memory (f_buf[7]=1) on {type(e).__name__}.")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to set termination flag on {type(e).__name__}: {e}")
+
+            # attempt to stop RLlib algorithm
+            try:
+                algo.stop()
+                logger.debug(f"run_algorithm: Called algo.stop() successfully on {type(e).__name__}.")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to stop algorithm cleanly on {type(e).__name__}: {e}")
+
+            # close and unlink shared memory blocks
+            try:
+                if filter_ep_shm is not None:
+                    try:
+                        filter_ep_shm.close()
+                        filter_ep_shm.unlink()
+                    except FileNotFoundError:
+                        pass
+                try:
+                    filter_p_shm.close()
+                    filter_p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    p_shm.close()
+                    p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    f_shm.close()
+                    f_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                logger.debug(f"run_algorithm: Closed and unlinked shared memory blocks on {type(e).__name__}.")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks on {type(e).__name__}: {e}")
+
+            if not keep_ray_up:
+                try:
+                    ray.shutdown()
+                    logger.debug(f"run_algorithm: Ray shutdown completed on {type(e).__name__}.")
+                except Exception as e:
+                    logger.debug(f"run_algorithm: Failed to shut down Ray on {type(e).__name__}: {e}")
 
         return results

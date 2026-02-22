@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import argparse
 import subprocess
 from collections import deque
 from statistics import mean
@@ -65,26 +66,29 @@ class ZmqListener(QtCore.QThread):
 
 # ---------- Main application window ----------
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, subscriber_only=False, logger=None):
         super().__init__()
         self.setWindowTitle("RLlib + Engine Monitor")
-        self.log = logging.getLogger('MyRLApp.GUI')
+        if logger is None:
+            self.log = logging.getLogger('MyRLApp.GUI')
+        else:
+            self.log = logger
         self.log.info(f"GUI, PID={os.getpid()}")
 
-        #========= DEFINE WHICH ALGO TO RUN HERE ==========================================
-        algo = 'IMPALA'
-
-        # launch setup_run.py (which is set up to spawn custom_run.py, shared_memory_env_runner.py, minion.py)
-        script_dir = os.path.dirname('/Users/rodrigohadlich/PycharmProjects/RayProject/')
-        setup_run_path = os.path.join(script_dir, "setup_run.py")
-        cmd = [
-            sys.executable,
-            setup_run_path,
-            "--algo", algo,
-            "--enable-zmq", "True",
-        ]
-        # use the same Python interpreter
-        self.setup_run_proc = subprocess.Popen(cmd)
+        if subscriber_only:
+            self.setup_run_proc = None
+        else:
+            # Standalone mode: launch setup_run.py (which spawns env_runner, minion, etc.)
+            algo = 'IMPALA'
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            setup_run_path = os.path.join(script_dir, "setup_run.py")
+            cmd = [
+                sys.executable,
+                setup_run_path,
+                "--algo", algo,
+                "--enable-zmq", "True",
+            ]
+            self.setup_run_proc = subprocess.Popen(cmd)
 
         # create containers for plot parameters
         self.plot_colors = ["#e60049", "#0bb4ff", "#50e991", "#ffa300", "#9b19f5", "#dc0ab4", "#b3d4ff", "#00bfa0"]
@@ -263,7 +267,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.listener.isRunning():
             self.listener.stop()
 
-        if self.setup_run_proc.poll() is None:
+        if self.setup_run_proc is not None and self.setup_run_proc.poll() is None:
             self.setup_run_proc.terminate()
             try:
                 self.setup_run_proc.wait(timeout=2)
@@ -273,8 +277,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         # Clean up ZMQ thread
         self.listener.stop()
-        # Terminate setup_run.py (and thus its children)
-        if self.setup_run_proc.poll() is None:
+        # Terminate setup_run.py (and thus its children) if we spawned it
+        if self.setup_run_proc is not None and self.setup_run_proc.poll() is None:
             self.setup_run_proc.terminate()
         super().closeEvent(event)
 
@@ -395,8 +399,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    logger = logging.getLogger('MyRLApp.GUI')
+    logger.info(f"GUI, PID={os.getpid()}")
+    gui_parser = argparse.ArgumentParser(description="RLlib + Engine Monitor GUI")
+    gui_parser.add_argument(
+        "--subscriber-only",
+        action="store_true",
+        help="Run in subscriber-only mode (do not spawn setup_run; expect it to be already running).",
+    )
+    gui_args, _ = gui_parser.parse_known_args()
+
+    logger.debug(f"GUI: Going to launch application.")
+
     app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow()
+    win = MainWindow(subscriber_only=gui_args.subscriber_only, logger=logger)
     win.resize(1200, 900)
     win.show()
     sys.exit(app.exec())
