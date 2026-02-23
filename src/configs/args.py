@@ -333,4 +333,28 @@ def custom_args(
         help="Init Ray in local mode for easier debugging.",
     )
 
+    # Model save/load options.
+    parser.add_argument(
+        "--rllib-module-name",
+        type=str,
+        default=None,
+        help="Basename for the full RLlib module (actor, critic, target networks). Saved under models/ directory. "
+        "If not set, defaults are used based on algo and env_type.",
+    )
+    parser.add_argument(
+        "--filter-model-name",
+        type=str,
+        default=None,
+        help="Basename for the safety filter StatePredictor model. Saved under models/ directory. "
+        "If not set, defaults are used based on algo and env_type.",
+    )
+    parser.add_argument(
+        "--model-mode",
+        type=str,
+        choices=["create", "load"],
+        default="create",
+        help="'create': Always create new models from scratch. "
+        "'load': Load existing models if found (error on spec mismatch, warn and create new if missing).",
+    )
+
     return parser

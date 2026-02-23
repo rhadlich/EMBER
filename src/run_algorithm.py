@@ -64,8 +64,10 @@ from ray.tune import CLIReporter
 from ray.tune.result import TRAINING_ITERATION
 from ray.rllib.core.rl_module.rl_module import RLModule
 
+from ray.rllib.algorithms.algorithm import Algorithm
+
 if TYPE_CHECKING:
-    from ray.rllib.algorithms import Algorithm, AlgorithmConfig
+    from ray.rllib.algorithms import AlgorithmConfig
     from ray.rllib.offline.dataset_reader import DatasetReader
 
 from configs.args import custom_args
@@ -95,6 +97,145 @@ def remove_nested_dicts(dictionary: dict) -> dict:
 
 def on_sigterm(signum, frame):
     raise KeyboardInterrupt
+
+
+def _ember_dir() -> str:
+    """Return path to EMBER project root (parent of src/)."""
+    return str(Path(__file__).resolve().parent.parent)
+
+
+def _checkpoints_dir() -> str:
+    """Return path to checkpoints directory under EMBER (created if needed)."""
+    d = os.path.join(_ember_dir(), "checkpoints")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _rllib_checkpoint_dir(rllib_module_name: str) -> str:
+    """Return path to RLlib checkpoint directory under EMBER/checkpoints."""
+    return os.path.join(_checkpoints_dir(), rllib_module_name)
+
+
+def _filter_checkpoint_dir(filter_model_name: str) -> str:
+    """Return path to filter checkpoint directory under EMBER/checkpoints."""
+    return os.path.join(_checkpoints_dir(), filter_model_name)
+
+
+def _spec_matches(saved: Dict, expected: Dict) -> bool:
+    """Compare saved spec with expected spec. Returns True only if all keys match."""
+    if saved.keys() != expected.keys():
+        return False
+    for k in expected:
+        if saved.get(k) != expected.get(k):
+            return False
+    return True
+
+
+def _build_or_restore_rllib_algo(config, args, logger):
+    """
+    Build algo from config or restore from RLlib checkpoint if model_mode=load
+    and checkpoint exists with matching spec.
+    Returns (algo, was_restored: bool).
+    Raises ValueError if checkpoint exists but spec mismatches.
+    """
+    model_mode = getattr(args, "model_mode", "create")
+    rllib_module_name = getattr(args, "rllib_module_name", "rllib_module")
+    rllib_module_spec = getattr(args, "rllib_module_spec", None)
+    checkpoint_dir = _rllib_checkpoint_dir(rllib_module_name)
+    spec_path = os.path.join(checkpoint_dir, "rllib_spec.json")
+
+    if model_mode == "load" and rllib_module_spec is not None and os.path.isdir(checkpoint_dir):
+        if os.path.isfile(spec_path):
+            with open(spec_path, "r") as f:
+                saved_spec = json.load(f)
+            if not _spec_matches(saved_spec, rllib_module_spec):
+                raise ValueError(
+                    f"RLlib module checkpoint at {checkpoint_dir} has incompatible spec. "
+                    f"Saved: {saved_spec}. Expected: {rllib_module_spec}. Refusing to load."
+                )
+        try:
+            algo = Algorithm.from_checkpoint(checkpoint_dir)
+            logger.info(f"Restored RLlib module from {checkpoint_dir}")
+            return algo, True
+        except Exception as e:
+            logger.warning(
+                f"Failed to restore RLlib module from {checkpoint_dir}: {e}. "
+                "Building from config."
+            )
+    elif model_mode == "load" and rllib_module_spec is not None:
+        logger.warning(
+            f"RLlib checkpoint not found at {checkpoint_dir}. Building from config."
+        )
+
+    algo = config.build()
+    return algo, False
+
+
+def _load_filter_model(filter_model, args, logger) -> bool:
+    """
+    Load StatePredictor weights if model_mode=load and files exist with matching spec.
+    Returns True if loaded, False if created new. Raises ValueError if spec mismatches.
+    """
+    model_mode = getattr(args, "model_mode", "create")
+    if model_mode != "load":
+        return False
+    filter_name = getattr(args, "filter_model_name", "filter")
+    filter_spec = getattr(args, "filter_spec", None)
+    if filter_spec is None:
+        logger.warning("filter_spec not set; cannot validate filter model. Skipping load.")
+        return False
+    filter_dir = _filter_checkpoint_dir(filter_name)
+    pt_path = os.path.join(filter_dir, "filter.pt")
+    spec_path = os.path.join(filter_dir, "filter_spec.json")
+    if not os.path.isfile(pt_path) or not os.path.isfile(spec_path):
+        logger.warning(
+            f"Filter model not found at {pt_path} (or spec at {spec_path}). "
+            "Creating new filter from scratch."
+        )
+        return False
+    with open(spec_path, "r") as f:
+        saved_spec = json.load(f)
+    if not _spec_matches(saved_spec, filter_spec):
+        raise ValueError(
+            f"Filter model checkpoint at {filter_dir} has incompatible spec. "
+            f"Saved: {saved_spec}. Expected: {filter_spec}. Refusing to load."
+        )
+    state = torch.load(pt_path, map_location="cpu")
+    filter_model.load_state_dict(state)
+    logger.info(f"Loaded filter model from {pt_path}")
+    return True
+
+
+def _save_models(algo, filter_model_refs, args, logger) -> None:
+    """Save RLlib module and filter models plus spec sidecars. Called on shutdown."""
+    rllib_module_spec = getattr(args, "rllib_module_spec", None)
+    filter_spec = getattr(args, "filter_spec", None)
+    rllib_module_name = getattr(args, "rllib_module_name", "rllib_module")
+    filter_name = getattr(args, "filter_model_name", "filter")
+    try:
+        if algo is not None and rllib_module_spec is not None:
+            checkpoint_dir = _rllib_checkpoint_dir(rllib_module_name)
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            algo.save_to_path(checkpoint_dir)
+            spec_path = os.path.join(checkpoint_dir, "rllib_spec.json")
+            with open(spec_path, "w") as f:
+                json.dump(rllib_module_spec, f, indent=2)
+            logger.info(f"Saved RLlib module to {checkpoint_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to save RLlib module: {e}")
+    try:
+        fm = filter_model_refs.get("model") if filter_model_refs else None
+        if fm is not None and filter_spec is not None:
+            filter_dir = _filter_checkpoint_dir(filter_name)
+            os.makedirs(filter_dir, exist_ok=True)
+            pt_path = os.path.join(filter_dir, "filter.pt")
+            spec_path = os.path.join(filter_dir, "filter_spec.json")
+            torch.save(fm.state_dict(), pt_path)
+            with open(spec_path, "w") as f:
+                json.dump(filter_spec, f, indent=2)
+            logger.info(f"Saved filter model to {pt_path}")
+    except Exception as e:
+        logger.warning(f"Failed to save filter model: {e}")
 
 
 def _get_current_onnx_model(module: RLModule,
@@ -439,6 +580,9 @@ def run_rllib_shared_memory(
     if args.no_tune:
         assert not args.as_test and not args.as_release_test
 
+        algo = None
+        filter_model_refs = None
+
         # create flag shared memory block here
         # flag buffer has 8 bytes:
         #   0 -> actor weights lock flag (locked_state=1)
@@ -467,10 +611,13 @@ def run_rllib_shared_memory(
 
         logger.debug("run_algorithm: created flag memory buffer")
 
-        # build algorithm, EnvRunner is created in this call
-        algo = config.build()
-
-        logger.debug("run_algorithm: done with config.build()")
+        # Build or restore RLlib algorithm
+        try:
+            algo, rllib_module_loaded = _build_or_restore_rllib_algo(config, args, logger)
+        except ValueError as e:
+            logger.error(str(e))
+            raise
+        logger.debug("run_algorithm: done with build/restore")
 
         # extract dimensions of weights in the networks
         ort_raw = _get_current_onnx_model(algo.get_module(), logger=logger)
@@ -563,7 +710,21 @@ def run_rllib_shared_memory(
             dropout=filter_dropout
         )
         filter_model.eval()
-        
+
+        # Load filter model if model_mode=load and compatible checkpoint exists
+        filter_loaded = False
+        try:
+            filter_loaded = _load_filter_model(filter_model, args, logger)
+        except ValueError as e:
+            logger.error(str(e))
+            raise
+
+        if getattr(args, "model_mode", "create") == "load" and (rllib_module_loaded != filter_loaded):
+            logger.warning(
+                f"Partial load: RLlib module={'loaded' if rllib_module_loaded else 'created'}, "
+                f"filter={'loaded' if filter_loaded else 'created'}."
+            )
+
         # Convert filter model to ONNX/ORT
         filter_ort_raw = _get_filter_onnx_model(filter_model, logger=logger, outdir="filter_model.onnx")
         filter_policy_nbytes = len(filter_ort_raw)
@@ -1096,6 +1257,9 @@ def run_rllib_shared_memory(
 
             logger.debug(f"run_algorithm: Done with the training loop on iteration {train_iter}.")
 
+            # Save models before shutdown (always, regardless of model_mode)
+            _save_models(algo, filter_model_refs, args, logger)
+
             # signal external processes (EnvRunner/Minion) to stop via shared flag
             try:
                 f_buf[7] = 1
@@ -1154,6 +1318,12 @@ def run_rllib_shared_memory(
 
         except (KeyboardInterrupt, RuntimeError) as e:
             logger.debug(f"run_algorithm: Caught {type(e).__name__}, initiating graceful shutdown.")
+
+            # Save models before shutdown (always)
+            try:
+                _save_models(algo, filter_model_refs, args, logger)
+            except Exception as save_err:
+                logger.warning(f"run_algorithm: Failed to save models on shutdown: {save_err}")
 
             # signal external processes to stop
             try:

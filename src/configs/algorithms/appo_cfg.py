@@ -43,3 +43,21 @@ def update_config(cfg, args):
         )
         # .rl_module(rl_module_spec=spec)
     )
+
+
+def get_rllib_module_spec(cfg) -> dict:
+    """Return architecture-relevant dict for RLlib module compatibility checks."""
+    mc = getattr(cfg, "model_config", None)
+    if mc is None:
+        return {"model_config": {}}
+    if isinstance(mc, dict):
+        d = dict(mc)
+    else:
+        try:
+            d = {k: getattr(mc, k, None) for k in (
+                "fcnet_hiddens", "fcnet_activation", "head_fcnet_hiddens",
+                "vf_share_layers", "free_log_std"
+            )}
+        except Exception:
+            d = {}
+    return {"model_config": {k: v for k, v in d.items() if v is not None}}
