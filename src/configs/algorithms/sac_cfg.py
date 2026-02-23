@@ -74,6 +74,26 @@ def update_config(cfg, args):
     )
 
 
+def get_rllib_module_spec(cfg) -> dict:
+    """Return architecture-relevant dict for RLlib module compatibility checks."""
+    def _to_plain_dict(x):
+        if x is None:
+            return {}
+        if isinstance(x, dict):
+            return dict(x)
+        try:
+            return dict(x)
+        except (TypeError, ValueError):
+            return {}
+    pmc = _to_plain_dict(getattr(cfg, "policy_model_config", None))
+    qmc = _to_plain_dict(getattr(cfg, "q_model_config", None))
+    return {
+        "policy_model_config": pmc,
+        "q_model_config": qmc,
+        "twin_q": bool(getattr(cfg, "twin_q", True)),
+    }
+
+
 class SACTorchLearnerWithRBS(SACTorchLearner):
     """
     SACTorchLearner with return-based scaling. This method was copied and pasted from the original SACTorchLearner class

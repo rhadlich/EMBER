@@ -4,3 +4,7 @@ migrate_repo.py
 *.config
 *.csv
 .DS_Store
+*.pkl
+*.pt
+*.json
+**/__pycache__/

@@ -26,3 +26,13 @@ def update_config(cfg, args):
         .rl_module(rl_module_spec=spec)
         # .rl_module(model_config={"vf_share_layers": False})
     )
+
+
+def get_rllib_module_spec(cfg) -> dict:
+    """Return architecture-relevant dict for RLlib module compatibility checks."""
+    spec = getattr(cfg, "rl_module_spec", None)
+    if spec is None:
+        return {"rl_module_spec": "ImpalaMlpModule"}
+    mod_cls = getattr(spec, "module_class", None)
+    name = getattr(mod_cls, "__name__", "ImpalaMlpModule") if mod_cls else "ImpalaMlpModule"
+    return {"rl_module_spec": name}

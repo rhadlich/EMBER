@@ -2,7 +2,7 @@
 
 How to run this script
 ----------------------
-`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --no-tune
+`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --model-mode "create or load" --gui True --rllib-module-name "rllib_module_name" --filter-model-name "filter_model_name" --cpu-core-minion "core#"
 
 """
 import numpy as np
@@ -251,5 +251,46 @@ if __name__ == "__main__":
             base_config = mod.update_config(base_config, args)
     except ModuleNotFoundError:
         pass
+
+    # Model save/load: resolve names and build spec for compatibility checks.
+    env_type = getattr(args, "env_type", "continuous")
+    args.rllib_module_name = getattr(args, "rllib_module_name", None) or f"{args.algo}_{env_type}_rllib_module"
+    args.filter_model_name = getattr(args, "filter_model_name", None) or f"{args.algo}_{env_type}_filter"
+    args.model_mode = getattr(args, "model_mode", "create")
+
+    obs_space_final = obs_space_onehot or obs_space
+    obs_shape = list(obs_space_final.shape) if hasattr(obs_space_final, "shape") else [getattr(obs_space_final, "n", None)]
+    action_shape = list(action_space.shape) if hasattr(action_space, "shape") else [int(sum(adapter.nvec))] if adapter.mode in ("discrete1", "multidiscrete") else None
+    filter_num_hidden = getattr(args, "filter_num_hidden", 2)
+    filter_hidden_exp = getattr(args, "filter_hidden_exp", 7)
+    filter_dropout = getattr(args, "filter_dropout", 0.0)
+
+    args.rllib_module_spec = {
+        "algo": args.algo,
+        "framework": args.framework,
+        "env_type": env_type,
+        "obs_is_discrete": obs_is_discrete,
+        "obs_shape": obs_shape,
+        "action_shape": action_shape,
+        "adapter_mode": adapter.mode,
+    }
+    try:
+        mod = importlib.import_module(f"configs.algorithms.{args.algo.lower()}_cfg")
+        if hasattr(mod, "get_rllib_module_spec"):
+            arch = mod.get_rllib_module_spec(base_config)
+            if arch is not None:
+                args.rllib_module_spec["rllib_module_arch"] = arch
+    except Exception:
+        pass  # Algo may not define it
+    logger.debug(f"rllib_module_spec: {args.rllib_module_spec}")
+
+    args.filter_spec = {
+        "filter_state_dim": filter_dims["state"],
+        "filter_action_dim": filter_dims["action"],
+        "filter_num_hidden": filter_num_hidden,
+        "filter_hidden_exp": filter_hidden_exp,
+        "filter_dropout": filter_dropout,
+    }
+    logger.debug(f"filter_spec: {args.filter_spec}")
 
     run_rllib_shared_memory(base_config, args)
