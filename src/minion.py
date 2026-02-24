@@ -120,13 +120,11 @@ class Minion:
         self.timing_recorder = TimingRecorder(csv_path=csv_path, logger=self.logger)
 
         # add attributes to object
-        # self.policy_shm_name = policy_shm_name
-        # self.flag_shm_name = flag_shm_name
-        # self.ep_shm_name = ep_shm_name
         self.policy_shm_name = self.config.env_config['policy_shm_name']
         self.flag_shm_name = self.config.env_config['flag_shm_name']
         self.episode_shm_properties = self.config.env_config["ep_shm_properties"]
         self.ep_shm_name = self.episode_shm_properties['name']
+        self.enable_safety_filter = self.config.env_config.get("enable_safety_filter", True)
         self.filter_policy_shm_name = self.config.env_config.get('filter_policy_shm_name', 'filter_policy')
         self.filter_ep_shm_properties = self.config.env_config.get("filter_ep_shm_properties")
         if self.filter_ep_shm_properties is not None:
@@ -216,55 +214,63 @@ class Minion:
 
         self.logger.debug("Minion: Initialized ENV.")
 
-        # Connect to filter policy shared memory block
-        while self.f_buf[2] == 1:  # wait until filter policy shared memory block has been created (lock flag)
-            time.sleep(0.01)
-        self.filter_p_shm = shared_memory.SharedMemory(name=self.filter_policy_shm_name, create=False)
-        self.filter_p_buf = self.filter_p_shm.buf
+        self.safety_filter = None
+        self.filter_ep_arr = None
+        self.filter_ep_shm = None
+        self.model_error = 0.0
 
-        self.logger.debug("Minion: Getting initial filter network weights")
-        self.filter_ort_session = None
-        # get initial filter network weights
-        while self.f_buf[3] == 0:  # wait until filter weights-available flag is set to true
-            time.sleep(0.01)
-        self.filter_ort_session, self.filter_input_names, self.filter_output_names = self._get_ort_session(model_type='filter')
-        self.logger.debug(f"Minion: filter_input_names: {self.filter_input_names}, filter_output_names: {self.filter_output_names}")
-        self.f_buf[3] = 0  # change filter new-weights-available flag to false
+        if self.enable_safety_filter:
+            # Connect to filter policy shared memory block
+            while self.f_buf[2] == 1:  # wait until filter policy shared memory block has been created (lock flag)
+                time.sleep(0.01)
+            self.filter_p_shm = shared_memory.SharedMemory(name=self.filter_policy_shm_name, create=False)
+            self.filter_p_buf = self.filter_p_shm.buf
 
-        self.logger.debug("Minion: Initialized filter ORT session")
+            self.logger.debug("Minion: Getting initial filter network weights")
+            self.filter_ort_session = None
+            # get initial filter network weights
+            while self.f_buf[3] == 0:  # wait until filter weights-available flag is set to true
+                time.sleep(0.01)
+            self.filter_ort_session, self.filter_input_names, self.filter_output_names = self._get_ort_session(model_type='filter')
+            self.logger.debug(f"Minion: filter_input_names: {self.filter_input_names}, filter_output_names: {self.filter_output_names}")
+            self.f_buf[3] = 0  # change filter new-weights-available flag to false
 
-        try:
-            # Initialize SafetyFilter with ORT session
-            filter_dims = self.filter_ep_shm_properties.get("filter_dims", None)
-            filter_state_dim = filter_dims.get("state", None)
-            filter_action_dim = filter_dims.get("action", None)
-            if filter_state_dim is None or filter_action_dim is None:
-                raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
-            
-            self.safety_filter = SafetyFilter(
-                state_dim=filter_state_dim,
-                action_dim=filter_action_dim,
-                ort_session=self.filter_ort_session,
-                input_names=self.filter_input_names,
-                output_names=self.filter_output_names
-            )
-            self.model_error = 0.0  # Initial model error, will be updated from shared memory (float, not torch tensor)
-        except Exception as e:
-            self.logger.error(f"Minion: Could not initialize SafetyFilter: {e}")
-            raise RuntimeError(f"Minion: Could not initialize SafetyFilter: {e}")
+            self.logger.debug("Minion: Initialized filter ORT session")
 
-        self.logger.debug("Minion: Initialized SafetyFilter")
+            try:
+                # Initialize SafetyFilter with ORT session
+                filter_dims = self.filter_ep_shm_properties.get("filter_dims", None)
+                filter_state_dim = filter_dims.get("state", None)
+                filter_action_dim = filter_dims.get("action", None)
+                if filter_state_dim is None or filter_action_dim is None:
+                    raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
 
-        # Connect to filter episode shared memory if available
-        if self.filter_ep_shm_properties is not None:
-            self.filter_ep_shm = shared_memory.SharedMemory(name=self.filter_ep_shm_name, create=False)
-            self.filter_ep_buf = self.filter_ep_shm.buf
-            self.filter_ep_arr = np.ndarray(shape=(self.filter_ep_shm_properties["TOTAL_SIZE"],),
-                                            dtype=np.float32,
-                                            buffer=self.filter_ep_buf,
-                                            )
-            self.logger.debug(f"Minion: filter_ep_arr shape -> {self.filter_ep_arr.shape}")
-            self.logger.debug("Minion: connected to filter episode memory block")
+                self.safety_filter = SafetyFilter(
+                    state_dim=filter_state_dim,
+                    action_dim=filter_action_dim,
+                    ort_session=self.filter_ort_session,
+                    input_names=self.filter_input_names,
+                    output_names=self.filter_output_names
+                )
+                self.model_error = 0.0  # Initial model error, will be updated from shared memory (float, not torch tensor)
+            except Exception as e:
+                self.logger.error(f"Minion: Could not initialize SafetyFilter: {e}")
+                raise RuntimeError(f"Minion: Could not initialize SafetyFilter: {e}")
+
+            self.logger.debug("Minion: Initialized SafetyFilter")
+
+            # Connect to filter episode shared memory if available
+            if self.filter_ep_shm_properties is not None:
+                self.filter_ep_shm = shared_memory.SharedMemory(name=self.filter_ep_shm_name, create=False)
+                self.filter_ep_buf = self.filter_ep_shm.buf
+                self.filter_ep_arr = np.ndarray(shape=(self.filter_ep_shm_properties["TOTAL_SIZE"],),
+                                                dtype=np.float32,
+                                                buffer=self.filter_ep_buf,
+                                                )
+                self.logger.debug(f"Minion: filter_ep_arr shape -> {self.filter_ep_arr.shape}")
+                self.logger.debug("Minion: connected to filter episode memory block")
+        else:
+            self.logger.debug("Minion: Safety filter disabled.")
 
         # set up data broadcasting to GUI (optional)
         self.pub = None
@@ -405,6 +411,8 @@ class Minion:
         Returns:
             True if weights were updated, False otherwise
         """
+        if model_type == 'filter' and not getattr(self, 'enable_safety_filter', True):
+            return False
         if model_type == 'actor':
             weights_flag_idx = 1
             lock_flag_idx = 0
@@ -786,7 +794,7 @@ class Minion:
             self.logger.debug(f"Minion: Failed to get action from actor to filter: {e}")
             raise RuntimeError(f"Failed to get action from actor to filter: {e}")
 
-        # Apply safety filter to action
+        # Apply safety filter to action (or use nominal when filter disabled)
         if hasattr(self, 'safety_filter') and self.safety_filter is not None:
             try:
                 # SafetyFilter now uses numpy arrays directly (no torch conversion needed)
@@ -798,9 +806,12 @@ class Minion:
                 self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
             except Exception as e:
                 self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
-        
+                action_filtered = action_from_actor_for_filter_nominal
+        else:
+            action_filtered = action_from_actor_for_filter_nominal
+
         try:
-        # Format action for environment
+            # Format action for environment
             action_for_env_filtered = self._get_action_from_filter_to_env(action_filtered)
             nominal_action_for_env = self._get_action_from_filter_to_env(action_from_actor)
             self.logger.debug(f"Minion: action_for_env_filtered: {action_for_env_filtered}")

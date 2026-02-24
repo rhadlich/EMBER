@@ -157,49 +157,74 @@ if __name__ == "__main__":
         "action_dist_size": action_dist_size,
     }
 
+    enable_safety_filter = not getattr(args, "disable_safety_filter", False)
+
     # Define filter training data ring buffer properties (4x larger than actor buffer)
     # Filter data format: (current_state, action_filtered, next_state, action_nominal)
-    
-    filter_dims = {
-        "state": dims["state"],
-        "action": dims["action"],
-        "next_state": dims["state"],
-        "nominal_action": dims["action"],
-    }
-    FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
-    FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)
-    FILTER_ELEMENTS_PER_ROLLOUT = sum(filter_dims.values())  # state + action_filtered + next_state + action_nominal
-    FILTER_BYTES_PER_ROLLOUT = FILTER_ELEMENTS_PER_ROLLOUT * bytes_per_float
-    FILTER_PAYLOAD_SIZE = FILTER_ELEMENTS_PER_ROLLOUT * FILTER_BATCH_SIZE  # filter buffer does not need initial state
-    FILTER_HEADER_SIZE = HEADER_SIZE  # same structure
-    FILTER_HEADER_SLOT_SIZE = HEADER_SLOT_SIZE
-    FILTER_SLOT_SIZE = FILTER_HEADER_SLOT_SIZE + FILTER_PAYLOAD_SIZE
-    FILTER_TOTAL_SIZE = FILTER_HEADER_SIZE + FILTER_NUM_SLOTS * FILTER_SLOT_SIZE
-    FILTER_TOTAL_SIZE_BYTES = int(FILTER_TOTAL_SIZE * bytes_per_float)
-    FILTER_N_BATCHES_FOR_TRAINING_ITERATION = 16
-    
-    logger.debug(f"Filter buffer: BATCH_SIZE={FILTER_BATCH_SIZE}, NUM_SLOTS={FILTER_NUM_SLOTS}")
-    logger.debug(f"Filter ELEMENTS_PER_ROLLOUT: {FILTER_ELEMENTS_PER_ROLLOUT}")
-    logger.debug(f"Filter PAYLOAD_SIZE: {FILTER_PAYLOAD_SIZE}")
-    logger.debug(f"Filter TOTAL_SIZE_BYTES: {FILTER_TOTAL_SIZE_BYTES}")
+    filter_ep_shm_properties = None
+    if enable_safety_filter:
+        filter_dims = {
+            "state": dims["state"],
+            "action": dims["action"],
+            "next_state": dims["state"],
+            "nominal_action": dims["action"],
+        }
+        FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
+        FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)
+        FILTER_ELEMENTS_PER_ROLLOUT = sum(filter_dims.values())  # state + action_filtered + next_state + action_nominal
+        FILTER_BYTES_PER_ROLLOUT = FILTER_ELEMENTS_PER_ROLLOUT * bytes_per_float
+        FILTER_PAYLOAD_SIZE = FILTER_ELEMENTS_PER_ROLLOUT * FILTER_BATCH_SIZE  # filter buffer does not need initial state
+        FILTER_HEADER_SIZE = HEADER_SIZE  # same structure
+        FILTER_HEADER_SLOT_SIZE = HEADER_SLOT_SIZE
+        FILTER_SLOT_SIZE = FILTER_HEADER_SLOT_SIZE + FILTER_PAYLOAD_SIZE
+        FILTER_TOTAL_SIZE = FILTER_HEADER_SIZE + FILTER_NUM_SLOTS * FILTER_SLOT_SIZE
+        FILTER_TOTAL_SIZE_BYTES = int(FILTER_TOTAL_SIZE * bytes_per_float)
+        FILTER_N_BATCHES_FOR_TRAINING_ITERATION = 16
 
-    filter_ep_shm_properties = {
-        "BATCH_SIZE": FILTER_BATCH_SIZE,
-        "NUM_SLOTS": FILTER_NUM_SLOTS,
-        "ELEMENTS_PER_ROLLOUT": FILTER_ELEMENTS_PER_ROLLOUT,
-        "BYTES_PER_ROLLOUT": FILTER_BYTES_PER_ROLLOUT,
-        "PAYLOAD_SIZE": FILTER_PAYLOAD_SIZE,
-        "HEADER_SIZE": FILTER_HEADER_SIZE,
-        "HEADER_SLOT_SIZE": FILTER_HEADER_SLOT_SIZE,
-        "SLOT_SIZE": FILTER_SLOT_SIZE,
-        "TOTAL_SIZE": FILTER_TOTAL_SIZE,
-        "TOTAL_SIZE_BYTES": FILTER_TOTAL_SIZE_BYTES,
-        "STATE_ACTION_DIMS": filter_dims,
-        "BYTES_PER_FLOAT": bytes_per_float,
-        "N_BATCHES_FOR_TRAINING_ITERATION": FILTER_N_BATCHES_FOR_TRAINING_ITERATION,
-        "name": "filter_episodes",
-        "filter_dims": filter_dims,
+        logger.debug(f"Filter buffer: BATCH_SIZE={FILTER_BATCH_SIZE}, NUM_SLOTS={FILTER_NUM_SLOTS}")
+        logger.debug(f"Filter ELEMENTS_PER_ROLLOUT: {FILTER_ELEMENTS_PER_ROLLOUT}")
+        logger.debug(f"Filter PAYLOAD_SIZE: {FILTER_PAYLOAD_SIZE}")
+        logger.debug(f"Filter TOTAL_SIZE_BYTES: {FILTER_TOTAL_SIZE_BYTES}")
+
+        filter_ep_shm_properties = {
+            "BATCH_SIZE": FILTER_BATCH_SIZE,
+            "NUM_SLOTS": FILTER_NUM_SLOTS,
+            "ELEMENTS_PER_ROLLOUT": FILTER_ELEMENTS_PER_ROLLOUT,
+            "BYTES_PER_ROLLOUT": FILTER_BYTES_PER_ROLLOUT,
+            "PAYLOAD_SIZE": FILTER_PAYLOAD_SIZE,
+            "HEADER_SIZE": FILTER_HEADER_SIZE,
+            "HEADER_SLOT_SIZE": FILTER_HEADER_SLOT_SIZE,
+            "SLOT_SIZE": FILTER_SLOT_SIZE,
+            "TOTAL_SIZE": FILTER_TOTAL_SIZE,
+            "TOTAL_SIZE_BYTES": FILTER_TOTAL_SIZE_BYTES,
+            "STATE_ACTION_DIMS": filter_dims,
+            "BYTES_PER_FLOAT": bytes_per_float,
+            "N_BATCHES_FOR_TRAINING_ITERATION": FILTER_N_BATCHES_FOR_TRAINING_ITERATION,
+            "name": "filter_episodes",
+            "filter_dims": filter_dims,
+        }
+
+    # Build env_config with enable_safety_filter always; filter-related keys only when filter enabled.
+    env_config = {
+        "policy_shm_name": args.policy_shm_name,
+        "flag_shm_name": args.flag_shm_name,
+        "ep_shm_properties": ep_shm_properties,
+        "imep_space": imep_space,
+        "mprr_space": mprr_space,
+        "obs_is_discrete": obs_is_discrete,
+        "env_type": args.env_type.lower(),
+        "cpu_core_env_runner": args.cpu_core_env_runner,
+        "cpu_core_minion": args.cpu_core_minion,
+        "enable_zmq": args.enable_zmq,
+        "realtime_priority": 80,  # Default real-time priority for minion
+        "enable_safety_filter": enable_safety_filter,
     }
+    if enable_safety_filter:
+        env_config["filter_ep_shm_properties"] = filter_ep_shm_properties
+        env_config["filter_policy_shm_name"] = getattr(args, "filter_policy_shm_name", "filter_policy")
+        env_config["filter_num_hidden"] = getattr(args, "filter_num_hidden", 2)
+        env_config["filter_hidden_exp"] = getattr(args, "filter_hidden_exp", 7)
+        env_config["filter_dropout"] = getattr(args, "filter_dropout", 0.0)
 
     # Define the RLlib config.
     base_config = (
@@ -216,23 +241,7 @@ if __name__ == "__main__":
             normalize_actions=(True if adapter.mode == "continuous" else False),
             clip_actions=(True if adapter.mode == "continuous" else False),
             clip_rewards=False,
-            env_config={"policy_shm_name": args.policy_shm_name,
-                        "flag_shm_name": args.flag_shm_name,
-                        "ep_shm_properties": ep_shm_properties,
-                        "filter_ep_shm_properties": filter_ep_shm_properties,
-                        "imep_space": imep_space,
-                        "mprr_space": mprr_space,
-                        "obs_is_discrete": obs_is_discrete,
-                        "env_type": args.env_type.lower(),
-                        "cpu_core_env_runner": args.cpu_core_env_runner,
-                        "cpu_core_minion": args.cpu_core_minion,
-                        "enable_zmq": args.enable_zmq,
-                        "realtime_priority": 80,  # Default real-time priority for minion
-                        "filter_policy_shm_name": getattr(args, "filter_policy_shm_name", "filter_policy"),
-                        "filter_num_hidden": getattr(args, "filter_num_hidden", 2),
-                        "filter_hidden_exp": getattr(args, "filter_hidden_exp", 7),
-                        "filter_dropout": getattr(args, "filter_dropout", 0.0),
-                        },
+            env_config=env_config,
         )
         .env_runners(
             # Point RLlib to the custom EnvRunner to be used here.
@@ -261,9 +270,6 @@ if __name__ == "__main__":
     obs_space_final = obs_space_onehot or obs_space
     obs_shape = list(obs_space_final.shape) if hasattr(obs_space_final, "shape") else [getattr(obs_space_final, "n", None)]
     action_shape = list(action_space.shape) if hasattr(action_space, "shape") else [int(sum(adapter.nvec))] if adapter.mode in ("discrete1", "multidiscrete") else None
-    filter_num_hidden = getattr(args, "filter_num_hidden", 2)
-    filter_hidden_exp = getattr(args, "filter_hidden_exp", 7)
-    filter_dropout = getattr(args, "filter_dropout", 0.0)
 
     args.rllib_module_spec = {
         "algo": args.algo,
@@ -284,13 +290,18 @@ if __name__ == "__main__":
         pass  # Algo may not define it
     logger.debug(f"rllib_module_spec: {args.rllib_module_spec}")
 
-    args.filter_spec = {
-        "filter_state_dim": filter_dims["state"],
-        "filter_action_dim": filter_dims["action"],
-        "filter_num_hidden": filter_num_hidden,
-        "filter_hidden_exp": filter_hidden_exp,
-        "filter_dropout": filter_dropout,
-    }
-    logger.debug(f"filter_spec: {args.filter_spec}")
-
+    if enable_safety_filter:
+        filter_num_hidden = getattr(args, "filter_num_hidden", 2)
+        filter_hidden_exp = getattr(args, "filter_hidden_exp", 7)
+        filter_dropout = getattr(args, "filter_dropout", 0.0)
+        args.filter_spec = {
+            "filter_state_dim": filter_dims["state"],
+            "filter_action_dim": filter_dims["action"],
+            "filter_num_hidden": filter_num_hidden,
+            "filter_hidden_exp": filter_hidden_exp,
+            "filter_dropout": filter_dropout,
+        }
+        logger.debug(f"filter_spec: {args.filter_spec}")
+    else:
+        args.filter_spec = None
     run_rllib_shared_memory(base_config, args)

@@ -153,13 +153,6 @@ def custom_args(
 
     # tune.Tuner options.
     parser.add_argument(
-        "--no-tune",
-        type=bool,
-        default=True,
-        help="Whether to NOT use tune.Tuner(), but rather a simple for-loop calling "
-        "`algo.train()` repeatedly until one of the stop criteria is met.",
-    )
-    parser.add_argument(
         "--num-samples",
         type=int,
         default=1,
@@ -331,6 +324,14 @@ def custom_args(
         "--local-mode",
         action="store_true",
         help="Init Ray in local mode for easier debugging.",
+    )
+
+    # Safety filter.
+    parser.add_argument(
+        "--disable-safety-filter",
+        action="store_true",
+        default=False,
+        help="Disable the safety filter: no filter model load/train/save, and actor action is used as-is (no filter correction). Default: filter enabled.",
     )
 
     # Model save/load options.
