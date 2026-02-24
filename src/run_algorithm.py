@@ -366,8 +366,8 @@ def run_rllib_shared_memory(
     Use the custom_args function from the define_args.py script to generate "args".
 
     The function sets up an Algorithm object from the given config (altered by the
-    contents of `args`), then runs the Algorithm via Tune (or manually, if
-    `args.no_tune` is set to True) using the stopping criteria in `stop`.
+    contents of `args`), then runs the Algorithm using the stopping criteria in
+    `stop`.
 
     At the end of the experiment, if `args.as_test` is True, checks, whether the
     Algorithm reached the `success_metric` (if None, use `env_runners/
@@ -384,7 +384,7 @@ def run_rllib_shared_memory(
         args: A argparse.Namespace object, ideally returned by calling
             `args = add_rllib_example_script_args()`. It must have the following
             properties defined: `stop_iters`, `stop_reward`, `stop_timesteps`,
-            `no_tune`, `verbose`, `checkpoint_freq`, `as_test`. Optionally, for WandB
+            `verbose`, `checkpoint_freq`, `as_test`. Optionally, for WandB
             logging: `wandb_key`, `wandb_project`, `wandb_run_name`.
         stop: An optional dict mapping ResultDict key strings (using "/" in case of
             nesting, e.g. "env_runners/episode_return_mean" for referring to
@@ -414,9 +414,292 @@ def run_rllib_shared_memory(
             `num_env_runners`).
 
     Returns:
-        The last ResultDict from a --no-tune run OR the tune.Tuner.fit()
-        results.
+        The last ResultDict from the training run.
     """
+        # Define internal helper functions.
+    def _read_filter_batch():
+        """Read completed batches from filter episode shared memory buffer.
+        Returns batches as numpy arrays of shape (batch_size, state_dim + action_dim + state_dim)
+        or None if no complete batch available.
+        Also adds batches to storage buffer for accumulation.
+        """
+        logger.debug("run_algorithm: Starting _read_filter_batch().")
+        if filter_ep_arr is None or filter_ep_shm_properties is None:
+            return None
+
+        # wait until the buffer is unlocked to read indices
+        while True:
+            if f_buf[6] == 0:  # filter episode buffer lock flag
+                write_idx, read_idx = get_indices(filter_ep_arr, f_buf, lock_index=6)
+                break
+            else:
+                time.sleep(0.0001)
+
+        # Check if any batches available
+        if write_idx == read_idx:
+            set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
+            return None  # ring empty
+        
+        logger.debug(f"run_algorithm: write_idx: {write_idx}, read_idx: {read_idx}")
+
+        # Calculate number of batches
+        if write_idx < read_idx:
+            num_batches = ((filter_ep_shm_properties["NUM_SLOTS"] - 1) - read_idx) + write_idx + 1
+        else:
+            num_batches = write_idx - read_idx
+
+        logger.debug(f"run_algorithm: num_batches: {num_batches}")
+
+        batches = []
+        for i in range(num_batches):
+            slot_off = filter_ep_shm_properties["HEADER_SIZE"] + read_idx * filter_ep_shm_properties["SLOT_SIZE"]
+            filled = int(filter_ep_arr[slot_off])
+            
+            # Ensure batch is complete
+            if filled < filter_ep_shm_properties["BATCH_SIZE"]:
+                set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
+                return batches if batches else None
+
+            # Extract data from ring
+            data_start = slot_off + filter_ep_shm_properties["HEADER_SLOT_SIZE"]
+            payload = np.copy(filter_ep_arr[data_start: data_start + filter_ep_shm_properties["PAYLOAD_SIZE"]])
+            
+            # Reshape to (batch_size, elements_per_rollout)
+            batch = payload.reshape(filter_ep_shm_properties["BATCH_SIZE"], 
+                                   filter_ep_shm_properties["ELEMENTS_PER_ROLLOUT"])
+            
+            batches.append(batch)
+            
+            # Add batch to storage buffer
+            if filter_model_refs['storage_buffer'] is not None:
+                filter_model_refs['storage_buffer'].add_batch(batch)
+            
+            # Advance read_idx
+            read_idx = (read_idx + 1) % filter_ep_shm_properties["NUM_SLOTS"]
+
+        # Commit new indices and unlock
+        set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
+        return batches
+
+    def _sample_from_storage_buffer(
+        n_batches: Optional[int] = 1,
+        batch_size: Optional[int] = None,
+    ):
+        """Sample batches from storage buffer for training.
+        Returns batches as numpy arrays or None if not enough samples available.
+        """
+        storage_buffer = filter_model_refs.get('storage_buffer')
+        if storage_buffer is None:
+            return None
+        
+        # Determine batch size for sampling
+        if batch_size is None:
+            batch_size = filter_model_refs.get('storage_training_batch_size')
+            if batch_size is None:
+                # Use ring buffer batch size as default
+                if filter_ep_shm_properties is not None:
+                    batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
+                else:
+                    batch_size = 128
+        
+        # Sample batches from storage buffer
+        sampled_batches = storage_buffer.sample_batches(n_batches=n_batches, batch_size=batch_size)
+        return sampled_batches
+
+    def _train_filter_model():
+        """Train filter model on available batch data.
+        First accumulates data from ring buffer to storage buffer, then samples from storage buffer
+        for training if enough samples are available. Falls back to ring buffer batches if storage buffer is too small.
+        Returns loss value or None if no data available.
+        """
+        logger.debug("run_algorithm: Starting filter model training.")
+
+        if filter_model_refs['model'] is None:
+            return None
+
+        # First, read from ring buffer and accumulate in storage buffer
+        ring_batches = _read_filter_batch()  # This also adds batches to storage buffer
+
+        logger.debug(f"run_algorithm: Read {len(ring_batches)} batches from ring buffer.")
+        
+        # Try to sample from storage buffer first
+        batches = None
+        storage_buffer = filter_model_refs.get('storage_buffer')
+        if storage_buffer is not None and storage_buffer.size() >= storage_buffer.min_samples_for_training:
+            batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
+            n_batches = filter_ep_shm_properties.get("N_BATCHES_FOR_TRAINING_ITERATION", 1)
+            n_batches = n_batches if storage_buffer.size() >= batch_size*n_batches else 1
+            sampled = _sample_from_storage_buffer(n_batches=n_batches, batch_size=batch_size)
+            if sampled is not None and len(sampled) > 0:
+                batches = sampled
+                logger.debug(f"run_algorithm: Using storage buffer for training ({storage_buffer.size()} samples)")
+        
+        # Fall back to ring buffer batches if storage buffer doesn't have enough samples
+        if batches is None or len(batches) == 0:
+            batches = ring_batches
+            if batches is None or len(batches) == 0:
+                return None
+            logger.debug(f"run_algorithm: Using ring buffer for training (storage buffer has {storage_buffer.size() if storage_buffer else 0} samples)")
+
+        logger.debug(f"run_algorithm: Using {len(batches)} batches for training.")
+
+        model = filter_model_refs['model']
+        model.train()  # Set to training mode
+        
+        # Initialize optimizer if not already done
+        if not hasattr(_train_filter_model, 'optimizer'):
+            _train_filter_model.optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        
+        optimizer = _train_filter_model.optimizer
+        criterion = torch.nn.MSELoss()
+        
+        total_loss = 0.0
+        num_samples = 0
+
+        logger.debug("run_algorithm: Starting training loop in _train_filter_model().")
+        
+        for batch in batches:
+            # Split batch into state, action, next_state
+            state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
+            action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
+            
+            states = torch.from_numpy(batch[:, :state_dim]).float()
+            actions = torch.from_numpy(batch[:, state_dim:state_dim + action_dim]).float()
+            # next_state is the segment immediately following action_filtered (ignore appended action_nominal)
+            next_state_start = state_dim + action_dim
+            next_state_end = next_state_start + state_dim
+            next_states = torch.from_numpy(batch[:, next_state_start:next_state_end]).float()
+            
+            # Forward pass
+            predicted_next_states, _, _ = model(states, actions)
+            
+            # Compute loss
+            loss = criterion(predicted_next_states, next_states)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_samples += states.shape[0]
+        
+        logger.debug("run_algorithm: Training loop in _train_filter_model() completed.")
+        
+        model.eval()  # Set back to eval mode
+        
+        avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
+        logger.debug(f"run_algorithm: Filter model training loss: {avg_loss:.6f}")
+        
+        return avg_loss
+
+    def _update_filter_policy_shm(mse_loss):
+        """Update filter policy weights in shared memory along with MSE loss.
+        
+        Args:
+            mse_loss: The MSE loss value from training to store with the weights.
+        """
+        if filter_model_refs['model'] is None:
+            return
+        
+        model = filter_model_refs['model']
+        model.eval()
+        
+        # Convert to ONNX/ORT
+        filter_ort_raw = _get_filter_onnx_model(model, logger=logger, outdir="filter_model.onnx")
+        filter_policy_nbytes = len(filter_ort_raw)
+        filter_p_buf = filter_model_refs['filter_p_buf']
+        header_offset = 4
+        mse_offset = header_offset + filter_policy_nbytes  # Store MSE after the ORT weights
+        
+        # Check if buffer is large enough (weights + 4 bytes for MSE float32)
+        required_size = mse_offset + 4
+        if len(filter_p_buf) < required_size:
+            logger.warning(f"Filter policy buffer too small: need {required_size}, have {len(filter_p_buf)}")
+            return
+        
+        # Check size matches (excluding MSE storage)
+        _len_ort_expected = struct.unpack_from("<I", filter_p_buf, 0)
+        if _len_ort_expected[0] != filter_policy_nbytes:
+            logger.warning(f"Filter model size mismatch: expected {_len_ort_expected[0]}, got {filter_policy_nbytes}")
+            return
+        
+        # Wait for lock and update
+        while f_buf[2] == 1:  # filter weights lock flag
+            time.sleep(0.0001)
+        
+        f_buf[2] = 1  # set lock flag to locked
+        filter_p_buf[header_offset:header_offset + len(filter_ort_raw)] = filter_ort_raw
+        # Store MSE loss as float32 after the weights
+        struct.pack_into("<f", filter_p_buf, mse_offset, float(mse_loss))
+        f_buf[2] = 0  # set lock flag to unlocked
+        f_buf[3] = 1  # set filter weights-available flag to 1 (true)
+        
+        logger.debug(f"run_algorithm: Updated filter policy weights in shared memory with MSE={mse_loss:.6f}")
+
+    def _graceful_shutdown():
+        """Save models, signal shutdown to external processes, save collected metrics,
+        stop RLlib algorithm and shutdown ray, close and unlink shared memory blocks.
+        """
+        try:
+            _save_models(algo, filter_model_refs, args, logger)
+        except Exception as e:
+            logger.warning(f"run_algorithm: Failed to save models on shutdown: {e}")
+
+        try:
+            f_buf[7] = 1
+            logger.debug("run_algorithm: Set termination flag in shared memory (f_buf[7]=1).")
+        except Exception as e:
+            logger.debug(f"run_algorithm: Failed to set termination flag: {e}")
+
+        try:
+            if env_runners_df_stored is not None and learners_df_stored is not None:
+                env_runners_df_stored.to_csv('env_runners_df.csv', index=False)
+                learners_df_stored.to_csv('learners_df.csv', index=False)
+        except Exception as e:
+            logger.debug(f"run_algorithm: Failed to write metrics CSVs: {e}")
+
+        try:
+            algo.stop()
+            logger.debug("run_algorithm: Called algo.stop() successfully.")
+        except Exception as e:
+            logger.debug(f"run_algorithm: Failed to stop algorithm cleanly: {e}")
+
+        try:
+            if filter_ep_shm is not None:
+                try:
+                    filter_ep_shm.close()
+                    filter_ep_shm.unlink()
+                except FileNotFoundError:
+                    pass
+            if filter_p_shm is not None:
+                try:
+                    filter_p_shm.close()
+                    filter_p_shm.unlink()
+                except FileNotFoundError:
+                    pass
+            try:
+                p_shm.close()
+                p_shm.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                f_shm.close()
+                f_shm.unlink()
+            except FileNotFoundError:
+                pass
+            logger.debug("run_algorithm: Closed and unlinked shared memory blocks.")
+        except Exception as e:
+            logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks: {e}")
+
+        if not keep_ray_up:
+            try:
+                ray.shutdown()
+                logger.debug("run_algorithm: Ray shutdown completed.")
+            except Exception as e:
+                logger.debug(f"run_algorithm: Failed to shut down Ray: {e}")
+
+    # Begin main body of run_algorithm.
     if args is None:
         parser = custom_args()
         args = parser.parse_args()
@@ -571,88 +854,93 @@ def run_rllib_shared_memory(
         if args.output is not None:
             config.offline_data(output=args.output)
 
-    logger.debug("run_algorithm: Done with setting config. Going into args.no_tune")
+    logger.debug("run_algorithm: Done with setting config.")
 
     signal.signal(signal.SIGTERM, on_sigterm)
 
-    # Run the experiment w/o Tune (directly operate on the RLlib Algorithm object).
+    # Run the experiment (directly operate on the RLlib Algorithm object).
     # THIS IS WHAT WILL BE RUN ON THE RASPBERRY PI
-    if args.no_tune:
-        assert not args.as_test and not args.as_release_test
+    assert not args.as_test and not args.as_release_test
 
-        algo = None
-        filter_model_refs = None
+    algo = None
+    filter_model_refs = None
 
-        # create flag shared memory block here
-        # flag buffer has 8 bytes:
-        #   0 -> actor weights lock flag (locked_state=1)
-        #   1 -> actor weights available flag (true_state=1)
-        #   2 -> filter weights lock flag (locked_state=1)
-        #   3 -> filter weights available flag (true_state=1)
-        #   4 -> minion data collection flag (has it started collecting data?, true_state=1)
-        #   5 -> actor episode buffer lock flag (needed because of race conditions with reading and writing, locked_state=1)
-        #   6 -> filter episode buffer lock flag (locked_state=1)
-        #   7 -> termination flag (1 -> request all external processes to stop)
-        f_shm = shared_memory.SharedMemory(
-            create=True,
-            name=args.flag_shm_name,
-            size=8,
-        )
-        f_buf = f_shm.buf
+    # create flag shared memory block here
+    # flag buffer has 8 bytes:
+    #   0 -> actor weights lock flag (locked_state=1)
+    #   1 -> actor weights available flag (true_state=1)
+    #   2 -> filter weights lock flag (locked_state=1)
+    #   3 -> filter weights available flag (true_state=1)
+    #   4 -> minion data collection flag (has it started collecting data?, true_state=1)
+    #   5 -> actor episode buffer lock flag (needed because of race conditions with reading and writing, locked_state=1)
+    #   6 -> filter episode buffer lock flag (locked_state=1)
+    #   7 -> termination flag (1 -> request all external processes to stop)
+    f_shm = shared_memory.SharedMemory(
+        create=True,
+        name=args.flag_shm_name,
+        size=8,
+    )
+    f_buf = f_shm.buf
 
-        f_buf[0] = 1  # set actor weights lock flag to locked
-        f_buf[1] = 0  # set actor weights-available flag to false
-        f_buf[2] = 1  # set filter weights lock flag to locked
-        f_buf[3] = 0  # set filter weights-available flag to false
-        f_buf[4] = 0  # set minion flag to false (minion has not started collecting rollouts)
-        f_buf[5] = 0  # set actor episode lock flag to unlocked
-        f_buf[6] = 0  # set filter episode lock flag to unlocked
-        f_buf[7] = 0  # termination flag (0 -> keep running, 1 -> stop)
+    f_buf[0] = 1  # set actor weights lock flag to locked
+    f_buf[1] = 0  # set actor weights-available flag to false
+    f_buf[2] = 1  # set filter weights lock flag to locked
+    f_buf[3] = 0  # set filter weights-available flag to false
+    f_buf[4] = 0  # set minion flag to false (minion has not started collecting rollouts)
+    f_buf[5] = 0  # set actor episode lock flag to unlocked
+    f_buf[6] = 0  # set filter episode lock flag to unlocked
+    f_buf[7] = 0  # termination flag (0 -> keep running, 1 -> stop)
 
-        logger.debug("run_algorithm: created flag memory buffer")
+    logger.debug("run_algorithm: created flag memory buffer")
 
-        # Build or restore RLlib algorithm
-        try:
-            algo, rllib_module_loaded = _build_or_restore_rllib_algo(config, args, logger)
-        except ValueError as e:
-            logger.error(str(e))
-            raise
-        logger.debug("run_algorithm: done with build/restore")
+    # Build or restore RLlib algorithm
+    try:
+        algo, rllib_module_loaded = _build_or_restore_rllib_algo(config, args, logger)
+    except ValueError as e:
+        logger.error(str(e))
+        raise
+    logger.debug("run_algorithm: done with build/restore")
 
-        # extract dimensions of weights in the networks
-        ort_raw = _get_current_onnx_model(algo.get_module(), logger=logger)
-        policy_nbytes = len(ort_raw)
+    # extract dimensions of weights in the networks
+    ort_raw = _get_current_onnx_model(algo.get_module(), logger=logger)
+    policy_nbytes = len(ort_raw)
 
-        logger.debug(f"run_algorithm: ort_raw length is {policy_nbytes}")
+    logger.debug(f"run_algorithm: ort_raw length is {policy_nbytes}")
 
-        # create policy shared memory blocks
-        # need to include one more float32 as the buffer header to contain length of ort_compressed.
-        # python creates the length of the buffer to be the smallest number of pages that can hold the requested number
-        # of bytes, but not the size requested (on Mac at least)
-        header_offset = 4
-        p_shm = shared_memory.SharedMemory(
-            create=True,
-            name=args.policy_shm_name,
-            size=policy_nbytes + header_offset
-        )
+    # create policy shared memory blocks
+    # need to include one more float32 as the buffer header to contain length of ort_compressed.
+    # python creates the length of the buffer to be the smallest number of pages that can hold the requested number
+    # of bytes, but not the size requested (on Mac at least)
+    header_offset = 4
+    p_shm = shared_memory.SharedMemory(
+        create=True,
+        name=args.policy_shm_name,
+        size=policy_nbytes + header_offset
+    )
 
-        logger.debug("run_algorithm: created policy memory buffer")
+    logger.debug("run_algorithm: created policy memory buffer")
 
-        # get reference to policy buffer
-        p_buf = p_shm.buf
+    # get reference to policy buffer
+    p_buf = p_shm.buf
 
-        logger.debug(f"run_algorithm: buffer length is {len(p_buf)}")
+    logger.debug(f"run_algorithm: buffer length is {len(p_buf)}")
 
-        # store initial weights and remove lock flags
-        struct.pack_into("<I", p_buf, 0, policy_nbytes)
-        p_buf[header_offset:header_offset + len(ort_raw)] = ort_raw  # insert raw weights
-        f_buf[0] = 0  # set lock flag to unlocked
-        f_buf[1] = 1  # set weights-available flag to 1 (true)
+    # store initial weights and remove lock flags
+    struct.pack_into("<I", p_buf, 0, policy_nbytes)
+    p_buf[header_offset:header_offset + len(ort_raw)] = ort_raw  # insert raw weights
+    f_buf[0] = 0  # set lock flag to unlocked
+    f_buf[1] = 1  # set weights-available flag to 1 (true)
 
-        logger.debug("run_algorithm: stored initial model weights")
+    logger.debug("run_algorithm: stored initial model weights")
 
+    enable_safety_filter = config.env_config.get("enable_safety_filter", True)
+    filter_ep_shm = None
+    filter_p_shm = None
+
+    if enable_safety_filter:
         # Initialize filter model (StatePredictor)
-        filter_dims = config.env_config.get("filter_ep_shm_properties", None).get("filter_dims", None)
+        filter_ep_shm_properties_for_dims = config.env_config.get("filter_ep_shm_properties", None)
+        filter_dims = filter_ep_shm_properties_for_dims.get("filter_dims", None) if filter_ep_shm_properties_for_dims else None
         filter_state_dim = filter_dims.get("state", None)
         filter_action_dim = filter_dims.get("action", None)
         # if isinstance(config.observation_space, spaces.Discrete):
@@ -663,25 +951,26 @@ def run_rllib_shared_memory(
         #     filter_state_dim = len(config.observation_space.shape)
         # else:
         #     raise NotImplementedError(f"Observation space type not supported or not provided.")
-        
+        #
+        #
         # if isinstance(config.action_space, spaces.Discrete):
         #     filter_action_dim = config.action_space.n.size
         # elif isinstance(config.action_space, spaces.Tuple):
         #     filter_action_dim = len(config.action_space)
         # else:
         #     raise NotImplementedError(f"Action space type not supported or not provided.")
-        
+
         if filter_state_dim is None or filter_action_dim is None:
             raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
-        
+        #
         filter_num_hidden = config.env_config.get("filter_num_hidden", 2)
         filter_hidden_exp = config.env_config.get("filter_hidden_exp", 7)
         filter_dropout = config.env_config.get("filter_dropout", 0.0)
-        
+
         logger.debug(f"run_algorithm: Initializing filter model with state_dim={filter_state_dim}, "
                     f"action_dim={filter_action_dim}, num_hidden={filter_num_hidden}, "
                     f"hidden_exp={filter_hidden_exp}, dropout={filter_dropout}")
-        
+        #
         # Initialize filter storage buffer configuration
         filter_storage_max_samples = config.env_config.get("filter_storage_max_samples", 50000)
         filter_storage_min_samples = config.env_config.get("filter_storage_min_samples", 1000)
@@ -690,7 +979,7 @@ def run_rllib_shared_memory(
         filter_storage_critical_capacity_fraction = config.env_config.get("filter_storage_critical_capacity_fraction", 0.20)
         filter_storage_h_critical_threshold = config.env_config.get("filter_storage_h_critical_threshold", 2.0)
         filter_storage_intervention_l2_threshold = config.env_config.get("filter_storage_intervention_l2_threshold", 0.10)
-        
+
         logger.debug(f"run_algorithm: Filter storage buffer config: max_samples={filter_storage_max_samples}, "
                     f"min_samples={filter_storage_min_samples}")
         logger.debug(
@@ -700,7 +989,7 @@ def run_rllib_shared_memory(
             f"h_critical_threshold={filter_storage_h_critical_threshold}, "
             f"intervention_l2_threshold={filter_storage_intervention_l2_threshold}"
         )
-        
+
         # Create PyTorch StatePredictor model
         filter_model = StatePredictor(
             state_dim=filter_state_dim,
@@ -728,9 +1017,9 @@ def run_rllib_shared_memory(
         # Convert filter model to ONNX/ORT
         filter_ort_raw = _get_filter_onnx_model(filter_model, logger=logger, outdir="filter_model.onnx")
         filter_policy_nbytes = len(filter_ort_raw)
-        
+
         logger.debug(f"run_algorithm: filter_ort_raw length is {filter_policy_nbytes}")
-        
+
         # Create filter policy shared memory block
         # Size: header (4 bytes) + ORT model + MSE loss (4 bytes float32)
         filter_policy_shm_name = config.env_config.get("filter_policy_shm_name", "filter_policy")
@@ -739,14 +1028,14 @@ def run_rllib_shared_memory(
             name=filter_policy_shm_name,
             size=filter_policy_nbytes + header_offset + 4  # +4 for MSE float32
         )
-        
+
         logger.debug("run_algorithm: created filter policy memory buffer")
-        
+
         # Get reference to filter policy buffer
         filter_p_buf = filter_p_shm.buf
-        
+
         logger.debug(f"run_algorithm: filter buffer length is {len(filter_p_buf)}")
-        
+
         # Store initial filter weights and remove lock flags
         struct.pack_into("<I", filter_p_buf, 0, filter_policy_nbytes)
         filter_p_buf[header_offset:header_offset + len(filter_ort_raw)] = filter_ort_raw  # insert raw weights
@@ -755,7 +1044,7 @@ def run_rllib_shared_memory(
         struct.pack_into("<f", filter_p_buf, mse_offset, 0.0)
         f_buf[2] = 0  # set filter lock flag to unlocked
         f_buf[3] = 1  # set filter weights-available flag to 1 (true)
-        
+
         logger.debug("run_algorithm: stored initial filter model weights with MSE=0.0")
 
         # Create filter episode shared memory block for training data
@@ -807,7 +1096,7 @@ def run_rllib_shared_memory(
                 input_names=None,
                 output_names=None,
             )
-        
+
         filter_storage_buffer = FilterStorageBuffer(
             max_samples=filter_storage_max_samples,
             min_samples_for_training=filter_storage_min_samples,
@@ -821,7 +1110,7 @@ def run_rllib_shared_memory(
             compute_h_fn=barrier_only_safety_filter.compute_h if barrier_only_safety_filter is not None else None,
         )
         logger.debug("run_algorithm: Initialized filter storage buffer")
-        
+
         # Store filter model and shared memory references for training loop
         filter_model_refs = {
             'model': filter_model,
@@ -834,319 +1123,85 @@ def run_rllib_shared_memory(
             'storage_training_batch_size': filter_storage_training_batch_size,
         }
 
-        results = None
+    results = None
 
-        logger.debug("run_algorithm: waiting until minion starts collecting rollouts.")
-        # wait until the minion has started collecting rollouts
-        while f_buf[4] == 0:  # minion data collection flag is now at index 4
-            if f_buf[7] == 1:  # termination flag is now at index 7
-                logger.debug("run_algorithm: termination flag is set, exiting")
-                raise RuntimeError("run_algorithm: termination flag is set, exiting")
-            time.sleep(0.1)
-        logger.debug("run_algorithm: minion is now collecting rollouts")
+    logger.debug("run_algorithm: waiting until minion starts collecting rollouts.")
+    # wait until the minion has started collecting rollouts
+    while f_buf[4] == 0:  # minion data collection flag is now at index 4
+        if f_buf[7] == 1:  # termination flag is now at index 7
+            logger.debug("run_algorithm: termination flag is set, exiting")
+            raise RuntimeError("run_algorithm: termination flag is set, exiting")
+        time.sleep(0.1)
+    logger.debug("run_algorithm: minion is now collecting rollouts")
 
-        # debugging
-        # logger.debug(f"run_algorithm: circular_buffer_num_batches -> {algo.config.circular_buffer_num_batches}")
-        # logger.debug(
-        #     f"run_algorithm: circular_buffer_iterations_per_batch -> {algo.config.circular_buffer_iterations_per_batch}")
-        # logger.debug(f"run_algorithm: target_network_update_freq -> {algo.config.target_network_update_freq}")
-        # logger.debug(
-        #     f"run_algorithm: num_aggregator_actors_per_learner -> {algo.config.num_aggregator_actors_per_learner}")
-        # logger.debug(
-        #     f"run_algorithm: num_envs_per_env_runner -> {algo.config.num_envs_per_env_runner}")
-        # logger.debug(f"run_algorithm: _skip_learners -> {algo.config._skip_learners}")
-        # logger.debug(f"run_algorithm: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
-        # logger.debug(f"run_algorithm: broadcast_env_runner_states? {algo.config.broadcast_env_runner_states}")
-        # logger.debug(f"run_algorithm: num_learners -> {algo.config.num_learners}")
-        # logger.debug(f"run_algorithm: min_sample_timesteps_per_iteration -> {algo.config.min_sample_timesteps_per_iteration}")
-        # logger.debug(f"run_algorithm: min_env_steps_per_iteration -> {algo.config.min_env_steps_per_iteration}")
-        # logger.debug(f"run_algorithm: min_time_s_per_iteration -> {algo.config.min_time_s_per_iteration}")
+    # merge = (
+    #                 not algo.config.enable_env_runner_and_connector_v2
+    #                 and algo.config.use_worker_filter_stats
+    #         ) or (
+    #                 algo.config.enable_env_runner_and_connector_v2
+    #                 and (
+    #                         algo.config.merge_env_runner_states is True
+    #                         or (
+    #                                 algo.config.merge_env_runner_states == "training_only"
+    #                                 and not algo.config.in_evaluation
+    #                         )
+    #                 )
+    #         )
+    # broadcast = (
+    #                     not algo.config.enable_env_runner_and_connector_v2
+    #                     and algo.config.update_worker_filter_stats
+    #             ) or (
+    #                     algo.config.enable_env_runner_and_connector_v2
+    #                     and algo.config.broadcast_env_runner_states
+    #             )
+    # logger.debug(f"run_algorithm: merge -> {merge}")
+    # logger.debug(f"run_algorithm: broadcast -> {broadcast}")
 
-        merge = (
-                        not algo.config.enable_env_runner_and_connector_v2
-                        and algo.config.use_worker_filter_stats
-                ) or (
-                        algo.config.enable_env_runner_and_connector_v2
-                        and (
-                                algo.config.merge_env_runner_states is True
-                                or (
-                                        algo.config.merge_env_runner_states == "training_only"
-                                        and not algo.config.in_evaluation
-                                )
-                        )
-                )
-        broadcast = (
-                            not algo.config.enable_env_runner_and_connector_v2
-                            and algo.config.update_worker_filter_stats
-                    ) or (
-                            algo.config.enable_env_runner_and_connector_v2
-                            and algo.config.broadcast_env_runner_states
-                    )
-        logger.debug(f"run_algorithm: merge -> {merge}")
-        logger.debug(f"run_algorithm: broadcast -> {broadcast}")
+    module = algo.get_module()
+    dist_cls = module.get_inference_action_dist_cls()
+    logger.debug(f"policy dist_class: {dist_cls}, {dist_cls.__name__}")
 
-        module = algo.get_module()
-        dist_cls = module.get_inference_action_dist_cls()
-        logger.debug(f"policy dist_class: {dist_cls}, {dist_cls.__name__}")
-
-        # set up data broadcasting to GUI (optional)
-        pub = None
-        ctx = None
-        if args.enable_zmq and zmq_available and zmq is not None:
-            try:
-                ctx = zmq.Context()
-                pub = ctx.socket(zmq.PUB)
-                pub.bind("ipc:///tmp/training.ipc")
-                logger.info("ZMQ publisher initialized for GUI communication")
-            except Exception as e:
-                logger.warning(f"Failed to initialize ZMQ publisher: {e}. Continuing without ZMQ.")
-                pub = None
-                ctx = None
-        elif args.enable_zmq and not zmq_available:
-            logger.warning("ZMQ requested but not available (zmq not installed). Continuing without ZMQ.")
-        else:
-            logger.debug("ZMQ disabled via --enable-zmq flag")
-
-        # Helper functions for filter training
-        def _read_filter_batch():
-            """Read completed batches from filter episode shared memory buffer.
-            Returns batches as numpy arrays of shape (batch_size, state_dim + action_dim + state_dim)
-            or None if no complete batch available.
-            Also adds batches to storage buffer for accumulation.
-            """
-            logger.debug("run_algorithm: Starting _read_filter_batch().")
-            if filter_ep_arr is None or filter_ep_shm_properties is None:
-                return None
-
-            # wait until the buffer is unlocked to read indices
-            while True:
-                if f_buf[6] == 0:  # filter episode buffer lock flag
-                    write_idx, read_idx = get_indices(filter_ep_arr, f_buf, lock_index=6)
-                    break
-                else:
-                    time.sleep(0.0001)
-
-            # Check if any batches available
-            if write_idx == read_idx:
-                set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
-                return None  # ring empty
-            
-            logger.debug(f"run_algorithm: write_idx: {write_idx}, read_idx: {read_idx}")
-
-            # Calculate number of batches
-            if write_idx < read_idx:
-                num_batches = ((filter_ep_shm_properties["NUM_SLOTS"] - 1) - read_idx) + write_idx + 1
-            else:
-                num_batches = write_idx - read_idx
-
-            logger.debug(f"run_algorithm: num_batches: {num_batches}")
-
-            batches = []
-            for i in range(num_batches):
-                slot_off = filter_ep_shm_properties["HEADER_SIZE"] + read_idx * filter_ep_shm_properties["SLOT_SIZE"]
-                filled = int(filter_ep_arr[slot_off])
-                
-                # Ensure batch is complete
-                if filled < filter_ep_shm_properties["BATCH_SIZE"]:
-                    set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
-                    return batches if batches else None
-
-                # Extract data from ring
-                data_start = slot_off + filter_ep_shm_properties["HEADER_SLOT_SIZE"]
-                payload = np.copy(filter_ep_arr[data_start: data_start + filter_ep_shm_properties["PAYLOAD_SIZE"]])
-                
-                # Reshape to (batch_size, elements_per_rollout)
-                batch = payload.reshape(filter_ep_shm_properties["BATCH_SIZE"], 
-                                       filter_ep_shm_properties["ELEMENTS_PER_ROLLOUT"])
-                
-                batches.append(batch)
-                
-                # Add batch to storage buffer
-                if filter_model_refs['storage_buffer'] is not None:
-                    filter_model_refs['storage_buffer'].add_batch(batch)
-                
-                # Advance read_idx
-                read_idx = (read_idx + 1) % filter_ep_shm_properties["NUM_SLOTS"]
-
-            # Commit new indices and unlock
-            set_indices(filter_ep_arr, read_idx, 'r', f_buf, lock_index=6)
-            return batches
-
-        def _sample_from_storage_buffer(
-            n_batches: Optional[int] = 1,
-            batch_size: Optional[int] = None,
-        ):
-            """Sample batches from storage buffer for training.
-            Returns batches as numpy arrays or None if not enough samples available.
-            """
-            storage_buffer = filter_model_refs.get('storage_buffer')
-            if storage_buffer is None:
-                return None
-            
-            # Determine batch size for sampling
-            if batch_size is None:
-                batch_size = filter_model_refs.get('storage_training_batch_size')
-                if batch_size is None:
-                    # Use ring buffer batch size as default
-                    if filter_ep_shm_properties is not None:
-                        batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
-                    else:
-                        batch_size = 128
-            
-            # Sample batches from storage buffer
-            sampled_batches = storage_buffer.sample_batches(n_batches=n_batches, batch_size=batch_size)
-            return sampled_batches
-
-        def _train_filter_model():
-            """Train filter model on available batch data.
-            First accumulates data from ring buffer to storage buffer, then samples from storage buffer
-            for training if enough samples are available. Falls back to ring buffer batches if storage buffer is too small.
-            Returns loss value or None if no data available.
-            """
-            logger.debug("run_algorithm: Starting filter model training.")
-
-            if filter_model_refs['model'] is None:
-                return None
-
-            # First, read from ring buffer and accumulate in storage buffer
-            ring_batches = _read_filter_batch()  # This also adds batches to storage buffer
-
-            logger.debug(f"run_algorithm: Read {len(ring_batches)} batches from ring buffer.")
-            
-            # Try to sample from storage buffer first
-            batches = None
-            storage_buffer = filter_model_refs.get('storage_buffer')
-            if storage_buffer is not None and storage_buffer.size() >= storage_buffer.min_samples_for_training:
-                batch_size = filter_ep_shm_properties.get("BATCH_SIZE", 128)
-                n_batches = filter_ep_shm_properties.get("N_BATCHES_FOR_TRAINING_ITERATION", 1)
-                n_batches = n_batches if storage_buffer.size() >= batch_size*n_batches else 1
-                sampled = _sample_from_storage_buffer(n_batches=n_batches, batch_size=batch_size)
-                if sampled is not None and len(sampled) > 0:
-                    batches = sampled
-                    logger.debug(f"run_algorithm: Using storage buffer for training ({storage_buffer.size()} samples)")
-            
-            # Fall back to ring buffer batches if storage buffer doesn't have enough samples
-            if batches is None or len(batches) == 0:
-                batches = ring_batches
-                if batches is None or len(batches) == 0:
-                    return None
-                logger.debug(f"run_algorithm: Using ring buffer for training (storage buffer has {storage_buffer.size() if storage_buffer else 0} samples)")
-
-            logger.debug(f"run_algorithm: Using {len(batches)} batches for training.")
-
-            model = filter_model_refs['model']
-            model.train()  # Set to training mode
-            
-            # Initialize optimizer if not already done
-            if not hasattr(_train_filter_model, 'optimizer'):
-                _train_filter_model.optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-            
-            optimizer = _train_filter_model.optimizer
-            criterion = torch.nn.MSELoss()
-            
-            total_loss = 0.0
-            num_samples = 0
-
-            logger.debug("run_algorithm: Starting training loop in _train_filter_model().")
-            
-            for batch in batches:
-                # Split batch into state, action, next_state
-                state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
-                action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
-                
-                states = torch.from_numpy(batch[:, :state_dim]).float()
-                actions = torch.from_numpy(batch[:, state_dim:state_dim + action_dim]).float()
-                # next_state is the segment immediately following action_filtered (ignore appended action_nominal)
-                next_state_start = state_dim + action_dim
-                next_state_end = next_state_start + state_dim
-                next_states = torch.from_numpy(batch[:, next_state_start:next_state_end]).float()
-                
-                # Forward pass
-                predicted_next_states, _, _ = model(states, actions)
-                
-                # Compute loss
-                loss = criterion(predicted_next_states, next_states)
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-                num_samples += states.shape[0]
-            
-            logger.debug("run_algorithm: Training loop in _train_filter_model() completed.")
-            
-            model.eval()  # Set back to eval mode
-            
-            avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
-            logger.debug(f"run_algorithm: Filter model training loss: {avg_loss:.6f}")
-            
-            return avg_loss
-
-        def _update_filter_policy_shm(mse_loss):
-            """Update filter policy weights in shared memory along with MSE loss.
-            
-            Args:
-                mse_loss: The MSE loss value from training to store with the weights.
-            """
-            if filter_model_refs['model'] is None:
-                return
-            
-            model = filter_model_refs['model']
-            model.eval()
-            
-            # Convert to ONNX/ORT
-            filter_ort_raw = _get_filter_onnx_model(model, logger=logger, outdir="filter_model.onnx")
-            filter_policy_nbytes = len(filter_ort_raw)
-            filter_p_buf = filter_model_refs['filter_p_buf']
-            header_offset = 4
-            mse_offset = header_offset + filter_policy_nbytes  # Store MSE after the ORT weights
-            
-            # Check if buffer is large enough (weights + 4 bytes for MSE float32)
-            required_size = mse_offset + 4
-            if len(filter_p_buf) < required_size:
-                logger.warning(f"Filter policy buffer too small: need {required_size}, have {len(filter_p_buf)}")
-                return
-            
-            # Check size matches (excluding MSE storage)
-            _len_ort_expected = struct.unpack_from("<I", filter_p_buf, 0)
-            if _len_ort_expected[0] != filter_policy_nbytes:
-                logger.warning(f"Filter model size mismatch: expected {_len_ort_expected[0]}, got {filter_policy_nbytes}")
-                return
-            
-            # Wait for lock and update
-            while f_buf[2] == 1:  # filter weights lock flag
-                time.sleep(0.0001)
-            
-            f_buf[2] = 1  # set lock flag to locked
-            filter_p_buf[header_offset:header_offset + len(filter_ort_raw)] = filter_ort_raw
-            # Store MSE loss as float32 after the weights
-            struct.pack_into("<f", filter_p_buf, mse_offset, float(mse_loss))
-            f_buf[2] = 0  # set lock flag to unlocked
-            f_buf[3] = 1  # set filter weights-available flag to 1 (true)
-            
-            logger.debug(f"run_algorithm: Updated filter policy weights in shared memory with MSE={mse_loss:.6f}")
-
+    # set up data broadcasting to GUI (optional)
+    pub = None
+    ctx = None
+    if args.enable_zmq and zmq_available and zmq is not None:
         try:
-            # determine maximum number of training iterations
-            if stop is not None and TRAINING_ITERATION in stop and stop[TRAINING_ITERATION]:
-                max_iters = int(stop[TRAINING_ITERATION])
-            elif getattr(args, "stop_iters", None):
-                max_iters = int(args.stop_iters)
-            else:
-                max_iters = 200
+            ctx = zmq.Context()
+            pub = ctx.socket(zmq.PUB)
+            pub.bind("ipc:///tmp/training.ipc")
+            logger.info("ZMQ publisher initialized for GUI communication")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ZMQ publisher: {e}. Continuing without ZMQ.")
+            pub = None
+            ctx = None
+    elif args.enable_zmq and not zmq_available:
+        logger.warning("ZMQ requested but not available (zmq not installed). Continuing without ZMQ.")
+    else:
+        logger.debug("ZMQ disabled via --enable-zmq flag")
 
-            # start counter
-            train_iter = 0
-            while train_iter < max_iters:
-                logger.debug("run_algorithm: in the train loop now.")
+    env_runners_df_stored = None
+    learners_df_stored = None
 
-                # perform one logical iteration of actor training
-                results = algo.train()
+    try:
+        # determine maximum number of training iterations
+        if stop is not None and TRAINING_ITERATION in stop and stop[TRAINING_ITERATION]:
+            max_iters = int(stop[TRAINING_ITERATION])
+        elif getattr(args, "stop_iters", None):
+            max_iters = int(args.stop_iters)
+        else:
+            max_iters = 200
 
-                logger.debug(f"run_algorithm: Completed iteration {train_iter} of actor training. Moving on to filter training.")
+        # start counter
+        train_iter = 0
+        while train_iter < max_iters:
+            logger.debug("run_algorithm: in the train loop now.")
 
+            # perform one logical iteration of actor training
+            results = algo.train()
+
+            logger.debug(f"run_algorithm: Completed iteration {train_iter} of actor training. Moving on to filter training.")
+
+            if enable_safety_filter:
                 try:
                     # Train filter model (alternating training)
                     filter_loss = _train_filter_model()
@@ -1156,221 +1211,89 @@ def run_rllib_shared_memory(
                 except Exception as e:
                     logger.debug(f"run_algorithm: Failed to train filter model: {e}")
                     raise RuntimeError(f"Failed to train filter model: {e}")
-                
-                # start logging results
-                if 'learners' in results.keys():
-                    env_runners_df = pd.DataFrame([remove_nested_dicts(results['env_runners'])])
-                    learners_df = pd.DataFrame([remove_nested_dicts(results['learners']['default_policy'])])
-                    try:
-                        env_runners_df_stored = pd.concat([env_runners_df_stored, env_runners_df], ignore_index=True)
-                        learners_df_stored = pd.concat([learners_df_stored, learners_df], ignore_index=True)
-                        logger.debug(f"run_algorithm: Concatenated env_runners_df and env_runners_df_prev: {env_runners_df_stored.shape}, {learners_df_stored.shape}")
-                    except Exception as e:
-                        env_runners_df_stored = env_runners_df.copy()
-                        learners_df_stored = learners_df.copy()
-                        logger.debug(f"run_algorithm: Failed to concatenate env_runners_df and env_runners_df_prev: {e}")
-
-
-                state = algo.learner_group.get_state(components="learner")
-                if 'metrics_logger' in state['learner']:
-                    stats = state['learner']['metrics_logger']['stats']
-                    try:
-                        logger.debug(f"step {train_iter:>4}: "
-                                     f"Qloss={list(stats['default_policy--qf_loss']['values'])} | "
-                                     f"Ploss={list(stats['default_policy--policy_loss']['values'])} | "
-                                     f"α={list(stats['default_policy--alpha_value']['values'])} "
-                                     f"(αloss={list(stats['default_policy--alpha_loss']['values'])}) | "
-                                     f"Qµ={list(stats['default_policy--qf_mean']['values'])}"
-                                     )
-                    except Exception as e:
-                        logger.debug(f"could not print stats due to error {e}")
-
-                seq_learn = state["learner"]["weights_seq_no"]
-
-                logger.debug(f"run_algorithm: learner weights_seq_no="
-                             f"{seq_learn}")
-
-                # walk_keys(results)
-                # logger.debug(f"run_algorithm: results.keys()={results.keys()}.")
-                logger.debug("run_algorithm: printing BehaviourAudit.")
+            
+            # start logging results
+            if 'learners' in results.keys():
+                env_runners_df = pd.DataFrame([remove_nested_dicts(results['env_runners'])])
+                learners_df = pd.DataFrame([remove_nested_dicts(results['learners']['default_policy'])])
                 try:
-                    msg = {
-                        "topic": "policy",
-                        "ratio_max": float(results["env_runners"]["ratio_max"]),
-                    }
-                    # send results to be logged in the GUI
-                    if pub is not None:
-                        pub.send_json(msg)
-
-                    logger.debug(f'ratio_max={results["env_runners"]["ratio_max"]}, '
-                                 f'ratio_p99={results["env_runners"]["ratio_p99"]}, '
-                                 f'delta_logp={results["env_runners"]["delta_logp"]}')
-                except KeyError:
-                    logger.debug("Could not find the keys in results dictionary")
+                    env_runners_df_stored = pd.concat([env_runners_df_stored, env_runners_df], ignore_index=True)
+                    learners_df_stored = pd.concat([learners_df_stored, learners_df], ignore_index=True)
+                    logger.debug(f"run_algorithm: Concatenated env_runners_df and env_runners_df_prev: {env_runners_df_stored.shape}, {learners_df_stored.shape}")
+                except Exception as e:
+                    env_runners_df_stored = env_runners_df.copy()
+                    learners_df_stored = learners_df.copy()
+                    logger.debug(f"run_algorithm: Failed to concatenate env_runners_df and env_runners_df_prev: {e}")
 
 
-                # attempt at debugging
-                # logger.debug("run_algorithm: ran algo.train()")
-                # target_updates = algo._counters["num_target_updates"]
-                # last_update = algo._counters["last_target_update_ts"]
-                # cur_ts = algo._counters[
-                #     (
-                #         "num_agent_steps_sampled"
-                #         if algo.config.count_steps_by == "agent_steps"
-                #         else "num_env_steps_sampled"
-                #     )
-                # ]
-                # logger.debug(f"run_algorithm: enable_rl_module_and_learner? {algo.config.enable_rl_module_and_learner}")
-                # logger.debug(f"run_algorithm: tentative update frequency: {algo.config.num_epochs * algo.config.minibatch_buffer_size}")
-                # logger.debug(f"run_algorithm: update math: {cur_ts - last_update}")
-                # logger.debug(f"run_algorithm: number of target updates: {target_updates}")
-                # last_synch = algo.metrics.peek(
-                #     "num_training_step_calls_since_last_synch_worker_weights",
-                # )
-                # logger.debug(f"run_algorithm: num training steps since last synch: {last_synch}")
-                # logger.debug(f"run_algorithm: num_weights_broadcast -> {algo.metrics.peek('num_weight_broadcasts')}")
+            state = algo.learner_group.get_state(components="learner")
+            if 'metrics_logger' in state['learner']:
+                stats = state['learner']['metrics_logger']['stats']
+                try:
+                    logger.debug(f"step {train_iter:>4}: "
+                                 f"Qloss={list(stats['default_policy--qf_loss']['values'])} | "
+                                 f"Ploss={list(stats['default_policy--policy_loss']['values'])} | "
+                                 f"α={list(stats['default_policy--alpha_value']['values'])} "
+                                 f"(αloss={list(stats['default_policy--alpha_loss']['values'])}) | "
+                                 f"Qµ={list(stats['default_policy--qf_mean']['values'])}"
+                                 )
+                except Exception as e:
+                    logger.debug(f"could not print stats due to error {e}")
 
-                msg = {"topic": "training", "iteration": train_iter}  # to send to GUI
+            seq_learn = state["learner"]["weights_seq_no"]
 
-                # print results
-                if ENV_RUNNER_RESULTS in results:
-                    mean_return = results[ENV_RUNNER_RESULTS].get(
-                        EPISODE_RETURN_MEAN, np.nan
-                    )
-                    logger.debug(f"iter={train_iter} R={mean_return}")
-                    msg.update({"mean_return": float(mean_return)})
-                    # print(f"iter={train_iter} R={mean_return}", end="")
-                if EVALUATION_RESULTS in results:
-                    Reval = results[EVALUATION_RESULTS][ENV_RUNNER_RESULTS][
-                        EPISODE_RETURN_MEAN
-                    ]
-                    print(f" R(eval)={Reval}", end="")
-                    msg.update({"eval_return": float(Reval)})
-                print()
+            logger.debug(f"run_algorithm: learner weights_seq_no="
+                         f"{seq_learn}")
 
+            # walk_keys(results)
+            # logger.debug(f"run_algorithm: results.keys()={results.keys()}.")
+            logger.debug("run_algorithm: printing BehaviourAudit.")
+            try:
+                msg = {
+                    "topic": "policy",
+                    "ratio_max": float(results["env_runners"]["ratio_max"]),
+                }
                 # send results to be logged in the GUI
                 if pub is not None:
                     pub.send_json(msg)
 
-                # increment counter
-                train_iter += 1
+                logger.debug(f'ratio_max={results["env_runners"]["ratio_max"]}, '
+                             f'ratio_p99={results["env_runners"]["ratio_p99"]}, '
+                             f'delta_logp={results["env_runners"]["delta_logp"]}')
+            except KeyError:
+                logger.debug("Could not find the keys in results dictionary")
 
-            logger.debug(f"run_algorithm: Done with the training loop on iteration {train_iter}.")
+            msg = {"topic": "training", "iteration": train_iter}  # to send to GUI
 
-            # Save models before shutdown (always, regardless of model_mode)
-            _save_models(algo, filter_model_refs, args, logger)
+            # print results
+            if ENV_RUNNER_RESULTS in results:
+                mean_return = results[ENV_RUNNER_RESULTS].get(
+                    EPISODE_RETURN_MEAN, np.nan
+                )
+                logger.debug(f"iter={train_iter} R={mean_return}")
+                msg.update({"mean_return": float(mean_return)})
+                # print(f"iter={train_iter} R={mean_return}", end="")
+            if EVALUATION_RESULTS in results:
+                Reval = results[EVALUATION_RESULTS][ENV_RUNNER_RESULTS][
+                    EPISODE_RETURN_MEAN
+                ]
+                print(f" R(eval)={Reval}", end="")
+                msg.update({"eval_return": float(Reval)})
+            print()
 
-            # signal external processes (EnvRunner/Minion) to stop via shared flag
-            try:
-                f_buf[7] = 1
-                logger.debug("run_algorithm: Set termination flag in shared memory (f_buf[7]=1).")
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to set termination flag: {e}")
+            # send results to be logged in the GUI
+            if pub is not None:
+                pub.send_json(msg)
 
-            # persist collected metrics if available
-            try:
-                env_runners_df_stored.to_csv('env_runners_df.csv', index=False)
-                learners_df_stored.to_csv('learners_df.csv', index=False)
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to write metrics CSVs: {e}")
+            # increment counter
+            train_iter += 1
 
-            # stop RLlib algorithm and shut down Ray/SHM resources
-            try:
-                algo.stop()
-                logger.debug("run_algorithm: Called algo.stop() successfully.")
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to stop algorithm cleanly: {e}")
+        logger.debug(f"run_algorithm: Done with the training loop on iteration {train_iter}.")
 
-            # close and unlink shared memory blocks owned by this process
-            try:
-                if filter_ep_shm is not None:
-                    try:
-                        filter_ep_shm.close()
-                        filter_ep_shm.unlink()
-                    except FileNotFoundError:
-                        # Already unlinked elsewhere; safe to ignore.
-                        pass
-                try:
-                    filter_p_shm.close()
-                    filter_p_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                try:
-                    p_shm.close()
-                    p_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                try:
-                    f_shm.close()
-                    f_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                logger.debug("run_algorithm: Closed and unlinked shared memory blocks.")
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks: {e}")
+        _graceful_shutdown()
 
-            if not keep_ray_up:
-                try:
-                    ray.shutdown()
-                    logger.debug("run_algorithm: Ray shutdown completed.")
-                except Exception as e:
-                    logger.debug(f"run_algorithm: Failed to shut down Ray: {e}")
+    except (KeyboardInterrupt, RuntimeError) as e:
+        logger.debug(f"run_algorithm: Caught {type(e).__name__}, initiating graceful shutdown.")
+        _graceful_shutdown()
 
-        except (KeyboardInterrupt, RuntimeError) as e:
-            logger.debug(f"run_algorithm: Caught {type(e).__name__}, initiating graceful shutdown.")
-
-            # Save models before shutdown (always)
-            try:
-                _save_models(algo, filter_model_refs, args, logger)
-            except Exception as save_err:
-                logger.warning(f"run_algorithm: Failed to save models on shutdown: {save_err}")
-
-            # signal external processes to stop
-            try:
-                f_buf[7] = 1
-                logger.debug(f"run_algorithm: Set termination flag in shared memory (f_buf[7]=1) on {type(e).__name__}.")
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to set termination flag on {type(e).__name__}: {e}")
-
-            # attempt to stop RLlib algorithm
-            try:
-                algo.stop()
-                logger.debug(f"run_algorithm: Called algo.stop() successfully on {type(e).__name__}.")
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to stop algorithm cleanly on {type(e).__name__}: {e}")
-
-            # close and unlink shared memory blocks
-            try:
-                if filter_ep_shm is not None:
-                    try:
-                        filter_ep_shm.close()
-                        filter_ep_shm.unlink()
-                    except FileNotFoundError:
-                        pass
-                try:
-                    filter_p_shm.close()
-                    filter_p_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                try:
-                    p_shm.close()
-                    p_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                try:
-                    f_shm.close()
-                    f_shm.unlink()
-                except FileNotFoundError:
-                    pass
-                logger.debug(f"run_algorithm: Closed and unlinked shared memory blocks on {type(e).__name__}.")
-            except Exception as e:
-                logger.debug(f"run_algorithm: Failed to close/unlink shared memory blocks on {type(e).__name__}: {e}")
-
-            if not keep_ray_up:
-                try:
-                    ray.shutdown()
-                    logger.debug(f"run_algorithm: Ray shutdown completed on {type(e).__name__}.")
-                except Exception as e:
-                    logger.debug(f"run_algorithm: Failed to shut down Ray on {type(e).__name__}: {e}")
-
-        return results
+    return results
