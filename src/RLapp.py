@@ -8,7 +8,7 @@ from statistics import mean
 
 from PyQt6 import QtCore, QtWidgets
 import pyqtgraph as pg
-from pyqtgraph import mkBrush, ViewBox, PlotCurveItem, DateAxisItem
+from pyqtgraph import mkBrush
 import zmq
 import numpy as np
 
@@ -103,10 +103,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_count = 0
         self.evaluation_count = 0
         self.evaluation_x = deque(maxlen=self._max_points)
-        self.policy_x = {
-            'delta in minion': deque(maxlen=self._max_points),
-            'ratio_max': deque(maxlen=self._max_points),
-        }
 
         # manually set fields to be plotted
         self.engine_data["imep"] = deque(maxlen=self._max_points)
@@ -114,16 +110,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_data["target imep"] = deque(maxlen=self._max_points)
         self.engine_data["mean sampled imep"] = deque(maxlen=self._max_points)
         self.engine_data["evaluation error"] = deque(maxlen=self._max_points)
-        self.policy_data = {
-            'delta in minion': deque(maxlen=self._max_points),
-            'ratio_max': deque(maxlen=self._max_points),
-        }
+        self.engine_data["eval imep"] = deque(maxlen=self._max_points)
+        self.engine_data["eval target imep"] = deque(maxlen=self._max_points)
         # self.engine_data["ratio_p99"] = deque(maxlen=self._max_points)
 
-        # training: one curve for reward vs iteration
+        # training/eval reward: curves vs iteration
         self.training_curve = None
+        self.eval_reward_curve = None
         self.training_x = []
         self.training_y = []
+        self.eval_reward_y = []
 
         # set up the UI
         central = QtWidgets.QWidget()
@@ -175,46 +171,28 @@ class MainWindow(QtWidgets.QMainWindow):
         curve = self.evaluation_plot.plot(name='evaluation error', pen=pen)
         self.engine_curves['evaluation error'] = curve
 
-        # training reward plot
-        self.training_plot = pg.PlotWidget(title="Training Reward (custom_run.py)")
+        # training & evaluation reward plot
+        self.training_plot = pg.PlotWidget(title="Reward (custom_run.py)")
         legend_training = self.training_plot.addLegend()
         legend_training.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
         self.training_plot.showGrid(x=True, y=True)
         self.training_plot.setBackground('w')
         vlay.addWidget(self.training_plot)
+        # *** need to make curves?
 
-        # policy update plots
-        date_axis = DateAxisItem(orientation='bottom')
-        self.t0 = time.time()
-        self.policy_plot = pg.PlotWidget(
-            axisItems={'bottom': date_axis},
-            title="Policy Update"
-        )
-        legend_policy = self.policy_plot.addLegend()
-        legend_policy.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
-        self.policy_plot.showGrid(x=True, y=True)
-        self.policy_plot.setBackground('w')
-        vlay.addWidget(self.policy_plot)
-        self.policy_plot.showAxis('right')
-        self.policy_plot.getAxis('right').setLabel('ratio_max', **{'color': self.plot_colors[6]})
-        self.ratio_vb = ViewBox()
-        self.policy_plot.scene().addItem(self.ratio_vb)
-        self.policy_plot.getAxis('right').linkToView(self.ratio_vb)
-        self.ratio_vb.setXLink(self.policy_plot.getViewBox())
-        self.policy_plot.getViewBox().sigResized.connect(
-            lambda: self.ratio_vb.setGeometry(self.policy_plot.getViewBox().sceneBoundingRect())
-        )
-        # add curves
-        pen = pg.mkPen(color=self.plot_colors[5], width=self.plot_line_width)
-        curve = self.policy_plot.plot(name='delta in minion', pen=pen)
-        self.engine_curves['delta in minion'] = curve
-        pen = pg.mkPen(color=self.plot_colors[6], width=self.plot_line_width)
-        curve = PlotCurveItem(name='ratio_max', pen=pen)
-        self.ratio_vb.addItem(curve)
-        self.engine_curves['ratio_max'] = curve
-        # pen = pg.mkPen(color=self.plot_colors[6], width=self.plot_line_width)
-        # curve = self.policy_plot.plot(name='ratio_p99', pen=pen)
-        # self.engine_curves['ratio_p99'] = curve
+        # eval IMEP plot (desired vs actual, eval rollouts)
+        self.eval_imep_plot = pg.PlotWidget(title="Eval IMEP Tracking (minion.py)")
+        legend_eval_imep = self.eval_imep_plot.addLegend()
+        legend_eval_imep.setBrush(mkBrush(255, 255, 255, alpha))  # RGBA, 200 alpha
+        self.eval_imep_plot.showGrid(x=True, y=True)
+        self.eval_imep_plot.setBackground('w')
+        vlay.addWidget(self.eval_imep_plot)
+        pen = pg.mkPen(color=self.plot_colors[0], width=self.plot_line_width)
+        curve = self.eval_imep_plot.plot(name='eval imep', pen=pen)
+        self.engine_curves['eval imep'] = curve
+        pen = pg.mkPen(color=self.plot_colors[1], width=self.plot_line_width)
+        curve = self.eval_imep_plot.plot(name='eval target imep', pen=pen)
+        self.engine_curves['eval target imep'] = curve
 
         # ── Insert a horizontal layout at the top for controls ──
         controls = QtWidgets.QHBoxLayout()
@@ -231,7 +209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(self.safety_plot)
         main_layout.addWidget(self.evaluation_plot)
         main_layout.addWidget(self.training_plot)
-        main_layout.addWidget(self.policy_plot)
+        main_layout.addWidget(self.eval_imep_plot)
         self.setCentralWidget(central)
 
         # 3) Start ZMQ listener thread
@@ -257,11 +235,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timer_LS.start()
 
         self.log.debug("GUI: Done with init.")
-
-    def update_views(self):
-        """When the main plot is resized, update the secondary VB to match."""
-        self.ratio_vb.setGeometry(self.policy_plot.getViewBox().sceneBoundingRect())
-        self.ratio_vb.linkedViewChanged(self.policy_plot.getViewBox(), self.ratio_vb.XAxis)
 
     def stop_processes(self):
         if self.listener.isRunning():
@@ -296,54 +269,49 @@ class MainWindow(QtWidgets.QMainWindow):
             list(self.evaluation_x),
             list(self.engine_data['evaluation error'])
         )
-        self.engine_curves['delta in minion'].setData(
-            list(self.policy_x['delta in minion']),
-            list(self.policy_data['delta in minion'])
+        self.engine_curves['eval imep'].setData(
+            list(self.evaluation_x),
+            list(self.engine_data['eval imep'])
         )
-        self.engine_curves['ratio_max'].setData(
-            list(self.policy_x['ratio_max']),
-            list(self.policy_data['ratio_max'])
+        self.engine_curves['eval target imep'].setData(
+            list(self.evaluation_x),
+            list(self.engine_data['eval target imep'])
         )
-        if self.training_curve:
+        if self.training_curve is not None:
             self.training_curve.setData(self.training_x, self.training_y)
+        if self.eval_reward_curve is not None:
+            self.eval_reward_curve.setData(self.training_x, self.eval_reward_y)
 
     @QtCore.pyqtSlot(dict)
     def on_zmq_message(self, msg):
+        self.log.debug(f"GUI: In on_zmq_message.")
         topic = msg.get("topic", "")
+        self.log.debug(f"GUI: topic -> {topic}.")
         if topic == "engine":
             self._update_engine(msg)
         elif topic == "training":
             self._update_training(msg)
         elif topic == "evaluation":
             self._update_evaluation(msg)
-        elif topic == "policy":
-            self._update_policy(msg)
-
-    def _update_policy(self, msg):
-        # self.log.debug(f"GUI: In _update_policy.")
-        t = time.time() - self.t0
-
-        for key in msg.keys():
-            if key != "topic":
-                # self.log.debug(f"GUI: In _update_policy key: {key}, value = {msg[key]}")
-                self.policy_data[key].append(msg[key])
-                self.policy_x[key].append(t)
-        # self.log.debug(f"GUI: Done with _update_evaluation.")
 
     def _update_evaluation(self, msg):
-        # self.log.debug(f"GUI: In _update_evaluation.")
+        self.log.debug(f"GUI: In _update_evaluation.")
         self.evaluation_count += 1
         self.evaluation_x.append(self.evaluation_count)
 
-        data_list = self.engine_data['evaluation error']
-        data_list.append(np.abs(msg["current imep"] - msg["target"]))
-        # self.log.debug(f"GUI: Done with _update_evaluation.")
+        current_imep = msg["current imep"]
+        target_imep = msg["target"]
+
+        self.engine_data['eval imep'].append(current_imep)
+        self.engine_data['eval target imep'].append(target_imep)
+        self.engine_data['evaluation error'].append(np.abs(current_imep - target_imep))
+        self.log.debug(f"GUI: Done with _update_evaluation.")
 
     def _update_engine(self, msg):
-        # self.log.debug(f"GUI: In _update_engine.")
+        self.log.debug(f"GUI: In _update_engine.")
         self.engine_count += 1
         self.engine_x.append(self.engine_count)
-        # self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
+        self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
 
         data = {
             "imep": msg["current imep"],
@@ -362,40 +330,28 @@ class MainWindow(QtWidgets.QMainWindow):
             data_list = self.engine_data[k]
             data_list.append(v)
 
-        # self.log.debug(f"GUI: Done with _update_engine.")
+        self.log.debug(f"GUI: Done with _update_engine.")
 
     def _update_training(self, msg):
-        # Determine iteration & reward keys
-        # Adjust these if you used different JSON keys
-
-        # self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
-
-        if "iteration" in msg:
-            x = msg["iteration"]
-        else:
+        if "iteration" not in msg:
             return
+        x = msg["iteration"]
 
-        if "mean_return" in msg:
-            y = msg["mean_return"]
-        else:
+        if "mean_return" not in msg:
             return
-
-        if "eval_return" in msg:
-            y2 = msg["eval_return"]
+        y = msg["mean_return"]
 
         self.training_x.append(x)
         self.training_y.append(y)
+
         if len(self.training_x) > self._max_points:
             self.training_x.pop(0)
             self.training_y.pop(0)
 
         if self.training_curve is None:
-            # first time: create it
             pen = pg.mkPen(color=self.plot_colors[-1], width=self.plot_line_width)
-            self.training_curve = self.training_plot.plot(name="Reward", pen=pen)
+            self.training_curve = self.training_plot.plot(name="train mean_return", pen=pen)
             self.training_plot.addLegend()
-
-        # self.training_curve.setData(self.training_x, self.training_y)
 
 
 def main():

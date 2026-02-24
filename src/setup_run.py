@@ -219,6 +219,7 @@ if __name__ == "__main__":
         "realtime_priority": 80,  # Default real-time priority for minion
         "enable_safety_filter": enable_safety_filter,
     }
+
     if enable_safety_filter:
         env_config["filter_ep_shm_properties"] = filter_ep_shm_properties
         env_config["filter_policy_shm_name"] = getattr(args, "filter_policy_shm_name", "filter_policy")

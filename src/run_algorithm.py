@@ -144,6 +144,8 @@ def _build_or_restore_rllib_algo(config, args, logger):
     checkpoint_dir = _rllib_checkpoint_dir(rllib_module_name)
     spec_path = os.path.join(checkpoint_dir, "rllib_spec.json")
 
+    algo = config.build()
+
     if model_mode == "load" and rllib_module_spec is not None and os.path.isdir(checkpoint_dir):
         if os.path.isfile(spec_path):
             with open(spec_path, "r") as f:
@@ -154,7 +156,8 @@ def _build_or_restore_rllib_algo(config, args, logger):
                     f"Saved: {saved_spec}. Expected: {rllib_module_spec}. Refusing to load."
                 )
         try:
-            algo = Algorithm.from_checkpoint(checkpoint_dir)
+            algo.restore_from_path(checkpoint_dir)
+            algo.config.env_config['enable_zmq'] = args.enable_zmq
             logger.info(f"Restored RLlib module from {checkpoint_dir}")
             return algo, True
         except Exception as e:
@@ -164,10 +167,9 @@ def _build_or_restore_rllib_algo(config, args, logger):
             )
     elif model_mode == "load" and rllib_module_spec is not None:
         logger.warning(
-            f"RLlib checkpoint not found at {checkpoint_dir}. Building from config."
+            f"RLlib checkpoint not found at {checkpoint_dir}. Creating new RLlib module from config."
         )
 
-    algo = config.build()
     return algo, False
 
 

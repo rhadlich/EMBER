@@ -281,15 +281,15 @@ class Minion:
                 self.zmq_ctx = zmq.Context()
                 self.pub = self.zmq_ctx.socket(zmq.PUB)
                 self.pub.bind("ipc:///tmp/engine.ipc")
-                self.logger.info("ZMQ publisher initialized for GUI communication")
+                self.logger.info("Minion: ZMQ publisher initialized for GUI communication")
             except Exception as e:
-                self.logger.warning(f"Failed to initialize ZMQ publisher: {e}. Continuing without ZMQ.")
+                self.logger.warning(f"Minion: Failed to initialize ZMQ publisher: {e}. Continuing without ZMQ.")
                 self.pub = None
                 self.zmq_ctx = None
         elif enable_zmq and not zmq_available:
-            self.logger.warning("ZMQ requested but not available (zmq not installed). Continuing without ZMQ.")
+            self.logger.warning("Minion: ZMQ requested but not available (zmq not installed). Continuing without ZMQ.")
         else:
-            self.logger.debug("ZMQ disabled via config")
+            self.logger.debug("Minion: ZMQ disabled via config")
 
         # start count
         self.batch_count = 0
