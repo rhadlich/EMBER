@@ -2,8 +2,14 @@
 
 How to run this script
 ----------------------
-`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --model-mode "create or load" --gui True --rllib-module-name "rllib_module_name" --filter-model-name "filter_model_name" --cpu-core-minion "core#"
+`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --model-mode "create or load" --gui True --rllib-module-name "rllib_module_name" --filter-model-name "filter_model_name" --cpu-core-minion "core#"`
 
+Determinism
+-----------
+Pass a global seed via `--seed <int>` to get fully reproducible training runs
+for a fixed algorithm/env configuration. Running this script twice with the
+same CLI arguments (including `--seed`) should produce identical training
+metrics (e.g., `env_runners/episode_return_mean`) and filter MSE sequences.
 """
 import numpy as np
 import os
@@ -60,6 +66,20 @@ if __name__ == "__main__":
 
     logger = logging.getLogger("MyRLApp.setup_run")
     logger.info(f"setup_run, PID={os.getpid()}")
+
+    # If a global seed is provided, make this driver process deterministic.
+    # RLlib will additionally receive this seed via AlgorithmConfig.debugging(seed=...).
+    if getattr(args, "seed", None) is not None:
+        import random
+        import torch
+
+        seed = int(args.seed)
+        # Python stdlib, NumPy, and Torch RNGs.
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     # Spawn GUI if requested (implies enable_zmq for telemetry)
     if getattr(args, "gui", False):
@@ -220,6 +240,16 @@ if __name__ == "__main__":
         "enable_safety_filter": enable_safety_filter,
     }
 
+    # Propagate a single global seed from CLI into per-component seeds used by
+    # the EnvRunner/minion/env processes. If no seed is provided, behavior
+    # remains non-deterministic (current default).
+    if getattr(args, "seed", None) is not None:
+        base_seed = int(args.seed)
+        env_config["global_seed"] = base_seed
+        env_config["env_seed"] = base_seed + 1
+        env_config["minion_seed"] = base_seed + 2
+        env_config["filter_seed"] = base_seed + 3
+
     if enable_safety_filter:
         env_config["filter_ep_shm_properties"] = filter_ep_shm_properties
         env_config["filter_policy_shm_name"] = getattr(args, "filter_policy_shm_name", "filter_policy")
@@ -252,6 +282,9 @@ if __name__ == "__main__":
             create_local_env_runner=args.create_local_env_runner,
             create_env_on_local_worker=args.create_env_on_local_worker,
         )
+        # Give RLlib a deterministic seed so that trials with the same CLI
+        # arguments (including --seed) produce identical results.
+        .debugging(seed=getattr(args, "seed", None))
     )
 
     import importlib

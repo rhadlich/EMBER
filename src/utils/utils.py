@@ -196,7 +196,7 @@ class ActionAdapter:
 
     # ---------- forward pass → env action + log-prob --------------------------
     def sample_from_policy(
-            self, net_out, deterministic=False, rng=np.random.default_rng()
+            self, net_out, deterministic=False, rng=None
     ):
         """
         * For categorical: `net_out` is a flat logits vector
@@ -207,6 +207,12 @@ class ActionAdapter:
             action_norm     (scalar, ndarray, or list)
             logp            (float)   or None if deterministic
         """
+
+        # Lazily create an RNG if none was provided. Minion passes in a seeded
+        # RNG for reproducible runs; this fallback is only used in contexts
+        # where we don't control the caller.
+        if rng is None:
+            rng = np.random.default_rng()
 
         # ---------- CATEGORICAL ------------------------------------------------
         if self.mode in ("discrete1", "multidiscrete"):
