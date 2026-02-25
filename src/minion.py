@@ -10,6 +10,7 @@ import gzip
 import os
 import torch
 import copy
+import random
 
 from ray.rllib.utils.numpy import softmax
 import gymnasium as gym
@@ -104,7 +105,25 @@ class Minion:
         self.logger.debug("Minion: Started __init__()")
 
         self.config = config
-        
+
+        # Configure deterministic RNGs for this process, if seeds were provided
+        # via env_config. When no seeds are set, behavior stays non-deterministic.
+        env_cfg = getattr(self.config, "env_config", {}) or {}
+        minion_seed = env_cfg.get("minion_seed")
+        self._env_seed = env_cfg.get("env_seed")
+        if minion_seed is not None:
+            minion_seed = int(minion_seed)
+            random.seed(minion_seed)
+            np.random.seed(minion_seed)
+            torch.manual_seed(minion_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(minion_seed)
+            # Dedicated RNG for policy sampling so we don't rely on global state.
+            self.rng = np.random.default_rng(minion_seed + 1)
+        else:
+            # Fallback RNG (non-deterministic across runs).
+            self.rng = np.random.default_rng()
+
         # Set real-time priority (always defaults to 80 unless explicitly disabled)
         rt_priority = self.config.env_config.get("realtime_priority", 80)
         # Set priority if not explicitly disabled (None or False)
@@ -188,6 +207,14 @@ class Minion:
             raise NotImplementedError(f'Unknown observation_space {self.env.observation_space}')
 
         self.logger.debug(f"Minion: obs_is_discrete={self.obs_is_discrete}")
+
+        # Seed the Gymnasium environment's internal RNG once so that all future
+        # resets without an explicit seed follow a deterministic trajectory.
+        if self._env_seed is not None:
+            try:
+                self.env.reset(seed=int(self._env_seed))
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to seed environment with env_seed={self._env_seed}: {e}")
 
         # get random reference observation to check ort outputs and make sure weights change
         if self.obs_is_discrete:
@@ -777,9 +804,12 @@ class Minion:
         # self.logger.debug(f"Minion: performed action inference, net_out={net_out}, type={type(net_out)}")
 
         tic_policy = time.time()
-        # sample action from policy distribution
-        action_from_actor, logp, dist_inputs = self.action_adapter.sample_from_policy(net_out,
-                                                                                    deterministic=deterministic)
+        # sample action from policy distribution (use seeded RNG when provided)
+        action_from_actor, logp, dist_inputs = self.action_adapter.sample_from_policy(
+            net_out,
+            deterministic=deterministic,
+            rng=self.rng,
+        )
         toc_policy = time.time()
         duration_policy_ms = (toc_policy - tic_policy) * 1000.0
         self.timing_recorder.record_timing('policy_sampling', duration_policy_ms, deterministic=deterministic)
@@ -898,7 +928,7 @@ class Minion:
             obs_flat = _flatten_obs_array(obs)  # flatten to shape needed by memory buffer
             current_packet = np.concatenate((
                 action,
-                np.array([reward], dtype=np.float32),
+                np.array([adjusted_reward], dtype=np.float32),
                 obs_flat,
                 np.array([logp], dtype=np.float32),
                 net_out.astype(np.float32),

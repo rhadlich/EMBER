@@ -297,11 +297,7 @@ class EngineEnvContinuous(gym.Env):
 
 
 def reward_fn(inputs):
-    l = (inputs["current imep"] - inputs["target"])**2
-    l1 = 3
-    l2 = -15
-    l3 = -1.0
-    load_tracking = np.tanh(l1*l)*l2 + l*l3
+    load_tracking = (inputs["current imep"] - inputs["target"])**2 * -5.0
     safety = (max(0, inputs["mprr"]-7)**2) * -0.0
     filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -0.0
     return np.array([load_tracking, safety, filter_interference])

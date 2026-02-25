@@ -281,6 +281,15 @@ def custom_args(
     parser.add_argument("--num-cpus", type=int, default=0)
     parser.add_argument("--num-gpus", type=int, default=0)
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Global random seed for fully deterministic training. "
+            "If omitted, runs are non-deterministic."
+        ),
+    )
+    parser.add_argument(
         "--cpu-core-learner",
         type=int,
         default=None,

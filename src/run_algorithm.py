@@ -710,6 +710,19 @@ def run_rllib_shared_memory(
     if args.as_release_test:
         args.as_test = True
 
+    # If a global seed is provided on the CLI/config, make this learner/driver
+    # process deterministic for Python, NumPy and Torch RNGs. RLlib additionally
+    # receives this seed via AlgorithmConfig.debugging(seed=...) when the
+    # config is built by setup_run.py.
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        seed = int(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     logger = logging.getLogger("MyRLApp.run_algorithm")
     logger.info(f"run_algorithm, PID={os.getpid()}")
 
