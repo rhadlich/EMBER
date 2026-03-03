@@ -15,6 +15,7 @@ import random
 from ray.rllib.utils.numpy import softmax
 import gymnasium as gym
 from core.environments.engine_env import reward_fn, EngineEnvDiscrete, EngineEnvContinuous
+from core.environments.target_curve_generator import IMEPTargetCurveGenerator
 
 from utils.utils import ActionAdapter, TimingRecorder
 from utils.shared_memory_utils import get_indices, set_indices, flatten_obs_onehot
@@ -152,10 +153,6 @@ class Minion:
         else:
             self.filter_ep_shm_name = None
 
-        # set parameters for training and evaluation
-        self.reset_env_each_n_batches = True
-        self.n_batches_for_env_reset = 5
-
         # connect to shared memory blocks
         self.f_shm = shared_memory.SharedMemory(name=self.flag_shm_name, create=False)  # this one has to be first
         self.f_buf = self.f_shm.buf
@@ -216,6 +213,22 @@ class Minion:
                 self.env.reset(seed=int(self._env_seed))
             except Exception as e:
                 self.logger.debug(f"Minion: Failed to seed environment with env_seed={self._env_seed}: {e}")
+
+        # Target curve generator: produces smooth, realistic IMEP target
+        # profiles instead of random step changes from env.reset().
+        target_seed = int(self._env_seed) if self._env_seed is not None else None
+        if hasattr(self.env, 'imep_lims'):
+            imep_lo, imep_hi = self.env.imep_lims
+        else:
+            imep_lo, imep_hi = float(self.env.imep_space[0]), float(self.env.imep_space[-1])
+        self.target_gen = IMEPTargetCurveGenerator(
+            low=imep_lo,
+            high=imep_hi,
+            seed=target_seed,
+            step_drop_probability=0.1,
+            min_segment_len=200,
+            max_segment_len=800,
+        )
 
         # get random reference observation to check ort outputs and make sure weights change
         if self.obs_is_discrete:
@@ -662,18 +675,9 @@ class Minion:
 
             # Extract state for next slot's initial state
             if buffer_type == 'actor':
-                # Actor: either reset env or extract last state from current rollout
-                if self.reset_env_each_n_batches and not self.batch_count % self.n_batches_for_env_reset:
-                    # get next state from env.reset()
-                    self.logger.debug(f"Minion: resetting env in batch {self.batch_count}")
-                    obs, info = self.env.reset()
-                    obs = np.array([obs, info["current imep"], obs], dtype=np.float32)
-                    state = _flatten_obs_array(obs)
-                else:
-                    # extract last state from current rollout to use as initial observation for buffer slot
-                    state_off = (shm_properties["STATE_ACTION_DIMS"]['action'] +
-                                 shm_properties["STATE_ACTION_DIMS"]['reward'])
-                    state = data[state_off:state_off + shm_properties["STATE_ACTION_DIMS"]['state']]
+                state_off = (shm_properties["STATE_ACTION_DIMS"]['action'] +
+                             shm_properties["STATE_ACTION_DIMS"]['reward'])
+                state = data[state_off:state_off + shm_properties["STATE_ACTION_DIMS"]['state']]
 
             self.logger.debug(f"Minion: Past reset and state extraction")
 
@@ -773,7 +777,9 @@ class Minion:
 
         if initial_obs is None:
             obs, info = self.env.reset()
-            obs = np.array([obs, info["current imep"], obs], dtype=np.float32)
+            target = self.target_gen.current()
+            self.env._desired_imep = target
+            obs = np.array([target, info["current imep"], target], dtype=np.float32)
         else:
             obs = initial_obs
 
@@ -857,6 +863,7 @@ class Minion:
 
         try:
         # Time environment step
+            self.env._desired_imep = self.target_gen.next()
             tic_env = time.time()
             new_obs, reward, reward_vec, terminated, truncated, info = self.env.step(action_for_env_filtered, nominal_action_for_env)
             new_obs = np.array([obs[2], info["current imep"], new_obs], dtype=np.float32)
@@ -904,7 +911,9 @@ class Minion:
         # Write initial state for actor buffer (filter does not need initial state)
         if self.last_obs is None:
             obs, info = self.env.reset()
-            obs = np.array([obs, info["current imep"], obs], dtype=np.float32)
+            target = self.target_gen.current()
+            self.env._desired_imep = target
+            obs = np.array([target, info["current imep"], target], dtype=np.float32)
             self._write_fragment(_flatten_obs_array(obs), is_initial_state=True, buffer_type='actor')
         else:
             obs = self.last_obs
