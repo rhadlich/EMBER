@@ -196,8 +196,8 @@ class EngineEnvContinuous(gym.Env):
             self.imep_lims = [1.6, 4.1]
             self.mprr_lims = [1, 15]
             self.observation_space = spaces.Box(
-                low=np.array([self.imep_lims[0]], dtype=np.float32),
-                high=np.array([self.imep_lims[1]], dtype=np.float32),
+                low=np.array([self.imep_lims[0], self.imep_lims[0], self.imep_lims[0]], dtype=np.float32),
+                high=np.array([self.imep_lims[1], self.imep_lims[1], self.imep_lims[1]], dtype=np.float32),
                 dtype=np.float32
             )
 
@@ -278,7 +278,7 @@ class EngineEnvContinuous(gym.Env):
 
         # calculate reward
         reward_vec = self.reward(reward_inputs)
-        reward = np.sum(reward_vec) + 18.0
+        reward = (np.sum(reward_vec) + 15.0) * 0.1
 
         # clip observation values to make sure it is within the expected space
         self._current_imep = np.clip(self._current_imep, self.imep_lims[0], self.imep_lims[-1])

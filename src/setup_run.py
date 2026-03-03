@@ -133,9 +133,10 @@ if __name__ == "__main__":
     # Define the size of each rollout tuple.
     bytes_per_float = np.dtype("float32").itemsize  # number of bytes in rollout data type
     dims = {
-        "action": 2,
+        "action": 2,    # Currently injection timing and injection duration
         "reward": 1,
-        "state": 1,                             # this will be the next state AFTER taking "action"
+        # Current state is [prev desired IMEP, prev achieved IMEP, next desired IMEP]
+        "state": 3,                             # this will be the next state AFTER taking "action"
         "action_dist_size": action_dist_size,
         "logp": 1                               # scalar by definition
     }  # the length of the vector of each component of the rollout

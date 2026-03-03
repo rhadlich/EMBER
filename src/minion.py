@@ -43,7 +43,8 @@ def _flatten_obs_array(obs) -> np.ndarray:
     shared memory buffer.
     """
     # return np.append(obs["state"], obs["target"]).astype(np.float32)
-    return np.expand_dims(obs, 0).astype(np.float32)
+    # return np.expand_dims(obs, 0).astype(np.float32)
+    return obs.astype(np.float32)
 
 
 def set_realtime_priority(priority: int = 80, logger=None):
@@ -324,7 +325,7 @@ class Minion:
         self.last_obs = None
 
         # Set EMA settings for reward scaling
-        H = 50.0  # number of steps to reach 99% of the value, or half life of the exponential decay
+        H = 5.0  # number of steps to reach 99% of the value, or half life of the exponential decay
         self.ema_beta = np.exp(-np.log(2) / H)
         self.current_var_ema = 1.0
         self.current_reward_scale = 1.0
@@ -604,12 +605,14 @@ class Minion:
             assert data.shape == (shm_properties["ELEMENTS_PER_ROLLOUT"],) and data.dtype == np.float32
 
         # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
+        self.logger.debug("Minion: Waiting for buffer to be unlocked")
         while True:
             if self.f_buf[lock_index] == 0:
                 write_idx, read_idx = get_indices(ep_arr, self.f_buf, logger=self.logger, lock_index=lock_index)
                 break
             else:
                 time.sleep(0.0001)
+        self.logger.debug("Minion: Buffer unlocked")
 
         slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
 
@@ -664,6 +667,7 @@ class Minion:
                     # get next state from env.reset()
                     self.logger.debug(f"Minion: resetting env in batch {self.batch_count}")
                     obs, info = self.env.reset()
+                    obs = np.array([obs, info["current imep"], obs], dtype=np.float32)
                     state = _flatten_obs_array(obs)
                 else:
                     # extract last state from current rollout to use as initial observation for buffer slot
@@ -769,6 +773,7 @@ class Minion:
 
         if initial_obs is None:
             obs, info = self.env.reset()
+            obs = np.array([obs, info["current imep"], obs], dtype=np.float32)
         else:
             obs = initial_obs
 
@@ -854,6 +859,7 @@ class Minion:
         # Time environment step
             tic_env = time.time()
             new_obs, reward, reward_vec, terminated, truncated, info = self.env.step(action_for_env_filtered, nominal_action_for_env)
+            new_obs = np.array([obs[2], info["current imep"], new_obs], dtype=np.float32)
             toc_env = time.time()
             duration_env_ms = (toc_env - tic_env) * 1000.0
             self.timing_recorder.record_timing('env_step', duration_env_ms)
@@ -886,7 +892,7 @@ class Minion:
         self.timing_recorder.record_timing('collect_rollout', duration_collect_ms, deterministic=deterministic)
         # Save timing data after collect_rollouts completes
         self.timing_recorder.save_timing_data()
-        return [new_obs, action_from_actor, reward, reward_vec, terminated, truncated, logp, net_out, info]
+        return [new_obs, action_from_actor, reward, reward_vec, terminated, truncated, logp, net_out, dist_inputs, info]
 
     def train_and_eval_sequence(
             self,
@@ -896,8 +902,9 @@ class Minion:
         self.logger.debug("Minion: in train_and_eval_sequence")
 
         # Write initial state for actor buffer (filter does not need initial state)
-        if not self.last_obs:
+        if self.last_obs is None:
             obs, info = self.env.reset()
+            obs = np.array([obs, info["current imep"], obs], dtype=np.float32)
             self._write_fragment(_flatten_obs_array(obs), is_initial_state=True, buffer_type='actor')
         else:
             obs = self.last_obs
@@ -908,11 +915,12 @@ class Minion:
         rewards_adjusted = []
         sigmas = []
         reward_vecs = []
+        dist_inputs_list = []
 
         for i in range(int(train_batches * self.episode_shm_properties["BATCH_SIZE"])):
 
             tic = time.time()
-            obs, action, reward, reward_vec, _, _, logp, net_out, info = (
+            obs, action, reward, reward_vec, _, _, logp, net_out, dist_inputs, info = (
                 self.collect_rollout(initial_obs=obs))
             toc = time.time()
 
@@ -923,12 +931,13 @@ class Minion:
             rewards_adjusted.append(adjusted_reward)
             sigmas.append(np.sqrt(self.current_reward_scale))
             reward_vecs.append(reward_vec)
+            dist_inputs_list.append(dist_inputs)
 
             # Collect data to send to Learner
             obs_flat = _flatten_obs_array(obs)  # flatten to shape needed by memory buffer
             current_packet = np.concatenate((
                 action,
-                np.array([adjusted_reward], dtype=np.float32),
+                np.array([reward], dtype=np.float32),
                 obs_flat,
                 np.array([logp], dtype=np.float32),
                 net_out.astype(np.float32),
@@ -942,7 +951,7 @@ class Minion:
                 "topic": "engine",
                 "current imep": float(info["current imep"]),
                 "mprr": float(info["mprr"]),
-                "target": float(obs)
+                "target": float(obs[2])
             }
 
             # Send message to GUI (if enabled)
@@ -956,7 +965,7 @@ class Minion:
         
         # Compute performance metrics
         try:
-            train_rollouts_df = self._compute_performance_metrics(rewards_raw, rewards_adjusted, sigmas, np.vstack(reward_vecs))
+            train_rollouts_df = self._compute_performance_metrics(rewards_raw, rewards_adjusted, sigmas, np.vstack(reward_vecs), np.vstack(dist_inputs_list))
         except Exception as e:
             self.logger.debug(f"Minion: Failed to compute performance metrics for train rollouts: {e}")
             raise RuntimeError(f"Failed to compute performance metrics for train rollouts: {e}")
@@ -968,9 +977,10 @@ class Minion:
         rewards_adjusted_eval = []
         sigmas_eval = []
         reward_vecs_eval = []
+        dist_inputs_list_eval = []
 
         for i in range(eval_rollouts):
-            obs, action, reward, reward_vec, _, _, _, _, info = (
+            obs, action, reward, reward_vec, _, _, _, _, dist_inputs, info = (
                 self.collect_rollout(initial_obs=obs, deterministic=True))
 
             # Gather data for performance metrics
@@ -978,13 +988,14 @@ class Minion:
             rewards_adjusted_eval.append(self._scale_reward(reward))
             sigmas_eval.append(np.sqrt(self.current_reward_scale))
             reward_vecs_eval.append(reward_vec)
+            dist_inputs_list_eval.append(dist_inputs)
 
             # send evaluation results to be logged in the GUI
             msg = {
                 "topic": "evaluation",
                 "current imep": float(info["current imep"]),
                 "mprr": float(info["mprr"]),
-                "target": float(obs)
+                "target": float(obs[2])
             }
             # self.logger.debug(f"Minion (train_and_eval_sequence): eval msg: {msg}.")
             if self.pub is not None:
@@ -992,7 +1003,7 @@ class Minion:
         
         # Compute performance metrics for evaluation
         try:
-            eval_rollouts_df = self._compute_performance_metrics(rewards_raw_eval, rewards_adjusted_eval, sigmas_eval, np.vstack(reward_vecs_eval))
+            eval_rollouts_df = self._compute_performance_metrics(rewards_raw_eval, rewards_adjusted_eval, sigmas_eval, np.vstack(reward_vecs_eval), np.vstack(dist_inputs_list_eval))
         except Exception as e:
             self.logger.debug(f"Minion: Failed to compute performance metrics for eval rollouts: {e}")
             raise RuntimeError(f"Failed to compute performance metrics for eval rollouts: {e}")
@@ -1025,11 +1036,14 @@ class Minion:
         rewards_adjusted: list,
         sigmas: list,
         reward_vecs: np.ndarray,
+        dist_inputs_vecs: np.ndarray,
     ) -> dict:
         """
         Helper function to compute performance metrics from rollouts.
         """
         return pd.DataFrame([{
+            "return_raw": np.sum(rewards_raw),
+            "return_adjusted": np.sum(rewards_adjusted),
             "reward_raw_mean": np.mean(rewards_raw),
             "reward_raw_std": np.std(rewards_raw),
             "reward_raw_min": np.min(rewards_raw),
@@ -1054,6 +1068,10 @@ class Minion:
             "filter_interference_std": np.std(reward_vecs[:, 2]),
             "filter_interference_min": np.min(reward_vecs[:, 2]),
             "filter_interference_max": np.max(reward_vecs[:, 2]),
+            "dist_inputs[0]_mean": np.mean(dist_inputs_vecs[:, 0]),
+            "dist_inputs[1]_mean": np.mean(dist_inputs_vecs[:, 1]),
+            "dist_inputs[2]_mean": np.mean(dist_inputs_vecs[:, 2]),
+            "dist_inputs[3]_mean": np.mean(dist_inputs_vecs[:, 3]),
         }])
 
 
@@ -1134,7 +1152,7 @@ def main(policy_shm_name: str,
             try:
                 train_rollouts_df, eval_rollouts_df = actor.train_and_eval_sequence(
                     train_batches=1,
-                    eval_rollouts=5,
+                    eval_rollouts=10,
                 )
             except Exception as e:
                 actor.logger.debug(f"Minion: Failed to perform train and eval sequence: {e}")

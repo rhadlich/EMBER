@@ -37,9 +37,9 @@ def update_config(cfg, args):
     """Add/override APPO-specific settings on the RLlib config builder."""
     return (
         cfg.training(
-            model={"free_log_std": True},
+            # model={"free_log_std": True},
             q_model_config={
-                "fcnet_hiddens": [256, 256],
+                "fcnet_hiddens": [64, 64],
                 "fcnet_activation": "relu",
                 "post_fcnet_hiddens": [],
                 "post_fcnet_activation": None,
@@ -47,24 +47,33 @@ def update_config(cfg, args):
                 "custom_model_config": {},
             },
             policy_model_config={
-                "fcnet_hiddens": [256, 256],
+                "fcnet_hiddens": [64, 64],
                 "fcnet_activation": "relu",
                 "post_fcnet_hiddens": [],
                 "post_fcnet_activation": None,
                 "custom_model": None,  # Use this to define a custom policy model.
                 "custom_model_config": {},
             },
+
+            # Generic algorithm hyperparams
+            train_batch_size_per_learner=256,
+            gamma=0.995,
+            n_step=1,
+            grad_clip=10.0,
+
+            # SAC hyperparams
             initial_alpha=0.1,
+            target_entropy=-2.0,
             alpha_lr=1e-4,
             actor_lr=1e-4,
-            critic_lr=1e-4,
-            tau=0.003,
+            critic_lr=3e-5,
+            tau=5e-3,
             replay_buffer_config={
                 "type": "PrioritizedEpisodeReplayBuffer",
                 # Size of the replay buffer. Note that if async_updates is set,
                 # then each worker will have a replay buffer of this size.
-                "capacity": int(5e4),
-                "alpha": 0.6,
+                "capacity": int(1e6),
+                "alpha": 0.0,
                 # Beta parameter for sampling from prioritized replay buffer.
                 "beta": 0.4,
             },

@@ -284,9 +284,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(dict)
     def on_zmq_message(self, msg):
-        self.log.debug(f"GUI: In on_zmq_message.")
+        # self.log.debug(f"GUI: In on_zmq_message.")
         topic = msg.get("topic", "")
-        self.log.debug(f"GUI: topic -> {topic}.")
+        # self.log.debug(f"GUI: topic -> {topic}.")
         if topic == "engine":
             self._update_engine(msg)
         elif topic == "training":
@@ -295,7 +295,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_evaluation(msg)
 
     def _update_evaluation(self, msg):
-        self.log.debug(f"GUI: In _update_evaluation.")
+        # self.log.debug(f"GUI: In _update_evaluation.")
         self.evaluation_count += 1
         self.evaluation_x.append(self.evaluation_count)
 
@@ -305,13 +305,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_data['eval imep'].append(current_imep)
         self.engine_data['eval target imep'].append(target_imep)
         self.engine_data['evaluation error'].append(np.abs(current_imep - target_imep))
-        self.log.debug(f"GUI: Done with _update_evaluation.")
+        # self.log.debug(f"GUI: Done with _update_evaluation.")
 
     def _update_engine(self, msg):
-        self.log.debug(f"GUI: In _update_engine.")
+        # self.log.debug(f"GUI: In _update_engine.")
         self.engine_count += 1
         self.engine_x.append(self.engine_count)
-        self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
+        # self.log.debug(f"GUI (_update_engine): msg -> {msg}.")
 
         data = {
             "imep": msg["current imep"],
@@ -330,7 +330,7 @@ class MainWindow(QtWidgets.QMainWindow):
             data_list = self.engine_data[k]
             data_list.append(v)
 
-        self.log.debug(f"GUI: Done with _update_engine.")
+        # self.log.debug(f"GUI: Done with _update_engine.")
 
     def _update_training(self, msg):
         if "iteration" not in msg:
