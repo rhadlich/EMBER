@@ -1,0 +1,10 @@
+name: rayenv2
+channels:
+  - defaults
+dependencies:
+  - pip=25.1
+  - pip:
+      - pyqt6==6.9.1
+      - pyqt6-qt6==6.9.1
+      - pyqt6-sip==13.10.2
+      - pyqtgraph==0.13.7

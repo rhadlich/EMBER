@@ -3,7 +3,6 @@ channels:
   - defaults
 dependencies:
   - ca-certificates=2025.2.25
-  - libcxx=14.0.6
   - libffi=3.4.4
   - ncurses=6.4
   - openssl=3.0.16
@@ -92,10 +91,6 @@ dependencies:
       - pydantic==2.11.4
       - pydantic-core==2.33.2
       - pyparsing==3.2.3
-      - pyqt6==6.9.1
-      - pyqt6-qt6==6.9.1
-      - pyqt6-sip==13.10.2
-      - pyqtgraph==0.13.7
       - python-dateutil==2.9.0.post0
       - python-dotenv==1.1.0
       - pytz==2025.2
