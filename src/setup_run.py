@@ -3,7 +3,7 @@
 How to run this script
 ----------------------
 `python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --model-mode "create or load" --gui True --rllib-module-name "rllib_module_name" --filter-model-name "filter_model_name" --cpu-core-minion "core#"`
-
+python src/setup_run.py --algo 'SAC' --rllib-module-name 'rllib_module' --filter-model-name 'filter_model' --disable-safety-filter --model-mode 'create' --gui True --seed 123 --stop-iters 2000
 Determinism
 -----------
 Pass a global seed via `--seed <int>` to get fully reproducible training runs
@@ -60,6 +60,16 @@ parser.add_argument(
     default="flag",
     help="Name of flag shm to use",
 )
+
+
+def _get_buffer_action_dim(action_space, adapter) -> int:
+    if adapter.mode == "continuous":
+        return int(action_space.shape[0])
+    if adapter.mode == "discrete1":
+        return 1
+    if adapter.mode == "multidiscrete":
+        return len(adapter.nvec)
+    raise NotImplementedError(f"Unsupported adapter mode {adapter.mode}")
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -120,63 +130,46 @@ if __name__ == "__main__":
 
     adapter = ActionAdapter(action_space)
 
-    # get action space size in one-hot representation (if discrete). will need this to create
-    # the episode buffer such that it can hold the probability distribution
-    if adapter.mode in ("discrete1", "multidiscrete"):
-        # logits will be the same length as action_onehot_size
-        action_dist_size = int(sum(adapter.nvec))
+    # Import the algo config module early so that custom algorithms (e.g. TD3)
+    # can register themselves with ray.tune before get_trainable_cls() is called.
+    import importlib
+    try:
+        _algo_cfg_mod = importlib.import_module(
+            f"configs.algorithms.{args.algo.lower()}_cfg"
+        )
+    except ModuleNotFoundError:
+        _algo_cfg_mod = None
+
+    action_dim = _get_buffer_action_dim(action_space, adapter)
+    # Runtime observations stored in shared memory are the previous action signal
+    # plus three IMEP-related values.
+    state_dim = action_dim + 3
+
+    if _algo_cfg_mod is not None and hasattr(_algo_cfg_mod, "get_actor_episode_buffer_spec"):
+        ep_shm_properties = _algo_cfg_mod.get_actor_episode_buffer_spec(
+            state_dim=state_dim,
+            action_space=action_space,
+            action_adapter=adapter,
+            batch_size=8,
+            num_slots=32,
+            name="episodes",
+        )
     else:
-        # non-discrete action space, need mean and standard deviation of the distribution instead of logits
-        action_dist_size = 2*action_space.shape[0]
+        raise NotImplementedError(
+            f"Algorithm {args.algo} does not define get_actor_episode_buffer_spec()."
+        )
 
     # Define name and properties of episode ring buffer to pass down to EnvRunner.
-    # Define the size of each rollout tuple.
-    bytes_per_float = np.dtype("float32").itemsize  # number of bytes in rollout data type
-    dims = {
-        "action": 2,    # Currently injection timing and injection duration
-        "reward": 1,
-        # Current state is [prev desired IMEP, prev achieved IMEP, next desired IMEP]
-        "state": 3,                             # this will be the next state AFTER taking "action"
-        "action_dist_size": action_dist_size,
-        "logp": 1                               # scalar by definition
-    }  # the length of the vector of each component of the rollout
-    BATCH_SIZE = 32  # number of rollouts per batch (episode)
-    NUM_SLOTS = 8  # ring depth (i.e. number of episodes)
-
-    # the length of the vector of each component of the rollout
-    ELEMENTS_PER_ROLLOUT = sum(dims.values())
-    BYTES_PER_ROLLOUT = ELEMENTS_PER_ROLLOUT * bytes_per_float
-    
-    # Added state to PAYLOAD_SIZE because need to include the starting state for each episode. This will be simply
-    # the state observation at the end of the last episode/batch.
-    PAYLOAD_SIZE = ELEMENTS_PER_ROLLOUT * BATCH_SIZE + dims["state"]
-    HEADER_SIZE = 2  # write_idx, read_idx
-    HEADER_SLOT_SIZE = 1  # one float32 to store how many rollouts already in slot
-    SLOT_SIZE = HEADER_SLOT_SIZE + PAYLOAD_SIZE
-    TOTAL_SIZE = HEADER_SIZE + NUM_SLOTS*SLOT_SIZE
-    TOTAL_SIZE_BYTES = int(TOTAL_SIZE * bytes_per_float)
-    logger.debug(f"action_dist_size: {action_dist_size}")
-    logger.debug(f"ELEMENTS_PER_ROLLOUT: {ELEMENTS_PER_ROLLOUT}")
-    logger.debug(f"PAYLOAD_SIZE: {PAYLOAD_SIZE}")
-    logger.debug(f"SLOT_SIZE: {SLOT_SIZE}")
-    logger.debug(f"TOTAL_SIZE: {TOTAL_SIZE}")
-
-    ep_shm_properties = {
-        "BATCH_SIZE": BATCH_SIZE,
-        "NUM_SLOTS": NUM_SLOTS,
-        "ELEMENTS_PER_ROLLOUT": ELEMENTS_PER_ROLLOUT,
-        "BYTES_PER_ROLLOUT": BYTES_PER_ROLLOUT,
-        "PAYLOAD_SIZE": PAYLOAD_SIZE,
-        "HEADER_SIZE": HEADER_SIZE,
-        "HEADER_SLOT_SIZE": HEADER_SLOT_SIZE,
-        "SLOT_SIZE": SLOT_SIZE,
-        "TOTAL_SIZE": TOTAL_SIZE,
-        "TOTAL_SIZE_BYTES": TOTAL_SIZE_BYTES,
-        "STATE_ACTION_DIMS": dims,
-        "BYTES_PER_FLOAT": bytes_per_float,
-        "name": "episodes",
-        "action_dist_size": action_dist_size,
-    }
+    bytes_per_float = np.dtype("float32").itemsize
+    dims = ep_shm_properties["STATE_ACTION_DIMS"]
+    BATCH_SIZE = ep_shm_properties["BATCH_SIZE"]
+    NUM_SLOTS = ep_shm_properties["NUM_SLOTS"]
+    logger.debug(f"actor rollout schema: {ep_shm_properties['ROLLOUT_FIELD_ORDER']}")
+    logger.debug(f"actor rollout field dims: {ep_shm_properties['ROLLOUT_FIELD_DIMS']}")
+    logger.debug(f"ELEMENTS_PER_ROLLOUT: {ep_shm_properties['ELEMENTS_PER_ROLLOUT']}")
+    logger.debug(f"PAYLOAD_SIZE: {ep_shm_properties['PAYLOAD_SIZE']}")
+    logger.debug(f"SLOT_SIZE: {ep_shm_properties['SLOT_SIZE']}")
+    logger.debug(f"TOTAL_SIZE: {ep_shm_properties['TOTAL_SIZE']}")
 
     enable_safety_filter = not getattr(args, "disable_safety_filter", False)
 
@@ -185,18 +178,18 @@ if __name__ == "__main__":
     filter_ep_shm_properties = None
     if enable_safety_filter:
         filter_dims = {
-            "state": dims["state"],
-            "action": dims["action"],
-            "next_state": dims["state"],
-            "nominal_action": dims["action"],
+            "state": state_dim,
+            "action": action_dim,
+            "next_state": state_dim,
+            "nominal_action": action_dim,
         }
         FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
         FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)
         FILTER_ELEMENTS_PER_ROLLOUT = sum(filter_dims.values())  # state + action_filtered + next_state + action_nominal
         FILTER_BYTES_PER_ROLLOUT = FILTER_ELEMENTS_PER_ROLLOUT * bytes_per_float
         FILTER_PAYLOAD_SIZE = FILTER_ELEMENTS_PER_ROLLOUT * FILTER_BATCH_SIZE  # filter buffer does not need initial state
-        FILTER_HEADER_SIZE = HEADER_SIZE  # same structure
-        FILTER_HEADER_SLOT_SIZE = HEADER_SLOT_SIZE
+        FILTER_HEADER_SIZE = ep_shm_properties["HEADER_SIZE"]
+        FILTER_HEADER_SLOT_SIZE = ep_shm_properties["HEADER_SLOT_SIZE"]
         FILTER_SLOT_SIZE = FILTER_HEADER_SLOT_SIZE + FILTER_PAYLOAD_SIZE
         FILTER_TOTAL_SIZE = FILTER_HEADER_SIZE + FILTER_NUM_SLOTS * FILTER_SLOT_SIZE
         FILTER_TOTAL_SIZE_BYTES = int(FILTER_TOTAL_SIZE * bytes_per_float)
@@ -288,13 +281,9 @@ if __name__ == "__main__":
         .debugging(seed=getattr(args, "seed", None))
     )
 
-    import importlib
-    try:
-        mod = importlib.import_module(f"configs.algorithms.{args.algo.lower()}_cfg")
-        if hasattr(mod, "update_config"):
-            base_config = mod.update_config(base_config, args)
-    except ModuleNotFoundError:
-        pass
+    if _algo_cfg_mod is not None and hasattr(_algo_cfg_mod, "update_config"):
+        base_config = _algo_cfg_mod.update_config(base_config, args)
+
 
     # Model save/load: resolve names and build spec for compatibility checks.
     env_type = getattr(args, "env_type", "continuous")
@@ -315,14 +304,13 @@ if __name__ == "__main__":
         "action_shape": action_shape,
         "adapter_mode": adapter.mode,
     }
-    try:
-        mod = importlib.import_module(f"configs.algorithms.{args.algo.lower()}_cfg")
-        if hasattr(mod, "get_rllib_module_spec"):
-            arch = mod.get_rllib_module_spec(base_config)
+    if _algo_cfg_mod is not None and hasattr(_algo_cfg_mod, "get_rllib_module_spec"):
+        try:
+            arch = _algo_cfg_mod.get_rllib_module_spec(base_config)
             if arch is not None:
                 args.rllib_module_spec["rllib_module_arch"] = arch
-    except Exception:
-        pass  # Algo may not define it
+        except Exception:
+            pass
     logger.debug(f"rllib_module_spec: {args.rllib_module_spec}")
 
     if enable_safety_filter:

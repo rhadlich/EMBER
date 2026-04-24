@@ -1245,13 +1245,18 @@ def run_rllib_shared_memory(
             if 'metrics_logger' in state['learner']:
                 stats = state['learner']['metrics_logger']['stats']
                 try:
-                    logger.debug(f"step {train_iter:>4}: "
-                                 f"Qloss={list(stats['default_policy--qf_loss']['values'])} | "
-                                 f"Ploss={list(stats['default_policy--policy_loss']['values'])} | "
-                                 f"α={list(stats['default_policy--alpha_value']['values'])} "
-                                 f"(αloss={list(stats['default_policy--alpha_loss']['values'])}) | "
-                                 f"Qµ={list(stats['default_policy--qf_mean']['values'])}"
-                                 )
+                    msg = (
+                        f"step {train_iter:>4}: "
+                        f"Qloss={list(stats['default_policy--qf_loss']['values'])} | "
+                        f"Ploss={list(stats['default_policy--policy_loss']['values'])} | "
+                        f"Qµ={list(stats['default_policy--qf_mean']['values'])}"
+                    )
+                    if 'default_policy--alpha_value' in stats:
+                        msg += (
+                            f" | α={list(stats['default_policy--alpha_value']['values'])} "
+                            f"(αloss={list(stats['default_policy--alpha_loss']['values'])})"
+                        )
+                    logger.debug(msg)
                 except Exception as e:
                     logger.debug(f"could not print stats due to error {e}")
 

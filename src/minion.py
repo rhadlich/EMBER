@@ -17,7 +17,12 @@ import gymnasium as gym
 from core.environments.engine_env import reward_fn, EngineEnvDiscrete, EngineEnvContinuous
 from core.environments.target_curve_generator import IMEPTargetCurveGenerator
 
-from utils.utils import ActionAdapter, TimingRecorder
+from utils.utils import (
+    ActionAdapter,
+    TimingRecorder,
+    build_rollout_row,
+    get_rollout_field_slices,
+)
 from utils.shared_memory_utils import get_indices, set_indices, flatten_obs_onehot
 
 from ray.rllib.env import INPUT_ENV_SPACES
@@ -144,6 +149,30 @@ class Minion:
         self.policy_shm_name = self.config.env_config['policy_shm_name']
         self.flag_shm_name = self.config.env_config['flag_shm_name']
         self.episode_shm_properties = self.config.env_config["ep_shm_properties"]
+        self.actor_rollout_field_slices = get_rollout_field_slices(
+            self.episode_shm_properties
+        )
+        self.policy_output_kind = self.episode_shm_properties.get(
+            "policy_output_kind", "unknown"
+        )
+        self.exploration_noise = float(
+            getattr(self.config, "exploration_noise", 0.0) or 0.0
+        )
+        self.initial_steps = int(
+            getattr(self.config, "initial_steps", 0) or 0
+        )
+        self.initial_std = float(
+            getattr(self.config, "initial_std", 0.5) or 0.5
+        )
+        self.noise_decay_k = float(
+            getattr(self.config, "noise_decay_k", 0.01) or 0.01
+        )
+        self.noise_decay_schedule = str(
+            getattr(self.config, "noise_decay_schedule", "linear") or "linear"
+        ).lower()
+        self.linear_decay_steps = int(
+            getattr(self.config, "linear_decay_steps", 8000) or 8000
+        )
         self.ep_shm_name = self.episode_shm_properties['name']
         self.enable_safety_filter = self.config.env_config.get("enable_safety_filter", True)
         self.filter_policy_shm_name = self.config.env_config.get('filter_policy_shm_name', 'filter_policy')
@@ -225,9 +254,10 @@ class Minion:
             low=imep_lo,
             high=imep_hi,
             seed=target_seed,
-            step_drop_probability=0.1,
-            min_segment_len=200,
-            max_segment_len=800,
+            min_hold_len=15,
+            max_hold_len=60,
+            min_transition_len=20,
+            max_transition_len=90,
         )
 
         # get random reference observation to check ort outputs and make sure weights change
@@ -338,12 +368,33 @@ class Minion:
         self.last_obs = None
 
         # Set EMA settings for reward scaling
-        H = 5.0  # number of steps to reach 99% of the value, or half life of the exponential decay
+        H = 50.0  # number of steps to reach 99% of the value, or half life of the exponential decay
         self.ema_beta = np.exp(-np.log(2) / H)
         self.current_var_ema = 1.0
         self.current_reward_scale = 1.0
 
         self.logger.debug("Minion: Done with __init__().")
+
+    def _get_current_exploration_std(self) -> float:
+        """Return the rollout-time actor-noise std after the random phase."""
+        steps_since_random = max(self.rollout_count - self.initial_steps, 0)
+
+        if self.noise_decay_schedule == "linear":
+            progress = min(steps_since_random / max(self.linear_decay_steps, 1), 1.0)
+            return self.initial_std + progress * (
+                self.exploration_noise - self.initial_std
+            )
+
+        if self.noise_decay_schedule == "hyperbolic":
+            return (
+                self.exploration_noise
+                + (self.initial_std - self.exploration_noise)
+                / (1.0 + self.noise_decay_k * steps_since_random)
+            )
+
+        raise ValueError(
+            f"Unsupported noise decay schedule: {self.noise_decay_schedule}"
+        )
 
     def _ort_session_run(self, session, obs):
         tic = time.time()
@@ -357,7 +408,6 @@ class Minion:
         return net_out
 
     def _weights_changed(self, new_sess, atol=1e-5):
-        self.logger.debug("Minion: Called _weights_changed")
         tic = time.time()
 
         out_new = []
@@ -373,7 +423,6 @@ class Minion:
             return True
 
         diff = np.sum(np.abs(self.old_policy_output - out_new))
-        self.logger.debug(f"Δpolicy={diff:.4e}")
 
         msg = {
             "topic": "policy",
@@ -388,7 +437,6 @@ class Minion:
         toc = time.time()
         duration_ms = (toc - tic) * 1000.0
         self.timing_recorder.record_timing('weights_changed', duration_ms)
-        self.logger.debug("Minion: Finished _weights_changed")
 
         return diff > atol
 
@@ -403,11 +451,9 @@ class Minion:
             Tuple of (ort_session, input_names, output_names)
         """
         if model_type == 'actor':
-            self.logger.debug("Minion: Called _get_ort_session (actor)")
             p_buf = self.p_buf
             timing_name = 'get_ort_session'
         elif model_type == 'filter':
-            self.logger.debug("Minion: Called _get_ort_session (filter)")
             p_buf = self.filter_p_buf
             timing_name = 'get_filter_ort_session'
         else:
@@ -471,7 +517,6 @@ class Minion:
         
         # Check if weights are available and buffer is not locked
         if self.f_buf[weights_flag_idx] == 1 and self.f_buf[lock_flag_idx] == 0:
-            self.logger.debug(f"Minion: Updating {log_prefix} weights...")
             self.f_buf[lock_flag_idx] = 1  # set lock flag to locked
             tic = time.time()
             
@@ -494,7 +539,6 @@ class Minion:
                 # model_error is already updated in _get_ort_session()
             
             toc = time.time()
-            self.logger.debug(f"Minion: Time to update {log_prefix} weights is {(toc - tic)*1000:0.4f}ms")
 
             # Check if policy changed (only for actor)
             if check_weights_changed:
@@ -512,7 +556,7 @@ class Minion:
             toc_full = time.time()
             duration_ms = (toc_full - tic) * 1000.0
             self.timing_recorder.record_timing(timing_name, duration_ms)
-            self.logger.debug(f"Minion: {log_prefix.capitalize()} weights updated.")
+            # self.logger.debug(f"Minion: {log_prefix.capitalize()} weights updated.")
             
             # Save timing data after update completes
             self.timing_recorder.save_timing_data()
@@ -595,7 +639,6 @@ class Minion:
             timing_name = 'write_fragment'
             log_prefix = "write_fragment"
         elif buffer_type == 'filter':
-            self.logger.debug("Minion: Writing filter fragment")
             if not hasattr(self, 'filter_ep_arr') or self.filter_ep_arr is None:
                 return None
             ep_arr = self.filter_ep_arr
@@ -618,18 +661,14 @@ class Minion:
             assert data.shape == (shm_properties["ELEMENTS_PER_ROLLOUT"],) and data.dtype == np.float32
 
         # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
-        self.logger.debug("Minion: Waiting for buffer to be unlocked")
         while True:
             if self.f_buf[lock_index] == 0:
                 write_idx, read_idx = get_indices(ep_arr, self.f_buf, logger=self.logger, lock_index=lock_index)
                 break
             else:
                 time.sleep(0.0001)
-        self.logger.debug("Minion: Buffer unlocked")
 
         slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
-
-        self.logger.debug(f"Minion: Writing fragment to slot {write_idx} of buffer {buffer_type}")
 
         # Handle initial state
         if is_initial_state:
@@ -653,13 +692,9 @@ class Minion:
             episode_off += shm_properties["STATE_ACTION_DIMS"]["state"]
         ep_arr[episode_off: episode_off + shm_properties["ELEMENTS_PER_ROLLOUT"]] = data
 
-        self.logger.debug(f"Minion: Wrote data to slot {write_idx} of buffer {buffer_type}")
-
         # Increment fill counter
         filled += 1
         ep_arr[slot_off] = filled
-
-        self.logger.debug(f"Minion: Incremented fill counter to {filled}")
 
         # If this is the last rollout that can be added to this slot -> move write_idx to next slot
         if filled == shm_properties["BATCH_SIZE"]:
@@ -675,11 +710,9 @@ class Minion:
 
             # Extract state for next slot's initial state
             if buffer_type == 'actor':
-                state_off = (shm_properties["STATE_ACTION_DIMS"]['action'] +
-                             shm_properties["STATE_ACTION_DIMS"]['reward'])
-                state = data[state_off:state_off + shm_properties["STATE_ACTION_DIMS"]['state']]
+                next_obs_slice = self.actor_rollout_field_slices["next_obs"]
+                state = data[next_obs_slice]
 
-            self.logger.debug(f"Minion: Past reset and state extraction")
 
             if buffer_type == 'actor':
                 # add initial state to next slot
@@ -779,11 +812,11 @@ class Minion:
             obs, info = self.env.reset()
             target = self.target_gen.current()
             self.env._desired_imep = target
-            obs = np.array([target, info["current imep"], target], dtype=np.float32)
+            obs = np.array([-5.6, 0.31, target, info["current imep"], target], dtype=np.float32)
         else:
             obs = initial_obs
 
-        self.logger.debug("Minion: in collect_rollout")
+        # self.logger.debug("Minion: in collect_rollout")
 
         # format observation for actor and filter models
         try:
@@ -798,8 +831,8 @@ class Minion:
             self.logger.debug(f"Minion: Failed to get observation from environment to filter model: {e}")
             raise RuntimeError(f"Failed to get observation from environment to filter model: {e}")
 
-        self.logger.debug(f"Minion: obs_for_actor_model: {obs_for_actor_model}")
-        self.logger.debug(f"Minion: obs_for_filter_model: {obs_for_filter_model}")
+        # self.logger.debug(f"Minion: obs_for_actor_model: {obs_for_actor_model}")
+        # self.logger.debug(f"Minion: obs_for_filter_model: {obs_for_filter_model}")
 
         tic2 = time.time()
         # perform inference to get action distribution
@@ -825,8 +858,37 @@ class Minion:
         duration_policy_ms = (toc_policy - tic_policy) * 1000.0
         self.timing_recorder.record_timing('policy_sampling', duration_policy_ms, deterministic=deterministic)
 
-        self.logger.debug(
-            f"Minion: sampled action: action_raw={action_from_actor}, logp={logp}, dist_inputs={dist_inputs}")
+        # self.logger.debug(
+        #     f"Minion: sampled action: action_raw={action_from_actor}, logp={logp}, dist_inputs={dist_inputs}")
+
+        # Apply exploration noise (for deterministic policies like TD3).
+        # Phase 1: pure uniform-random actions for the first initial_steps rollouts.
+        # Phase 2: policy + Gaussian noise with std controlled by the configured
+        # decay schedule (linear by default, hyperbolic available for compatibility).
+        if (
+            not deterministic
+            and self.policy_output_kind == "deterministic"
+        ):
+            if self.rollout_count < self.initial_steps:
+                action_from_actor = self.rng.uniform(
+                    low=-1.0, high=1.0,
+                    size=np.shape(action_from_actor),
+                ).astype(np.float32)
+            elif self.initial_std > 0.0:
+                current_std = self._get_current_exploration_std()
+                noise = self.rng.normal(
+                    loc=0.0,
+                    scale=current_std,
+                    size=np.shape(action_from_actor),
+                ).astype(np.float32)
+                action_from_actor = np.clip(
+                    action_from_actor + noise, -1.0, 1.0
+                ).astype(np.float32)
+                self.logger.debug(
+                    f"Minion: Phase 2 exploration ({self.noise_decay_schedule}), "
+                    f"std={current_std:.4f}, "
+                    f"action_noisy={action_from_actor}"
+                )
         
         try:
             # Keep a copy of the nominal action (pre-filter) for filter-training data.
@@ -844,7 +906,7 @@ class Minion:
                     action_from_actor_for_filter_nominal,  # numpy array: (action_dim,)
                     self.model_error   # float scalar
                 )
-                self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
+                # self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
             except Exception as e:
                 self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
                 action_filtered = action_from_actor_for_filter_nominal
@@ -855,8 +917,8 @@ class Minion:
             # Format action for environment
             action_for_env_filtered = self._get_action_from_filter_to_env(action_filtered)
             nominal_action_for_env = self._get_action_from_filter_to_env(action_from_actor)
-            self.logger.debug(f"Minion: action_for_env_filtered: {action_for_env_filtered}")
-            self.logger.debug(f"Minion: nominal_action_for_env: {nominal_action_for_env}")
+            # self.logger.debug(f"Minion: action_for_env_filtered: {action_for_env_filtered}")
+            # self.logger.debug(f"Minion: nominal_action_for_env: {nominal_action_for_env}")
         except Exception as e:
             self.logger.debug(f"Minion: Failed to get action from filter to environment: {e}")
             raise RuntimeError(f"Failed to get action from filter to environment: {e}")
@@ -866,11 +928,10 @@ class Minion:
             self.env._desired_imep = self.target_gen.next()
             tic_env = time.time()
             new_obs, reward, reward_vec, terminated, truncated, info = self.env.step(action_for_env_filtered, nominal_action_for_env)
-            new_obs = np.array([obs[2], info["current imep"], new_obs], dtype=np.float32)
+            new_obs = np.concatenate((action_for_env_filtered[1:], np.array([obs[-1], info["current imep"], new_obs], dtype=np.float32)), axis=0)
             toc_env = time.time()
             duration_env_ms = (toc_env - tic_env) * 1000.0
             self.timing_recorder.record_timing('env_step', duration_env_ms)
-            self.logger.debug(f"Minion: Stepped environment.")
         except Exception as e:
             self.logger.debug(f"Minion: Failed to step environment: {e}")
             raise RuntimeError(f"Failed to step environment: {e}")
@@ -881,8 +942,8 @@ class Minion:
         # sampling is deterministic or not.
         if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
             try:
-                current_state = obs_for_filter_model        # Current state before action
-                next_state = self._get_obs_from_env_to_filter(new_obs)   # Next state after action
+                current_state = obs_for_filter_model.reshape(-1)
+                next_state = self._get_obs_from_env_to_filter(new_obs).reshape(-1)
                 # Store: (current_state, action_filtered, next_state, action_nominal)
                 filter_data = np.concatenate([current_state, action_filtered, next_state, action_from_actor_for_filter_nominal]).astype(np.float32)
                 self._write_fragment(filter_data, buffer_type='filter')
@@ -906,19 +967,16 @@ class Minion:
             train_batches: int = 1,
             eval_rollouts: int = 1,
     ):
-        self.logger.debug("Minion: in train_and_eval_sequence")
 
         # Write initial state for actor buffer (filter does not need initial state)
         if self.last_obs is None:
             obs, info = self.env.reset()
             target = self.target_gen.current()
             self.env._desired_imep = target
-            obs = np.array([target, info["current imep"], target], dtype=np.float32)
+            obs = np.array([-5.6, 0.31, target, info["current imep"], target], dtype=np.float32)
             self._write_fragment(_flatten_obs_array(obs), is_initial_state=True, buffer_type='actor')
         else:
             obs = self.last_obs
-        
-        self.logger.debug("Minion: going to collect train batches")
 
         rewards_raw = []
         rewards_adjusted = []
@@ -927,12 +985,13 @@ class Minion:
         dist_inputs_list = []
 
         for i in range(int(train_batches * self.episode_shm_properties["BATCH_SIZE"])):
-
+            # Collect rollout
             tic = time.time()
             obs, action, reward, reward_vec, _, _, logp, net_out, dist_inputs, info = (
                 self.collect_rollout(initial_obs=obs))
             toc = time.time()
 
+            # Scale reward
             adjusted_reward = self._scale_reward(reward)
 
             # Gather data for performance metrics
@@ -940,27 +999,42 @@ class Minion:
             rewards_adjusted.append(adjusted_reward)
             sigmas.append(np.sqrt(self.current_reward_scale))
             reward_vecs.append(reward_vec)
-            dist_inputs_list.append(dist_inputs)
+            dist_inputs_list.append(np.asarray(net_out, dtype=np.float32).reshape(-1))
 
-            # Collect data to send to Learner
-            obs_flat = _flatten_obs_array(obs)  # flatten to shape needed by memory buffer
-            current_packet = np.concatenate((
-                action,
-                np.array([reward], dtype=np.float32),
-                obs_flat,
-                np.array([logp], dtype=np.float32),
-                net_out.astype(np.float32),
-            )).astype(np.float32)
+            # Collect data to send to the learner according to the selected
+            # algorithm's shared-memory rollout schema.
+            obs_flat = _flatten_obs_array(obs)
+            rollout_fields = {
+                "action": action,
+                "reward": np.array([reward], dtype=np.float32),
+                "next_obs": obs_flat,
+            }
+
+            if self.episode_shm_properties["HAS_ACTION_LOGP"]:
+                rollout_fields["action_logp"] = np.array(
+                    [0.0 if logp is None else logp], dtype=np.float32
+                )
+
+            if self.episode_shm_properties["HAS_ACTION_DIST_INPUTS"]:
+                rollout_fields["action_dist_inputs"] = net_out.astype(np.float32)
+
+            current_packet = build_rollout_row(
+                self.episode_shm_properties, rollout_fields
+            )
 
             # Write data into the buffer
-            self._write_fragment(current_packet, is_initial_state=False, buffer_type='actor')
+            try:
+                self._write_fragment(current_packet, is_initial_state=False, buffer_type='actor')
+            except Exception as e:
+                self.logger.debug(f"Minion: Failed to write fragment to actor buffer: {e}")
+                raise RuntimeError(f"Failed to write fragment to actor buffer: {e}")
 
             # Send training results to be logged in the GUI
             msg = {
                 "topic": "engine",
                 "current imep": float(info["current imep"]),
                 "mprr": float(info["mprr"]),
-                "target": float(obs[2])
+                "target": float(obs[4])
             }
 
             # Send message to GUI (if enabled)
@@ -970,7 +1044,6 @@ class Minion:
                 except Exception as e:
                     self.logger.debug(f"Minion (train_and_eval_sequence): {e}")
 
-            # self.logger.debug(f"Minion (train_and_eval_sequence): sent to GUI.")
         
         # Compute performance metrics
         try:
@@ -989,7 +1062,7 @@ class Minion:
         dist_inputs_list_eval = []
 
         for i in range(eval_rollouts):
-            obs, action, reward, reward_vec, _, _, _, _, dist_inputs, info = (
+            obs, action, reward, reward_vec, _, _, _, net_out, _, info = (
                 self.collect_rollout(initial_obs=obs, deterministic=True))
 
             # Gather data for performance metrics
@@ -997,16 +1070,15 @@ class Minion:
             rewards_adjusted_eval.append(self._scale_reward(reward))
             sigmas_eval.append(np.sqrt(self.current_reward_scale))
             reward_vecs_eval.append(reward_vec)
-            dist_inputs_list_eval.append(dist_inputs)
+            dist_inputs_list_eval.append(np.asarray(net_out, dtype=np.float32).reshape(-1))
 
             # send evaluation results to be logged in the GUI
             msg = {
                 "topic": "evaluation",
                 "current imep": float(info["current imep"]),
                 "mprr": float(info["mprr"]),
-                "target": float(obs[2])
+                "target": float(obs[4])
             }
-            # self.logger.debug(f"Minion (train_and_eval_sequence): eval msg: {msg}.")
             if self.pub is not None:
                 self.pub.send_json(msg)
         
@@ -1050,7 +1122,7 @@ class Minion:
         """
         Helper function to compute performance metrics from rollouts.
         """
-        return pd.DataFrame([{
+        metrics = {
             "return_raw": np.sum(rewards_raw),
             "return_adjusted": np.sum(rewards_adjusted),
             "reward_raw_mean": np.mean(rewards_raw),
@@ -1077,11 +1149,10 @@ class Minion:
             "filter_interference_std": np.std(reward_vecs[:, 2]),
             "filter_interference_min": np.min(reward_vecs[:, 2]),
             "filter_interference_max": np.max(reward_vecs[:, 2]),
-            "dist_inputs[0]_mean": np.mean(dist_inputs_vecs[:, 0]),
-            "dist_inputs[1]_mean": np.mean(dist_inputs_vecs[:, 1]),
-            "dist_inputs[2]_mean": np.mean(dist_inputs_vecs[:, 2]),
-            "dist_inputs[3]_mean": np.mean(dist_inputs_vecs[:, 3]),
-        }])
+        }
+        for idx in range(dist_inputs_vecs.shape[1]):
+            metrics[f"dist_inputs[{idx}]_mean"] = np.mean(dist_inputs_vecs[:, idx])
+        return pd.DataFrame([metrics])
 
 
 def main(policy_shm_name: str,
@@ -1161,7 +1232,7 @@ def main(policy_shm_name: str,
             try:
                 train_rollouts_df, eval_rollouts_df = actor.train_and_eval_sequence(
                     train_batches=1,
-                    eval_rollouts=10,
+                    eval_rollouts=2,
                 )
             except Exception as e:
                 actor.logger.debug(f"Minion: Failed to perform train and eval sequence: {e}")

@@ -57,7 +57,8 @@ def update_config(cfg, args):
 
             # Generic algorithm hyperparams
             train_batch_size_per_learner=256,
-            gamma=0.995,
+            # training_intensity=256.0,
+            gamma=0.95,
             n_step=1,
             grad_clip=10.0,
 
@@ -65,17 +66,12 @@ def update_config(cfg, args):
             initial_alpha=0.1,
             target_entropy=-2.0,
             alpha_lr=1e-4,
-            actor_lr=1e-4,
-            critic_lr=3e-5,
+            actor_lr=2e-5,
+            critic_lr=2e-5,
             tau=5e-3,
             replay_buffer_config={
-                "type": "PrioritizedEpisodeReplayBuffer",
-                # Size of the replay buffer. Note that if async_updates is set,
-                # then each worker will have a replay buffer of this size.
-                "capacity": int(1e6),
-                "alpha": 0.0,
-                # Beta parameter for sampling from prioritized replay buffer.
-                "beta": 0.4,
+                "type": "EpisodeReplayBuffer",
+                "capacity": int(1e4),
             },
             # learner_class=SACTorchLearnerWithRBS,
         )
@@ -101,6 +97,110 @@ def get_rllib_module_spec(cfg) -> dict:
         "q_model_config": qmc,
         "twin_q": bool(getattr(cfg, "twin_q", True)),
     }
+
+
+def _get_buffer_action_dim(action_space, action_adapter) -> int:
+    if action_adapter.mode == "continuous":
+        return int(action_space.shape[0])
+    if action_adapter.mode == "discrete1":
+        return 1
+    if action_adapter.mode == "multidiscrete":
+        return len(action_adapter.nvec)
+    raise NotImplementedError(
+        f"Unsupported action adapter mode {action_adapter.mode}"
+    )
+
+
+def _build_actor_episode_buffer_spec(
+    *,
+    algorithm: str,
+    state_dim: int,
+    action_dim: int,
+    action_dist_inputs_dim: int,
+    include_action_logp: bool,
+    policy_output_kind: str,
+    batch_size: int,
+    num_slots: int,
+    name: str,
+) -> dict:
+    bytes_per_float = 4
+    field_order = ["action", "reward", "next_obs"]
+    field_dims = {
+        "action": action_dim,
+        "reward": 1,
+        "next_obs": state_dim,
+    }
+    if include_action_logp:
+        field_order.append("action_logp")
+        field_dims["action_logp"] = 1
+    if action_dist_inputs_dim > 0:
+        field_order.append("action_dist_inputs")
+        field_dims["action_dist_inputs"] = action_dist_inputs_dim
+
+    elements_per_rollout = sum(field_dims[field] for field in field_order)
+    payload_size = elements_per_rollout * batch_size + state_dim
+    header_size = 2
+    header_slot_size = 1
+    slot_size = header_slot_size + payload_size
+    total_size = header_size + num_slots * slot_size
+
+    return {
+        "algorithm": algorithm,
+        "policy_output_kind": policy_output_kind,
+        "BATCH_SIZE": batch_size,
+        "NUM_SLOTS": num_slots,
+        "ELEMENTS_PER_ROLLOUT": elements_per_rollout,
+        "BYTES_PER_ROLLOUT": elements_per_rollout * bytes_per_float,
+        "PAYLOAD_SIZE": payload_size,
+        "HEADER_SIZE": header_size,
+        "HEADER_SLOT_SIZE": header_slot_size,
+        "SLOT_SIZE": slot_size,
+        "TOTAL_SIZE": total_size,
+        "TOTAL_SIZE_BYTES": total_size * bytes_per_float,
+        "BYTES_PER_FLOAT": bytes_per_float,
+        "name": name,
+        "STATE_ACTION_DIMS": {
+            "action": action_dim,
+            "reward": 1,
+            "state": state_dim,
+        },
+        "ROLLOUT_FIELD_ORDER": field_order,
+        "ROLLOUT_FIELD_DIMS": field_dims,
+        "HAS_ACTION_LOGP": include_action_logp,
+        "HAS_ACTION_DIST_INPUTS": action_dist_inputs_dim > 0,
+        "action_dist_size": action_dist_inputs_dim,
+    }
+
+
+def get_actor_episode_buffer_spec(
+    *,
+    state_dim: int,
+    action_space,
+    action_adapter,
+    batch_size: int = 32,
+    num_slots: int = 8,
+    name: str = "episodes",
+) -> dict:
+    """Return the SAC-specific shared-memory actor rollout schema."""
+    action_dim = _get_buffer_action_dim(action_space, action_adapter)
+    if action_adapter.mode == "continuous":
+        action_dist_inputs_dim = 2 * int(action_space.shape[0])
+        policy_output_kind = "gaussian"
+    else:
+        action_dist_inputs_dim = int(sum(action_adapter.nvec))
+        policy_output_kind = "categorical"
+
+    return _build_actor_episode_buffer_spec(
+        algorithm="SAC",
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_dist_inputs_dim=action_dist_inputs_dim,
+        include_action_logp=True,
+        policy_output_kind=policy_output_kind,
+        batch_size=batch_size,
+        num_slots=num_slots,
+        name=name,
+    )
 
 
 class SACTorchLearnerWithRBS(SACTorchLearner):

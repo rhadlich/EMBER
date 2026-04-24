@@ -9,7 +9,8 @@ from ray.rllib.models.torch.torch_distributions import (
     TorchCategorical,
     TorchMultiCategorical,
     TorchDiagGaussian,
-    TorchSquashedGaussian
+    TorchSquashedGaussian,
+    TorchDeterministic,
 )
 from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
 from ray.rllib.models.distributions import Distribution
@@ -174,6 +175,9 @@ class ActionAdapter:
         elif self.action_dist_cls == TorchSquashedGaussian:
             # squashed gaussian already squashes to the env range
             return action
+        elif self.action_dist_cls == TorchDeterministic:
+            # deterministic policy (TD3): tanh output is already in [-1, 1]
+            return torch.clamp(action, min=-1.0, max=1.0)
         else:
             raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
@@ -191,6 +195,8 @@ class ActionAdapter:
             return ((action + 1.0) / 2) * (self.high - self.low) + self.low
         elif self.action_dist_cls == TorchSquashedGaussian:
             return action
+        elif self.action_dist_cls == TorchDeterministic:
+            return np.clip(((action + 1.0) / 2) * (self.high - self.low) + self.low, self.low, self.high)
         else:
             raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
@@ -255,9 +261,16 @@ class ActionAdapter:
                 if net_out.size == 2 * self.act_dim:
                     mu = net_out[:self.act_dim]
                     log_sigma = net_out[self.act_dim:]
+                elif net_out.size == self.act_dim:
+                    # Deterministic policy (e.g. TD3): output is the action
+                    # directly, no log-std component.
+                    act = np.clip(net_out, -1.0, 1.0).astype(np.float32)
+                    logp = 0.0
+                    dist_inputs = act.copy()
+                    return act, logp, dist_inputs
                 else:
                     raise NotImplementedError(f"Unexpected net_out size {net_out.size}; "
-                                              f"expected {2 * self.act_dim} for action_dim={self.act_dim}")
+                                              f"expected {2 * self.act_dim} or {self.act_dim} for action_dim={self.act_dim}")
             dist_inputs = np.concatenate([mu, log_sigma], axis=-1).astype(np.float32)
             if deterministic:
                 act = ((mu + 1.0) / 2.0) * (self.high - self.low) + self.low
@@ -291,6 +304,34 @@ class ActionAdapter:
         # self.log.debug(
         #     f"ActionAdapter (sample_from_policy): outputs are: act={act}, logp={logp}, dist_inputs={dist_inputs}.")
         return act.astype(np.float32), logp, dist_inputs
+
+
+def get_rollout_field_slices(shm_properties: dict) -> dict[str, slice]:
+    """Return per-field slices for one rollout row."""
+    start = 0
+    slices = {}
+    for field in shm_properties["ROLLOUT_FIELD_ORDER"]:
+        field_size = shm_properties["ROLLOUT_FIELD_DIMS"][field]
+        slices[field] = slice(start, start + field_size)
+        start += field_size
+    return slices
+
+
+def build_rollout_row(shm_properties: dict, field_values: dict[str, Union[float, np.ndarray]]) -> np.ndarray:
+    """Serialize one rollout row according to the configured schema."""
+    row = np.zeros(shm_properties["ELEMENTS_PER_ROLLOUT"], dtype=np.float32)
+    field_slices = get_rollout_field_slices(shm_properties)
+    for field in shm_properties["ROLLOUT_FIELD_ORDER"]:
+        if field not in field_values:
+            raise KeyError(f"Missing rollout field {field}")
+        value = np.asarray(field_values[field], dtype=np.float32).reshape(-1)
+        expected = shm_properties["ROLLOUT_FIELD_DIMS"][field]
+        if value.size != expected:
+            raise ValueError(
+                f"Field {field} expected size {expected}, got {value.size}"
+            )
+        row[field_slices[field]] = value
+    return row
 
 
 class TimingRecorder:

@@ -54,7 +54,7 @@ from utils.shared_memory_utils import (
     set_indices,
     flatten_obs_onehot
 )
-from utils.utils import ActionAdapter
+from utils.utils import ActionAdapter, get_rollout_field_slices
 
 import logging
 import utils.logging_setup as logging_setup
@@ -178,6 +178,21 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         self.action_dist_cls = self.module.get_inference_action_dist_cls()
         self.logger.debug(f"EnvRunner: action_dist_cls -> {self.action_dist_cls}")
 
+        self.logger.debug(f"EnvRunner: config type -> {type(self.config)}")
+        self.logger.debug(f"EnvRunner: module_spec -> {module_spec}")
+        self.logger.debug(f"EnvRunner: module_spec.module_class -> {getattr(module_spec, 'module_class', None)}")
+        self.logger.debug(f"EnvRunner: built module type -> {type(self.module)}")
+        self.logger.debug(f"EnvRunner: built module dist cls -> {self.module.get_inference_action_dist_cls()}")
+        try:
+            dummy = torch.randn(1, *self.config.observation_space.shape)
+            out = self.module.forward_inference({"obs": dummy})
+            self.logger.debug(
+                f"EnvRunner: forward_inference ACTION_DIST_INPUTS shape -> "
+                f"{out[Columns.ACTION_DIST_INPUTS].shape}"
+            )
+        except Exception as e:
+            self.logger.debug(f"EnvRunner: forward_inference probe failed: {e}")
+
         # check if observation and action spaces are discrete
         self.obs_is_discrete = self.config.env_config["obs_is_discrete"]
         self.action_adapter = ActionAdapter(self.config.action_space, action_dist_cls=self.action_dist_cls)
@@ -217,6 +232,11 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             self.TOTAL_SIZE = self.config.env_config["ep_shm_properties"]["TOTAL_SIZE"]
             self.TOTAL_SIZE_BYTES = self.config.env_config["ep_shm_properties"]["TOTAL_SIZE_BYTES"]
             self.STATE_ACTION_DIMS = self.config.env_config["ep_shm_properties"]["STATE_ACTION_DIMS"]
+            self.ROLLOUT_FIELD_ORDER = self.config.env_config["ep_shm_properties"]["ROLLOUT_FIELD_ORDER"]
+            self.ROLLOUT_FIELD_DIMS = self.config.env_config["ep_shm_properties"]["ROLLOUT_FIELD_DIMS"]
+            self.rollout_field_slices = get_rollout_field_slices(
+                self.config.env_config["ep_shm_properties"]
+            )
             self.BYTES_PER_FLOAT = self.config.env_config["ep_shm_properties"]["BYTES_PER_FLOAT"]
             self.action_dist_size = self.config.env_config["ep_shm_properties"]["action_dist_size"]
             self.episode_shm = shared_memory.SharedMemory(
@@ -347,7 +367,13 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
             # self.logger.debug("EnvRunner (get_metrics): Cleared older stuff")
 
-            if not self.act_is_discrete:
+            if (
+                not self.act_is_discrete
+                and self.config.env_config["ep_shm_properties"]["policy_output_kind"]
+                == "gaussian"
+                and self.config.env_config["ep_shm_properties"]["HAS_ACTION_LOGP"]
+                and self.config.env_config["ep_shm_properties"]["HAS_ACTION_DIST_INPUTS"]
+            ):
                 dist_inputs = torch.as_tensor(
                     eps.get_extra_model_outputs(Columns.ACTION_DIST_INPUTS)
                 )  # shape [T, 2*k]
@@ -684,14 +710,14 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         │       └ same as rollout[0]                           │
         └──────────────────────────────────────────────────────┘
         """
-        # self.logger.debug("EnvRunner: In _read_batch().")
+        self.logger.debug("EnvRunner: In _read_batch().")
 
         # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
         while True:
             if self.f_buf[5] == 0:  # actor episode buffer lock flag
                 write_idx, read_idx = get_indices(self.ep_arr, self.f_buf, lock_index=5)
-                # self.logger.debug(f"EnvRunner(_read_batch): Started reading buffer. "
-                #                   f"Identified write_idx, read_idx: {write_idx}, {read_idx}.")
+                self.logger.debug(f"EnvRunner(_read_batch): Started reading buffer. "
+                                  f"Identified write_idx, read_idx: {write_idx}, {read_idx}.")
                 break
             else:
                 time.sleep(0.0001)
@@ -713,7 +739,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         else:
             num_batches = write_idx - read_idx
 
-        # self.logger.debug(f"EnvRunner(_read_batch): num_batches: {num_batches}. Going into batches loop.")
+        self.logger.debug(f"EnvRunner(_read_batch): num_batches: {num_batches}. Going into batches loop.")
 
         batches = []
         for i in range(num_batches):
@@ -749,35 +775,29 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                 else initial_state,
             )
 
-            # get start and end indices of each component of the payload
-            action_start = 0
-            action_end = self.STATE_ACTION_DIMS["action"]
-            reward_start = action_end
-            reward_end = reward_start + self.STATE_ACTION_DIMS["reward"]
-            obs_start = reward_end
-            obs_end = obs_start + self.STATE_ACTION_DIMS["state"]
-            logp_start = obs_end
-            logp_end = logp_start + self.STATE_ACTION_DIMS["logp"]
-            dist_start = logp_end
-            dist_end = dist_start + self.STATE_ACTION_DIMS["action_dist_size"]
-
             # add one rollout at a time (i.e. one row in payload)
             for j, rollout in enumerate(payload):
+                extra_model_outputs = {}
+                if self.config.env_config["ep_shm_properties"]["HAS_ACTION_LOGP"]:
+                    extra_model_outputs[Columns.ACTION_LOGP] = np.squeeze(
+                        rollout[self.rollout_field_slices["action_logp"]]
+                    )
+                if self.config.env_config["ep_shm_properties"]["HAS_ACTION_DIST_INPUTS"]:
+                    extra_model_outputs[Columns.ACTION_DIST_INPUTS] = rollout[
+                        self.rollout_field_slices["action_dist_inputs"]
+                    ]
                 batch.add_env_step(
-                    action=rollout[action_start:action_end],
-                    reward=np.squeeze(rollout[reward_start:reward_end]),
+                    action=rollout[self.rollout_field_slices["action"]],
+                    reward=np.squeeze(rollout[self.rollout_field_slices["reward"]]),
                     # observation !AFTER! taking "action"
                     observation=(
-                        flatten_obs_onehot(_decode_obs(rollout[obs_start:obs_end]),
+                        flatten_obs_onehot(_decode_obs(rollout[self.rollout_field_slices["next_obs"]]),
                                            self.imep_space, self.mprr_space) if self.obs_is_discrete
-                        else rollout[obs_start:obs_end]
+                        else rollout[self.rollout_field_slices["next_obs"]]
                     ),
                     terminated=bool(terminateds[j]),
                     truncated=bool(truncateds[j]),
-                    extra_model_outputs={
-                        Columns.ACTION_LOGP: np.squeeze(rollout[logp_start:logp_end]),
-                        Columns.ACTION_DIST_INPUTS: rollout[dist_start:dist_end],
-                    }
+                    extra_model_outputs=extra_model_outputs,
                 )
 
             # append to list of batches to pass to learner
@@ -786,7 +806,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
             # Advance read_idx
             read_idx = (read_idx + 1) % self.NUM_SLOTS
 
-        # self.logger.debug("EnvRunner(_read_batch): Done logging batches.")
+        self.logger.debug("EnvRunner(_read_batch): Done logging batches.")
 
         # commit new indices and unlock episode buffer (unlocking happens inside set_indices)
         set_indices(self.ep_arr, read_idx, 'r', self.f_buf, lock_index=5)

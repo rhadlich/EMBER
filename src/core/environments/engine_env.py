@@ -190,17 +190,6 @@ class EngineEnvContinuous(gym.Env):
                  reward: RewardFn = None,
                  ):
 
-        if observation_space is not None:
-            self.observation_space = observation_space
-        else:
-            self.imep_lims = [1.6, 4.1]
-            self.mprr_lims = [1, 15]
-            self.observation_space = spaces.Box(
-                low=np.array([self.imep_lims[0], self.imep_lims[0], self.imep_lims[0]], dtype=np.float32),
-                high=np.array([self.imep_lims[1], self.imep_lims[1], self.imep_lims[1]], dtype=np.float32),
-                dtype=np.float32
-            )
-
         if action_space is not None:
             self.action_space = action_space
         else:
@@ -210,6 +199,31 @@ class EngineEnvContinuous(gym.Env):
             self.action_space = spaces.Box(
                 low=np.array([self.soi_lims[0], self.inj_d_lims[0]], dtype=np.float32),
                 high=np.array([self.soi_lims[1], self.inj_d_lims[1]], dtype=np.float32),
+            )
+        
+        if observation_space is not None:
+            self.observation_space = observation_space
+        else:
+            self.imep_lims = [1.6, 4.1]
+            self.mprr_lims = [1, 15]
+            self.observation_space = spaces.Box(
+                low=np.array([
+                    self.soi_lims[0],
+                    self.inj_d_lims[0],
+                    self.imep_lims[0],
+                    self.imep_lims[0],
+                    self.imep_lims[0]],
+                    dtype=np.float32
+                    ),
+                high=np.array([
+                    self.soi_lims[1],
+                    self.inj_d_lims[1],
+                    self.imep_lims[1],
+                    self.imep_lims[1],
+                    self.imep_lims[1]],
+                    dtype=np.float32
+                    ),
+                dtype=np.float32
             )
 
         self.reward = reward
@@ -297,7 +311,8 @@ class EngineEnvContinuous(gym.Env):
 
 
 def reward_fn(inputs):
-    load_tracking = (inputs["current imep"] - inputs["target"])**2 * -5.0
+    load_tracking = np.abs(inputs["current imep"] - inputs["target"]) * -5.0
+    # load_tracking += np.int16((np.abs(inputs["current imep"] - inputs["target"]) - 0.05*inputs["target"]) < 0.0) * 4.0
     safety = (max(0, inputs["mprr"]-7)**2) * -0.0
     filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -0.0
     return np.array([load_tracking, safety, filter_interference])
