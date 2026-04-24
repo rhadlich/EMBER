@@ -8,3 +8,4 @@ migrate_repo.py
 *.pt
 *.json
 **/__pycache__/
+.cursor/
