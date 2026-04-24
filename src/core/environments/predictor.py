@@ -6,7 +6,12 @@ from core.environments.define_models import MLP
 
 class Predictor:
     def __init__(self) -> None:
-        self.device = torch.device('cpu')
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
         # info for data normalization
         self.mean = np.array([6.5101062e+02, -7.2337663e-01, 4.4961038e-01])
@@ -47,7 +52,7 @@ class Predictor:
                    out_size: int,
                    dropout: float,
                    weights_path: str):
-        # create model and load weights
+        # create model and load weights/checkpoint
         self.model = MLP(
             input_dim=input_size,
             output_dim=out_size,
@@ -56,14 +61,15 @@ class Predictor:
             dropout=dropout,
         )
         self.model = self.model.to(self.device)
-        # self.model = torch.compile(self.model, mode="max-autotune")
-        self.model.load_state_dict(torch.load(weights_path))
+        checkpoint = torch.load(weights_path, map_location=self.device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
     def format_data(self, data):
         data = (data - self.mean) / self.std
         data = np.float32(data)
-        data = torch.tensor(data)
+        data = torch.tensor(data, device=self.device)
         return data
 
     def model_predict(self, values, *, noise_in_percent=None):
