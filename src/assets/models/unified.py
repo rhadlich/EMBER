@@ -300,7 +300,7 @@ def main(
             )
 
         # save model weights
-        filename_model = output_dir / f"model_weights_{node_type}.pth"
+        filename_model = output_dir / f"model_weights_{node_type}_new.pth"
         if rank == 0:
             base_model = model.module if distributed else model
             torch.save(
