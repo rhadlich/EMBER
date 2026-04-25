@@ -18,17 +18,19 @@ import sys
 
 from gymnasium import spaces
 from core.environments.engine_env import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
+from core.environments.throughput_env import ThroughputEngineEnvContinuous
 
 from env_runner import SharedMemoryEnvRunner
 # from ray.rllib.utils.test_utils import (
 #     add_rllib_example_script_args,
 #     run_rllib_example_script_experiment,
 # )
-from ray.tune.registry import get_trainable_cls
+from ray.tune.registry import get_trainable_cls, register_env
 from ray.rllib.core.rl_module import RLModuleSpec
 
 from configs.args import get_full_parser
 from run_algorithm import run_rllib_shared_memory
+from run_algorithm_throughput import run_rllib_throughput
 
 from utils.utils import ActionAdapter
 from core.rl_modules.impala_rl_modules import ImpalaMlpModule
@@ -60,6 +62,16 @@ parser.add_argument(
     default="flag",
     help="Name of flag shm to use",
 )
+parser.add_argument(
+    "--runtime-profile",
+    type=str,
+    default="realtime",
+    choices=["realtime", "throughput"],
+    help=(
+        "Execution profile. 'realtime' keeps the shared-memory/minion pipeline. "
+        "'throughput' uses standard RLlib sampling for intra-node cluster speed."
+    ),
+)
 
 
 def _get_buffer_action_dim(action_space, adapter) -> int:
@@ -70,6 +82,85 @@ def _get_buffer_action_dim(action_space, adapter) -> int:
     if adapter.mode == "multidiscrete":
         return len(adapter.nvec)
     raise NotImplementedError(f"Unsupported adapter mode {adapter.mode}")
+
+
+def _run_throughput_profile(args, logger) -> None:
+    """Run a non-realtime profile using RLlib-native sampling on Ray workers."""
+    if args.env_type.lower() != "continuous":
+        raise NotImplementedError(
+            "Throughput profile currently supports only env_type=continuous."
+        )
+
+    env = EngineEnvContinuous(reward=reward_fn)
+    obs_space = env.observation_space
+    action_space = env.action_space
+    adapter = ActionAdapter(action_space)
+
+    import importlib
+
+    try:
+        algo_cfg_mod = importlib.import_module(
+            f"configs.algorithms.{args.algo.lower()}_cfg"
+        )
+    except ModuleNotFoundError:
+        algo_cfg_mod = None
+
+    env_name = "engine_env_throughput_continuous"
+    register_env(
+        env_name,
+        lambda env_cfg: ThroughputEngineEnvContinuous(env_cfg),
+    )
+
+    env_config = {
+        "env_type": args.env_type.lower(),
+    }
+    if getattr(args, "seed", None) is not None:
+        base_seed = int(args.seed)
+        env_config["global_seed"] = base_seed
+        env_config["env_seed"] = base_seed + 1
+
+    base_config = (
+        get_trainable_cls(args.algo)
+        .get_default_config()
+        .api_stack(
+            enable_rl_module_and_learner=True,
+            enable_env_runner_and_connector_v2=True,
+        )
+        .environment(
+            env=env_name,
+            env_config=env_config,
+            observation_space=obs_space,
+            action_space=action_space,
+            normalize_actions=(True if adapter.mode == "continuous" else False),
+            clip_actions=(True if adapter.mode == "continuous" else False),
+            clip_rewards=False,
+        )
+        .debugging(seed=getattr(args, "seed", None))
+    )
+
+    # Respect explicit user overrides, but let throughput runner autoscale if unset.
+    base_config = base_config.env_runners(
+        num_env_runners=args.num_env_runners,
+        num_cpus_per_env_runner=args.num_cpus_per_env_runner,
+        create_local_env_runner=False,
+        create_env_on_local_worker=False,
+    )
+    if args.num_learners is not None:
+        base_config = base_config.learners(num_learners=args.num_learners)
+    if args.num_cpus_per_learner is not None:
+        base_config = base_config.learners(
+            num_cpus_per_learner=args.num_cpus_per_learner
+        )
+    if args.num_gpus_per_learner is not None:
+        base_config = base_config.learners(
+            num_gpus_per_learner=args.num_gpus_per_learner
+        )
+
+    if algo_cfg_mod is not None and hasattr(algo_cfg_mod, "update_config"):
+        base_config = algo_cfg_mod.update_config(base_config, args)
+
+    logger.info("Running throughput profile (RLlib-native sampling).")
+    run_rllib_throughput(base_config, args)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -99,6 +190,14 @@ if __name__ == "__main__":
         cmd = [sys.executable, rlapp_path, "--subscriber-only"]
         subprocess.Popen(cmd)
         logger.info("Spawned GUI in subscriber-only mode")
+
+    if args.runtime_profile == "throughput":
+        if getattr(args, "gui", False):
+            logger.warning(
+                "GUI/ZMQ telemetry is not used in throughput profile; training will continue."
+            )
+        _run_throughput_profile(args, logger)
+        sys.exit(0)
 
     # make environment to have access to observation and action spaces
     if args.env_type.lower() == 'continuous':
