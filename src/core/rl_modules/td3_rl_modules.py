@@ -88,7 +88,13 @@ class TD3TorchRLModule(DefaultSACTorchRLModule):
     def _forward_inference(self, batch: Dict) -> Dict[str, Any]:
         pi_encoder_outs = self.pi_encoder(batch)
         action = self.pi(pi_encoder_outs[ENCODER_OUT])
-        return {Columns.ACTION_DIST_INPUTS: action}
+        # Provide direct actions for connector-v2 sampling paths.
+        # Keeping ACTION_DIST_INPUTS preserves compatibility with existing
+        # realtime/minion code that reads model outputs as raw policy inputs.
+        return {
+            Columns.ACTIONS: action,
+            Columns.ACTION_DIST_INPUTS: action,
+        }
 
     @override(RLModule)
     def _forward_exploration(self, batch: Dict, **kwargs) -> Dict[str, Any]:

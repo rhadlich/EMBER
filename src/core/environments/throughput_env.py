@@ -21,6 +21,8 @@ class ThroughputEngineEnvContinuous(gym.Env):
     def __init__(self, config=None):
         super().__init__()
         config = config or {}
+        self._episode_step = 0
+        self._max_episode_steps = int(config.get("max_episode_steps", 32))
 
         self._env = EngineEnvContinuous(reward=reward_fn)
         self.action_space = self._env.action_space
@@ -47,6 +49,7 @@ class ThroughputEngineEnvContinuous(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         obs_scalar, info = self._env.reset(seed=seed, options=options)
+        self._episode_step = 0
         self._current_target = float(self._target_gen.current())
         self._env._desired_imep = self._current_target
         self._last_action = np.array(
@@ -71,6 +74,7 @@ class ThroughputEngineEnvContinuous(gym.Env):
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         action = np.clip(action, self.action_space.low, self.action_space.high)
+        self._episode_step += 1
 
         prev_target = float(self._current_target)
         self._current_target = float(self._target_gen.next())
@@ -96,5 +100,5 @@ class ThroughputEngineEnvContinuous(gym.Env):
         )
 
         terminated = False
-        truncated = False
+        truncated = self._episode_step >= self._max_episode_steps
         return obs, float(reward), terminated, truncated, info

@@ -91,6 +91,27 @@ def _run_throughput_profile(args, logger) -> None:
             "Throughput profile currently supports only env_type=continuous."
         )
 
+    # The parser defaults are tuned for realtime and intentionally conservative.
+    # In throughput mode, treat these as "unset" unless the user explicitly passed
+    # the CLI flag, allowing autoscaling to use node capacity.
+    cli_args = set(sys.argv[1:])
+
+    def _flag_present(flag: str) -> bool:
+        return any(a == flag or a.startswith(f"{flag}=") for a in cli_args)
+
+    if not _flag_present("--num-cpus"):
+        args.num_cpus = 0
+    if not _flag_present("--num-env-runners"):
+        args.num_env_runners = None
+    if not _flag_present("--num-cpus-per-env-runner"):
+        args.num_cpus_per_env_runner = None
+    if not _flag_present("--num-learners"):
+        args.num_learners = None
+    if not _flag_present("--num-cpus-per-learner"):
+        args.num_cpus_per_learner = None
+    if not _flag_present("--num-gpus-per-learner"):
+        args.num_gpus_per_learner = None
+
     env = EngineEnvContinuous(reward=reward_fn)
     obs_space = env.observation_space
     action_space = env.action_space
@@ -113,6 +134,7 @@ def _run_throughput_profile(args, logger) -> None:
 
     env_config = {
         "env_type": args.env_type.lower(),
+        "max_episode_steps": 32,
     }
     if getattr(args, "seed", None) is not None:
         base_seed = int(args.seed)
