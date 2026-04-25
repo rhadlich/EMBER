@@ -84,6 +84,48 @@ def custom_args(
         "this is identical to the batch size for (inference) action computations.",
     )
     parser.add_argument(
+        "--throughput-max-episode-steps",
+        type=int,
+        default=32,
+        help="Episode horizon used by throughput profile environment.",
+    )
+    parser.add_argument(
+        "--throughput-rollout-fragment-length",
+        type=int,
+        default=None,
+        help="Sampling fragment length per EnvRunner (throughput profile).",
+    )
+    parser.add_argument(
+        "--throughput-train-batch-size-per-learner",
+        type=int,
+        default=None,
+        help="Learner train batch size per update (throughput profile).",
+    )
+    parser.add_argument(
+        "--throughput-num-steps-sampled-before-learning-starts",
+        type=int,
+        default=None,
+        help="Warmup sampled steps before learning starts (throughput profile).",
+    )
+    parser.add_argument(
+        "--throughput-min-sample-timesteps-per-iteration",
+        type=int,
+        default=None,
+        help="Minimum env steps sampled before train() returns (throughput profile).",
+    )
+    parser.add_argument(
+        "--throughput-min-train-timesteps-per-iteration",
+        type=int,
+        default=None,
+        help="Minimum train timesteps before train() returns (throughput profile).",
+    )
+    parser.add_argument(
+        "--throughput-training-intensity",
+        type=float,
+        default=None,
+        help="Replay ratio target (train/sampled timesteps) in throughput profile.",
+    )
+    parser.add_argument(
         "--num-agents",
         type=int,
         default=0,

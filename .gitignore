@@ -9,3 +9,4 @@ migrate_repo.py
 *.json
 **/__pycache__/
 .cursor/
+scripts/

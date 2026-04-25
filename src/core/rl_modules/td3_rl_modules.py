@@ -71,6 +71,7 @@ class TD3TorchRLModule(DefaultSACTorchRLModule):
         if catalog_class is None:
             catalog_class = TD3Catalog
         super().__init__(*args, **kwargs, catalog_class=catalog_class)
+        self._throughput_explore_steps = 0
 
         try:
             print("TD3TorchRLModule built type:", type(self))
@@ -78,6 +79,12 @@ class TD3TorchRLModule(DefaultSACTorchRLModule):
             print("TD3TorchRLModule catalog attr:", type(getattr(self, "catalog", None)))
         except Exception as e:
             print("TD3TorchRLModule post-init probe failed:", e)
+
+    def _model_cfg(self, key: str, default):
+        cfg = getattr(self, "model_config", None)
+        if isinstance(cfg, dict):
+            return cfg.get(key, default)
+        return getattr(cfg, key, default) if cfg is not None else default
 
 
     # ------------------------------------------------------------------
@@ -98,7 +105,50 @@ class TD3TorchRLModule(DefaultSACTorchRLModule):
 
     @override(RLModule)
     def _forward_exploration(self, batch: Dict, **kwargs) -> Dict[str, Any]:
-        return self._forward_inference(batch)
+        out = self._forward_inference(batch)
+        if not bool(self._model_cfg("throughput_apply_exploration_noise", False)):
+            return out
+
+        action = out[Columns.ACTIONS]
+        if self._throughput_explore_steps < int(
+            self._model_cfg("throughput_initial_steps", 0)
+        ):
+            noisy_action = torch.rand_like(action) * 2.0 - 1.0
+        else:
+            exploration_noise = float(
+                self._model_cfg("throughput_exploration_noise", 0.1)
+            )
+            initial_std = float(self._model_cfg("throughput_initial_std", 0.5))
+            decay_schedule = str(
+                self._model_cfg("throughput_noise_decay_schedule", "linear")
+            )
+            steps_since_random = max(
+                self._throughput_explore_steps
+                - int(self._model_cfg("throughput_initial_steps", 0)),
+                0,
+            )
+            if decay_schedule == "linear":
+                linear_decay_steps = max(
+                    1, int(self._model_cfg("throughput_linear_decay_steps", 100000))
+                )
+                progress = min(1.0, steps_since_random / float(linear_decay_steps))
+                current_std = initial_std + progress * (exploration_noise - initial_std)
+            else:
+                noise_decay_k = float(
+                    self._model_cfg("throughput_noise_decay_k", 1e-5)
+                )
+                current_std = exploration_noise + (
+                    (initial_std - exploration_noise)
+                    / (1.0 + noise_decay_k * steps_since_random)
+                )
+            noisy_action = torch.clamp(
+                action + torch.randn_like(action) * current_std, -1.0, 1.0
+            )
+
+        self._throughput_explore_steps += action.shape[0]
+        out[Columns.ACTIONS] = noisy_action
+        out[Columns.ACTION_DIST_INPUTS] = noisy_action
+        return out
 
     # ------------------------------------------------------------------
     # Training forward pass

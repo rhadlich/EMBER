@@ -134,7 +134,7 @@ def _run_throughput_profile(args, logger) -> None:
 
     env_config = {
         "env_type": args.env_type.lower(),
-        "max_episode_steps": 32,
+        "max_episode_steps": int(getattr(args, "throughput_max_episode_steps", 32)),
     }
     if getattr(args, "seed", None) is not None:
         base_seed = int(args.seed)
@@ -159,6 +159,33 @@ def _run_throughput_profile(args, logger) -> None:
         )
         .debugging(seed=getattr(args, "seed", None))
     )
+    base_config = base_config.rl_module(
+        model_config={
+            "throughput_apply_exploration_noise": True,
+            "throughput_exploration_noise": float(getattr(args, "exploration_noise", 0.1)),
+            "throughput_initial_steps": int(getattr(args, "initial_steps", 0)),
+            "throughput_initial_std": float(getattr(args, "initial_std", 0.5)),
+            "throughput_noise_decay_k": float(getattr(args, "noise_decay_k", 1e-5)),
+            "throughput_noise_decay_schedule": str(
+                getattr(args, "noise_decay_schedule", "linear")
+            ),
+            "throughput_linear_decay_steps": int(
+                getattr(args, "linear_decay_steps", 100000)
+            ),
+        }
+    )
+
+    throughput_env_runner_kwargs = {}
+    if getattr(args, "num_envs_per_env_runner", None) is not None:
+        throughput_env_runner_kwargs["num_envs_per_env_runner"] = int(
+            args.num_envs_per_env_runner
+        )
+    if getattr(args, "throughput_rollout_fragment_length", None) is not None:
+        throughput_env_runner_kwargs["rollout_fragment_length"] = int(
+            args.throughput_rollout_fragment_length
+        )
+    if throughput_env_runner_kwargs:
+        base_config = base_config.env_runners(**throughput_env_runner_kwargs)
 
     # Respect explicit user overrides, but let throughput runner autoscale if unset.
     base_config = base_config.env_runners(
@@ -180,6 +207,36 @@ def _run_throughput_profile(args, logger) -> None:
 
     if algo_cfg_mod is not None and hasattr(algo_cfg_mod, "update_config"):
         base_config = algo_cfg_mod.update_config(base_config, args)
+
+    # Apply throughput-specific manual overrides last so they always win over
+    # algorithm defaults from update_config().
+    throughput_training_kwargs = {}
+    if getattr(args, "throughput_train_batch_size_per_learner", None) is not None:
+        throughput_training_kwargs["train_batch_size_per_learner"] = int(
+            args.throughput_train_batch_size_per_learner
+        )
+    if getattr(args, "throughput_num_steps_sampled_before_learning_starts", None) is not None:
+        throughput_training_kwargs["num_steps_sampled_before_learning_starts"] = int(
+            args.throughput_num_steps_sampled_before_learning_starts
+        )
+    if getattr(args, "throughput_training_intensity", None) is not None:
+        throughput_training_kwargs["training_intensity"] = float(
+            args.throughput_training_intensity
+        )
+    if throughput_training_kwargs:
+        base_config = base_config.training(**throughput_training_kwargs)
+
+    throughput_reporting_kwargs = {}
+    if getattr(args, "throughput_min_sample_timesteps_per_iteration", None) is not None:
+        throughput_reporting_kwargs["min_sample_timesteps_per_iteration"] = int(
+            args.throughput_min_sample_timesteps_per_iteration
+        )
+    if getattr(args, "throughput_min_train_timesteps_per_iteration", None) is not None:
+        throughput_reporting_kwargs["min_train_timesteps_per_iteration"] = int(
+            args.throughput_min_train_timesteps_per_iteration
+        )
+    if throughput_reporting_kwargs:
+        base_config = base_config.reporting(**throughput_reporting_kwargs)
 
     logger.info("Running throughput profile (RLlib-native sampling).")
     run_rllib_throughput(base_config, args)
