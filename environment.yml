@@ -73,7 +73,10 @@ dependencies:
       - numba==0.60.0
       - numpy==2.0.2
       - onnx==1.17.0
-      - onnxruntime==1.19.2
+      # onnxruntime publishes manylinux/macOS wheels; HPC PyPI mirrors often lag PyPI.
+      # If install fails with "No matching distribution", align this pin with what
+      # `pip index versions onnxruntime` shows on that machine (your cluster listed up to 1.16.3).
+      - onnxruntime==1.16.3
       - opencensus==0.11.4
       - opencensus-context==0.1.3
       - packaging==25.0

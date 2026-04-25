@@ -14,11 +14,15 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.dropout = nn.Dropout(dropout)
         hidden_dim = int((2 ** hidden_exp) / (1-dropout))
-        layers = [nn.Linear(input_dim, hidden_dim), nn.SiLU()]
-        for _ in range(num_hidden):
-            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout)])
-        layers.append(nn.Linear(hidden_dim, output_dim))
-        self.network = nn.Sequential(*layers)
+        self.fc_in = nn.Linear(input_dim, hidden_dim)
+        self.fc_hidden = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
+        self.silu = nn.SiLU()
+        self.network = nn.Sequential(
+            self.fc_in, self.silu,
+            *[nn.Sequential(self.fc_hidden, self.silu, self.dropout) for _ in range(num_hidden)],
+            self.fc_out,
+        )
 
     def forward(self, x):
         return self.network(x)
