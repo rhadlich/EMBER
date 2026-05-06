@@ -20,8 +20,8 @@ def peek_shapes_hdf5(data_dir):
     except StopIteration as exc:
         raise FileNotFoundError(f"No .h5 files found in {data_dir}") from exc
     with h5.File(first_file, "r") as fin:
-        data_shape = fin['data'].shape
-        label_shape = fin['labels'].shape
+        data_shape = fin['features/data'].shape
+        label_shape = fin['labels/pressure'].shape
 
     return data_shape, label_shape
 
@@ -29,38 +29,92 @@ def peek_shapes_hdf5(data_dir):
 # Dataset class
 class GetDataset(Dataset):
 
+    def _scan_file_metadata(self):
+        row_counts = []
+        feature_dims = []
+        label_dims = []
+
+        for filename in self.all_files:
+            with h5.File(filename, "r") as fin:
+                data_shape = fin['features/data'].shape
+                label_shape = fin['labels/pressure'].shape
+                mean_shape = fin['normalization/feature_mean'].shape
+                std_shape = fin['normalization/feature_std'].shape
+
+            if len(data_shape) != 2:
+                raise ValueError(
+                    f"Expected row-major 2D features in {filename}, got shape {data_shape}"
+                )
+            if len(label_shape) != 2:
+                raise ValueError(
+                    f"Expected row-major 2D labels in {filename}, got shape {label_shape}"
+                )
+
+            n_rows_data, n_features = data_shape
+            n_rows_label, n_targets = label_shape
+            if n_rows_data != n_rows_label:
+                raise ValueError(
+                    f"Row mismatch in {filename}: features {data_shape} vs labels {label_shape}"
+                )
+
+            mean_size = int(np.prod(mean_shape))
+            std_size = int(np.prod(std_shape))
+            if mean_size != n_features:
+                raise ValueError(
+                    f"Normalization mean shape {mean_shape} does not match features "
+                    f"shape {data_shape} in {filename}"
+                )
+            if std_size != n_features:
+                raise ValueError(
+                    f"Normalization std shape {std_shape} does not match features "
+                    f"shape {data_shape} in {filename}"
+                )
+
+            row_counts.append(n_rows_data)
+            feature_dims.append(n_features)
+            label_dims.append(n_targets)
+
+        if not row_counts:
+            raise FileNotFoundError(f"No .h5 files found in {self.source}")
+
+        if len(set(feature_dims)) != 1:
+            raise ValueError(f"Inconsistent feature dims across files: {feature_dims}")
+        if len(set(label_dims)) != 1:
+            raise ValueError(f"Inconsistent label dims across files: {label_dims}")
+
+        self.row_counts = np.asarray(row_counts, dtype=np.int64)
+        self.row_offsets = np.zeros(len(self.row_counts) + 1, dtype=np.int64)
+        self.row_offsets[1:] = np.cumsum(self.row_counts)
+        self.total_rows = int(self.row_offsets[-1])
+        self.feature_dim = int(feature_dims[0])
+        self.label_dim = int(label_dims[0])
+
     def init_reader(self):
-        # shuffle
+        # shuffle files only, sample-level shuffle remains in DataLoader
         if self.shuffle:
             self.rng.shuffle(self.all_files)
 
-        # shard dataset
-        self.global_size = len(self.all_files)
+        self.files = self.all_files
+        self._scan_file_metadata()
+
+        # shard by sample rows (not files)
         if self.allow_uneven_distribution:
-            # covers dataset completely, some workers will have more examples than others
-
-            # deal with bulk of files
-            num_files_local = self.global_size // self.size
-            start_idx = self.rank * num_files_local
-            end_idx = start_idx + num_files_local
-            self.files = self.all_files[start_idx:end_idx]
-
-            # deal with remainder of files
-            for idx in range(self.size * num_files_local, self.global_size):
-                if idx % self.size == self.rank:
-                    self.files.append(self.all_files[idx])
+            # covers dataset completely, some workers can have 1 extra sample
+            self.local_start = (self.rank * self.total_rows) // self.size
+            self.local_end = ((self.rank + 1) * self.total_rows) // self.size
+            self.global_size = self.total_rows
         else:
-            # here every worker will get the same number of samples,
-            # potentially under-sampling the data
-            num_files_local = self.global_size // self.size
-            start_idx = self.rank * num_files_local
-            end_idx = start_idx + num_files_local
-            self.files = self.all_files[start_idx:end_idx]
-            self.global_size = self.size * len(self.files)
+            # equal rows per worker, potentially under-sampling tail rows
+            num_rows_local = self.total_rows // self.size
+            self.local_start = self.rank * num_rows_local
+            self.local_end = self.local_start + num_rows_local
+            self.global_size = self.size * num_rows_local
 
-        # number of files in this worker
-        self.local_size = len(self.files)
-        print(f'Number of files in rank {self.rank} is {self.local_size}')
+        self.local_size = self.local_end - self.local_start
+        print(
+            f"Rank {self.rank}: local rows [{self.local_start}, {self.local_end}) "
+            f"of total {self.total_rows}"
+        )
 
     def __init__(self,
                  source,
@@ -85,11 +139,9 @@ class GetDataset(Dataset):
         # init reader
         self.init_reader()
 
-        # get shapes of data and labels
-        filename = self.files[0]
-        with h5.File(filename, "r") as fin:
-            self.data_shape = fin['data'].shape
-            self.label_shape = fin["labels"].shape
+        # per-sample feature/label shapes
+        self.data_shape = (self.feature_dim,)
+        self.label_shape = (self.label_dim,)
 
         if rank == 0:
             print(f'Initialized dataset with {self.global_size} samples. World size is {size}')
@@ -103,20 +155,28 @@ class GetDataset(Dataset):
     def shapes(self):
         return self.data_shape, self.label_shape
 
+    def _resolve_global_index(self, idx):
+        global_idx = self.local_start + int(idx)
+        file_idx = int(np.searchsorted(self.row_offsets, global_idx, side='right') - 1)
+        row_idx = int(global_idx - self.row_offsets[file_idx])
+        return file_idx, row_idx
+
     def __getitem__(self, idx):
-        filename = self.files[idx]
+        if idx < 0 or idx >= self.local_size:
+            raise IndexError(f"Index {idx} out of range for local size {self.local_size}")
+
+        file_idx, row_idx = self._resolve_global_index(idx)
+        global_idx = self.local_start + int(idx)
+        filename = self.files[file_idx]
 
         # load data and project
         with h5.File(filename, "r") as f:
-            data = f['data'][...][:, 1:-1]  # order is phi, inj pressure, inj timing, inj duration, cov
-            label = f['labels'][...]
-            mean = f['mean'][...][1:-1]
-            std_dev = f['std'][...][1:-1]
+            data = f['features/data'][row_idx]
+            label = f['labels/pressure'][row_idx]
+            mean = f['normalization/feature_mean'][...].reshape(-1)
+            std_dev = f['normalization/feature_std'][...].reshape(-1)
 
         # pre-process
         data = (data - mean) / std_dev
 
-        data = np.squeeze(data)
-        label = np.squeeze(label)[1800:-1800]       # try to compute gross part of cycle instead
-
-        return data, label, filename, idx
+        return data, label, filename, global_idx

@@ -106,8 +106,12 @@ class MSEWithDp(nn.Module):
         diff = (target - output)**2
 
         # central finite difference to get dp and difference in dp
-        dp_hat = output[:, 2:] - output[:, :-2]
-        dp = target[:, 2:] - target[:, :-2]
+        # under the assumption of the entire pressur trace being present, limit the finite difference to the combustion portion of the trace
+        res = 720 / output.size(1)
+        start_ind = int( (360-90) / res)
+        end_ind = int( (360+130) / res)
+        dp_hat = output[:, start_ind+2:end_ind] - output[:, start_ind:end_ind-2]
+        dp = target[:, start_ind+2:end_ind] - target[:, start_ind:end_ind-2]
         diff_dp = (dp_hat - dp)**2
 
         if self.reduction == "mean":

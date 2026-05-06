@@ -9,10 +9,14 @@ def suggest_float(low, high, scale='linear'):
     if scale == 'linear':
         num = np.random.rand() * (high - low) + low
     elif scale == 'log':
-        num = 10 ** (np.random.uniform(low, high + 1))
+        if low <= 0 or high <= 0:
+            raise ValueError("Log scale sampling requires low > 0 and high > 0")
+        if low > high:
+            raise ValueError(f"Expected low <= high, got low={low}, high={high}")
+        num = np.exp(np.random.uniform(np.log(low), np.log(high)))
     else:
         raise ValueError('scale must be linear or log')
-    return num
+    return float(num)
 
 
 def suggest_int(low, high, step=1):
@@ -122,13 +126,15 @@ class HPOGeneral:
         for name, cfg in self.param_configs.items():
             t = cfg.get("type")
             if t == "float":
-                val = suggest_float(cfg["low"], cfg["high"])
+                val = suggest_float(cfg["low"], cfg["high"], cfg.get("scale", "linear"))
             elif t == "int":
                 val = suggest_int(cfg["low"], cfg["high"])
             elif t == "categorical":
                 val = suggest_categorical(cfg["choices"])
             else:
                 raise ValueError(f"Unknown type '{t}' for hyperparameter '{name}'")
+            if isinstance(val, np.generic):
+                val = val.item()
             params[name] = val
             self.logger["hyperparameter"][name].append(val)
 
@@ -172,7 +178,11 @@ class HPOGeneral:
 
         For full fidelity of numpy arrays or lists in single cells, use '.pkl' or '.parquet'.
         """
-        if dist.get_rank() == 0:
+        # Guard rank/barrier calls for single-process or uninitialized distributed runs.
+        pg_avail = self.pg_avail and dist.is_available() and dist.is_initialized()
+        is_writer = (dist.get_rank() == 0) if pg_avail else True
+
+        if is_writer:
             # Merge logs into tabular form
             data = {**self.logger["hyperparameter"], **self.logger["performance"]}
             df = pd.DataFrame(data)
@@ -191,7 +201,8 @@ class HPOGeneral:
             else:
                 # default to parquet for full fidelity and robustness for package versions.
                 df.to_parquet(filename)
-        dist.barrier()
+        if pg_avail:
+            dist.barrier()
 
     def get_logs(self) -> Dict[str, Any]:
         """

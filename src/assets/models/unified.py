@@ -19,12 +19,33 @@ try:
 except ImportError:
     hpo = None
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+def resolve_device(device_name: str = "auto") -> torch.device:
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if device_name == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("Requested device 'cuda' but CUDA is not available.")
+        return torch.device("cuda")
+
+    if device_name == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not mps_backend.is_available():
+            raise ValueError("Requested device 'mps' but MPS is not available.")
+        return torch.device("mps")
+
+    if device_name == "cpu":
+        return torch.device("cpu")
+
+    raise ValueError(f"Unsupported device '{device_name}'. Use one of: auto, cpu, mps, cuda.")
+
+
+device = resolve_device("auto")
 
 # $CONDA_PREFIX/bin/torchrun
 
@@ -191,8 +212,13 @@ def main(
     n_trials,
     hpo_iters,
     distributed=False,
-    output_dir="src/assets/models",
+    output_dir="models",
+    device_name="auto",
 ):
+    global device
+    device = resolve_device(device_name)
+    print(f"Using device: {device}")
+
     # Initialize distributed process group (optional)
     if distributed:
         ddp_setup(method)
@@ -210,11 +236,56 @@ def main(
         distributed=distributed,
     )
     data_sample, label_sample, _, _ = next(iter(train_loader))
-    data_shape = data_sample[0].shape[0]
-    label_shape = label_sample[0].shape[0]
+    if data_sample.ndim < 2 or label_sample.ndim < 2:
+        raise ValueError(
+            f"Expected batched row samples with ndim>=2, got data={tuple(data_sample.shape)}, "
+            f"labels={tuple(label_sample.shape)}"
+        )
+    data_shape = int(data_sample.shape[-1])
+    label_shape = int(label_sample.shape[-1])
+
+    dataset_train = train_loader.dataset
+    if train_size != dataset_train.global_size:
+        raise ValueError(
+            f"train_size ({train_size}) does not match dataset global_size ({dataset_train.global_size})"
+        )
+
+    local_train_rows_observed = len(train_loader) * batch_size
+    global_train_rows_observed = torch.tensor(local_train_rows_observed, device=device)
+    if distributed:
+        dist.all_reduce(global_train_rows_observed)
+    global_train_rows_observed = int(global_train_rows_observed.item())
+    dropped_train_rows = train_size - global_train_rows_observed
+    if dropped_train_rows < 0:
+        raise ValueError(
+            f"Observed more train rows than expected: observed={global_train_rows_observed}, "
+            f"expected={train_size}"
+        )
+
+    local_validation_rows_observed = len(validation_loader)
+    global_validation_rows_observed = torch.tensor(local_validation_rows_observed, device=device)
+    if distributed:
+        dist.all_reduce(global_validation_rows_observed)
+    global_validation_rows_observed = int(global_validation_rows_observed.item())
+    if global_validation_rows_observed != validation_size:
+        raise ValueError(
+            f"Validation row accounting mismatch: observed={global_validation_rows_observed}, "
+            f"expected={validation_size}"
+        )
+
     if rank == 0:
+        print(f"First train batch source shape: {tuple(data_sample.shape)}")
+        print(f"First train batch target shape: {tuple(label_sample.shape)}")
         print(f'Data Shape: {data_shape}')
         print(f'Labels Shape: {label_shape}')
+        print(
+            f"Train rows observed this epoch setup: {global_train_rows_observed}/{train_size} "
+            f"(dropped_due_to_drop_last={dropped_train_rows})"
+        )
+        print(
+            f"Validation rows observed this epoch setup: "
+            f"{global_validation_rows_observed}/{validation_size}"
+        )
     out_size = label_shape
 
     # Create model and wrap it with DDP
@@ -266,10 +337,10 @@ def main(
                 print(f"Sampled parameters for iteration {j}: {sample}")
 
             # assign sampled parameters to variables
-            num_layers = sample["num_layers"]
-            layer_exp = sample["layer_exp"]
-            dropout = sample["dropout"]*0.1
-            learning_rate = sample["learning_rate"]
+            num_layers = int(sample["num_layers"])
+            layer_exp = int(sample["layer_exp"])
+            dropout = float(sample["dropout"]) * 0.1
+            learning_rate = float(sample["learning_rate"])
 
         model = MLP(
             input_dim=data_shape,
@@ -497,7 +568,13 @@ if __name__ == "__main__":
     parser.add_argument('--n_trials', default=1, type=int, help='Number of consecutive trials (default: 1)')
     parser.add_argument('--hpo_iters', default=0, type=int, help='Number of HPO samples (default: 0)')
     parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
-    parser.add_argument('--output_dir', default='src/assets/models', type=str, help='Directory to write checkpoints')
+    parser.add_argument('--output_dir', default='models', type=str, help='Directory to write checkpoints')
+    parser.add_argument(
+        '--device',
+        default='auto',
+        choices=['auto', 'cpu', 'mps', 'cuda'],
+        help='Training device: auto, cpu, mps, or cuda (default: auto)',
+    )
     args = parser.parse_args()
 
     # ---------------- HYPERPARAMETERS ----------------#
@@ -522,5 +599,6 @@ if __name__ == "__main__":
         args.hpo_iters,
         distributed=args.distributed,
         output_dir=args.output_dir,
+        device_name=args.device,
     )
 

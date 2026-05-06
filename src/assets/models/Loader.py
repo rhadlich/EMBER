@@ -29,6 +29,10 @@ def get_dataloader(root_dir, size, rank, batch_size, distributed=False):
                            shuffle=True,
                            size=1,
                            rank=0)
+    if train_set.global_size > train_set.total_rows:
+        raise ValueError(
+            f"Train dataset global_size={train_set.global_size} exceeds total_rows={train_set.total_rows}"
+        )
 
     distributed_train_sampler = None
     if distributed:
@@ -47,6 +51,10 @@ def get_dataloader(root_dir, size, rank, batch_size, distributed=False):
                               drop_last=True)
 
     print(f'THE LENGTH OF THE TRAIN LOADER IS {len(train_loader)}.')
+    print(
+        f"Train rows (expected): total={train_set.total_rows}, "
+        f"used_by_dataset={train_set.global_size}, local={train_set.local_size}"
+    )
 
     train_size = train_set.global_size
 
@@ -56,6 +64,11 @@ def get_dataloader(root_dir, size, rank, batch_size, distributed=False):
                                 shuffle=False,
                                 size=size,
                                 rank=rank)
+    if validation_set.global_size != validation_set.total_rows:
+        raise ValueError(
+            f"Validation dataset expected full coverage: global_size={validation_set.global_size}, "
+            f"total_rows={validation_set.total_rows}"
+        )
 
     # use batch size = 1 here to make sure we do not drop a sample
     validation_loader = DataLoader(validation_set,
@@ -65,5 +78,9 @@ def get_dataloader(root_dir, size, rank, batch_size, distributed=False):
                                    drop_last=False)
 
     validation_size = validation_set.global_size
+    print(
+        f"Validation rows (expected): total={validation_set.total_rows}, "
+        f"global={validation_set.global_size}, local={validation_set.local_size}"
+    )
 
     return train_loader, train_size, validation_loader, validation_size
