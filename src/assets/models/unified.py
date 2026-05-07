@@ -116,7 +116,7 @@ class Trainer:
         mse_logger = 0
         mae_logger = 0
         with torch.no_grad():
-            for val_idx, (source, targets, filename, idx) in enumerate(loader):
+            for val_idx, (source, targets) in enumerate(loader):
                 source = source.to(device)
                 targets = targets.to(device)
                 output = step_fn(source)
@@ -143,13 +143,13 @@ class Trainer:
         self.mae_logger = 0
 
         if self.train_method == 'default':
-            for batch_idx, (source, targets, filename, idx) in enumerate(self.train_data):
+            for batch_idx, (source, targets) in enumerate(self.train_data):
                 source = source.to(device)
                 targets = targets.to(device)
                 self._run_batch(source, targets)
         elif self.train_method == 'teacher_forcing':
             tf_ratio = 1 * tf_decay_exp ** epoch
-            for batch_idx, (source, targets, filename, idx) in enumerate(self.train_data):
+            for batch_idx, (source, targets) in enumerate(self.train_data):
                 source = source.to(device)
 
                 # decide whether to use ground truth or autoregression
@@ -214,6 +214,11 @@ def main(
     distributed=False,
     output_dir="models",
     device_name="auto",
+    train_data_mode="row",
+    num_workers=0,
+    pin_memory=False,
+    persistent_workers=False,
+    prefetch_factor=2,
 ):
     global device
     device = resolve_device(device_name)
@@ -234,13 +239,25 @@ def main(
         rank,
         batch_size,
         distributed=distributed,
+        train_data_mode=train_data_mode,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
-    data_sample, label_sample, _, _ = next(iter(train_loader))
+    data_sample, label_sample = next(iter(train_loader))
     if data_sample.ndim < 2 or label_sample.ndim < 2:
         raise ValueError(
             f"Expected batched row samples with ndim>=2, got data={tuple(data_sample.shape)}, "
             f"labels={tuple(label_sample.shape)}"
         )
+    if data_sample.shape[0] != label_sample.shape[0]:
+        raise ValueError(
+            f"Mismatched train batch rows between source and targets: "
+            f"{data_sample.shape[0]} vs {label_sample.shape[0]}"
+        )
+    if data_sample.shape[0] <= 0:
+        raise ValueError("Observed empty train batch.")
     data_shape = int(data_sample.shape[-1])
     label_shape = int(label_sample.shape[-1])
 
@@ -274,6 +291,18 @@ def main(
         )
 
     if rank == 0:
+        print(f"Train data mode: {train_data_mode}")
+        print(f"Configured target rows per optimizer step (--batch_size): {batch_size}")
+        print(f"Effective rows per optimizer step (observed first batch): {data_sample.shape[0]}")
+        print(
+            "DataLoader config: "
+            f"num_workers={num_workers}, pin_memory={pin_memory}, "
+            f"persistent_workers={persistent_workers}, prefetch_factor={prefetch_factor}"
+        )
+        if getattr(train_loader, "rows_per_file", None) is not None:
+            print(f"Rows per file (train): {train_loader.rows_per_file}")
+        if getattr(train_loader, "files_per_batch", None) is not None:
+            print(f"Derived files per batch (train): {train_loader.files_per_batch}")
         print(f"First train batch source shape: {tuple(data_sample.shape)}")
         print(f"First train batch target shape: {tuple(label_sample.shape)}")
         print(f'Data Shape: {data_shape}')
@@ -570,6 +599,25 @@ if __name__ == "__main__":
     parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
     parser.add_argument('--output_dir', default='models', type=str, help='Directory to write checkpoints')
     parser.add_argument(
+        '--train_data_mode',
+        default='row',
+        choices=['row', 'in_memory_rows', 'per_file'],
+        help='Training data mode: row, in_memory_rows, or per_file (default: row)',
+    )
+    parser.add_argument('--num_workers', default=0, type=int, help='Number of DataLoader workers (default: 0)')
+    parser.add_argument('--pin_memory', action='store_true', help='Enable pinned memory in DataLoader')
+    parser.add_argument(
+        '--persistent_workers',
+        action='store_true',
+        help='Keep DataLoader workers alive between epochs (requires --num_workers > 0)',
+    )
+    parser.add_argument(
+        '--prefetch_factor',
+        default=2,
+        type=int,
+        help='Number of prefetched batches per worker (requires --num_workers > 0, default: 2)',
+    )
+    parser.add_argument(
         '--device',
         default='auto',
         choices=['auto', 'cpu', 'mps', 'cuda'],
@@ -600,5 +648,10 @@ if __name__ == "__main__":
         distributed=args.distributed,
         output_dir=args.output_dir,
         device_name=args.device,
+        train_data_mode=args.train_data_mode,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
     )
 

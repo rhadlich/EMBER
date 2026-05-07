@@ -26,6 +26,19 @@ def peek_shapes_hdf5(data_dir):
     return data_shape, label_shape
 
 
+def list_h5_files(source):
+    files = sorted(
+        [
+            os.path.join(source, x)
+            for x in os.listdir(source)
+            if x.endswith(".h5")
+        ]
+    )
+    if not files:
+        raise FileNotFoundError(f"No .h5 files found in {source}")
+    return files
+
+
 # Dataset class
 class GetDataset(Dataset):
 
@@ -166,7 +179,6 @@ class GetDataset(Dataset):
             raise IndexError(f"Index {idx} out of range for local size {self.local_size}")
 
         file_idx, row_idx = self._resolve_global_index(idx)
-        global_idx = self.local_start + int(idx)
         filename = self.files[file_idx]
 
         # load data and project
@@ -179,4 +191,195 @@ class GetDataset(Dataset):
         # pre-process
         data = (data - mean) / std_dev
 
-        return data, label, filename, global_idx
+        return data, label
+
+
+class InMemoryRowDataset(Dataset):
+    def __init__(
+        self,
+        source,
+        allow_uneven_distribution=False,
+        shuffle=False,
+        size=1,
+        rank=0,
+        seed=12345,
+    ):
+        self.source = source
+        self.allow_uneven_distribution = allow_uneven_distribution
+        self.shuffle = shuffle
+        self.size = size
+        self.rank = rank
+        self.rng = np.random.RandomState(seed)
+        self.files = list_h5_files(self.source)
+        if self.shuffle:
+            self.rng.shuffle(self.files)
+
+        data_blocks = []
+        label_blocks = []
+        self.row_counts = []
+        feature_dims = []
+        label_dims = []
+        ref_mean = None
+        ref_std = None
+
+        for filename in self.files:
+            with h5.File(filename, "r") as fin:
+                data = fin["features/data"][...]
+                label = fin["labels/pressure"][...]
+                mean = fin["normalization/feature_mean"][...].reshape(-1)
+                std_dev = fin["normalization/feature_std"][...].reshape(-1)
+
+            if data.ndim != 2:
+                raise ValueError(
+                    f"Expected row-major 2D features in {filename}, got shape {data.shape}"
+                )
+            if label.ndim != 2:
+                raise ValueError(
+                    f"Expected row-major 2D labels in {filename}, got shape {label.shape}"
+                )
+            if data.shape[0] != label.shape[0]:
+                raise ValueError(
+                    f"Row mismatch in {filename}: features {data.shape} vs labels {label.shape}"
+                )
+            if mean.size != data.shape[1] or std_dev.size != data.shape[1]:
+                raise ValueError(
+                    f"Normalization shape mismatch in {filename} for feature shape {data.shape}"
+                )
+            if ref_mean is None:
+                ref_mean = mean
+                ref_std = std_dev
+            else:
+                if not np.allclose(mean, ref_mean):
+                    raise ValueError(f"feature_mean differs across files; mismatch found in {filename}")
+                if not np.allclose(std_dev, ref_std):
+                    raise ValueError(f"feature_std differs across files; mismatch found in {filename}")
+
+            data_blocks.append(data)
+            label_blocks.append(label)
+            self.row_counts.append(data.shape[0])
+            feature_dims.append(data.shape[1])
+            label_dims.append(label.shape[1])
+
+        if len(set(feature_dims)) != 1:
+            raise ValueError(f"Inconsistent feature dims across files: {feature_dims}")
+        if len(set(label_dims)) != 1:
+            raise ValueError(f"Inconsistent label dims across files: {label_dims}")
+
+        self.row_counts = np.asarray(self.row_counts, dtype=np.int64)
+        self.row_offsets = np.zeros(len(self.row_counts) + 1, dtype=np.int64)
+        self.row_offsets[1:] = np.cumsum(self.row_counts)
+        self.total_rows = int(self.row_offsets[-1])
+        self.feature_dim = int(feature_dims[0])
+        self.label_dim = int(label_dims[0])
+        self.feature_mean = ref_mean
+        self.feature_std = ref_std
+        if np.any(self.feature_std == 0):
+            raise ValueError("Found zeros in feature_std; cannot normalize safely.")
+
+        data_all = np.concatenate(data_blocks, axis=0)
+        label_all = np.concatenate(label_blocks, axis=0)
+        data_all = (data_all - self.feature_mean) / self.feature_std
+
+        if self.allow_uneven_distribution:
+            self.local_start = (self.rank * self.total_rows) // self.size
+            self.local_end = ((self.rank + 1) * self.total_rows) // self.size
+            self.global_size = self.total_rows
+        else:
+            num_rows_local = self.total_rows // self.size
+            self.local_start = self.rank * num_rows_local
+            self.local_end = self.local_start + num_rows_local
+            self.global_size = self.size * num_rows_local
+        self.local_size = self.local_end - self.local_start
+        self.data = data_all[self.local_start:self.local_end]
+        self.labels = label_all[self.local_start:self.local_end]
+
+        self.data_shape = (self.feature_dim,)
+        self.label_shape = (self.label_dim,)
+
+    def __len__(self):
+        return self.local_size
+
+    @property
+    def shapes(self):
+        return self.data_shape, self.label_shape
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.local_size:
+            raise IndexError(f"Index {idx} out of range for local size {self.local_size}")
+        return self.data[idx], self.labels[idx]
+
+
+class PerFileDataset(Dataset):
+    def __init__(self, source, shuffle=False, seed=12345):
+        self.source = source
+        self.shuffle = shuffle
+        self.rng = np.random.RandomState(seed)
+        self.files = list_h5_files(self.source)
+        if self.shuffle:
+            self.rng.shuffle(self.files)
+
+        self.rows_per_file = []
+        self.feature_dims = []
+        self.label_dims = []
+        self.total_rows = 0
+        self.feature_mean = None
+        self.feature_std = None
+        for filename in self.files:
+            with h5.File(filename, "r") as fin:
+                data_shape = fin["features/data"].shape
+                label_shape = fin["labels/pressure"].shape
+                mean = fin["normalization/feature_mean"][...].reshape(-1)
+                std_dev = fin["normalization/feature_std"][...].reshape(-1)
+
+            if len(data_shape) != 2 or len(label_shape) != 2:
+                raise ValueError(
+                    f"Expected 2D features/labels in {filename}, got {data_shape} and {label_shape}"
+                )
+            if data_shape[0] != label_shape[0]:
+                raise ValueError(
+                    f"Row mismatch in {filename}: features {data_shape} vs labels {label_shape}"
+                )
+            if mean.size != data_shape[1] or std_dev.size != data_shape[1]:
+                raise ValueError(
+                    f"Normalization shape mismatch in {filename} for feature shape {data_shape}"
+                )
+            if self.feature_mean is None:
+                self.feature_mean = mean
+                self.feature_std = std_dev
+            else:
+                if not np.allclose(mean, self.feature_mean):
+                    raise ValueError(f"feature_mean differs across files; mismatch found in {filename}")
+                if not np.allclose(std_dev, self.feature_std):
+                    raise ValueError(f"feature_std differs across files; mismatch found in {filename}")
+
+            self.rows_per_file.append(int(data_shape[0]))
+            self.feature_dims.append(int(data_shape[1]))
+            self.label_dims.append(int(label_shape[1]))
+            self.total_rows += int(data_shape[0])
+
+        if len(set(self.feature_dims)) != 1:
+            raise ValueError(f"Inconsistent feature dims across files: {self.feature_dims}")
+        if len(set(self.label_dims)) != 1:
+            raise ValueError(f"Inconsistent label dims across files: {self.label_dims}")
+
+        self.feature_dim = self.feature_dims[0]
+        self.label_dim = self.label_dims[0]
+        self.num_files = len(self.files)
+        self.global_size = self.total_rows
+        if np.any(self.feature_std == 0):
+            raise ValueError("Found zeros in feature_std; cannot normalize safely.")
+
+    def __len__(self):
+        return self.num_files
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.num_files:
+            raise IndexError(f"File index {idx} out of range for dataset size {self.num_files}")
+
+        filename = self.files[idx]
+        with h5.File(filename, "r") as fin:
+            data = fin["features/data"][...]
+            label = fin["labels/pressure"][...]
+
+        data = (data - self.feature_mean) / self.feature_std
+        return data, label
