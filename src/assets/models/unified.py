@@ -443,6 +443,9 @@ def main(
 
         # loop for running the same model multiple times and record times
         for i in range(n_trials):
+            if distributed:
+                # Ensure rank 0 has finished writing the latest checkpoint before any rank reads.
+                dist.barrier()
 
             # Start training model
             checkpoint = torch.load(filename_model, map_location=device)
@@ -514,6 +517,9 @@ def main(
                     },
                     filename_model,
                 )
+            if distributed:
+                # Ensure all ranks wait for rank 0 save completion before next trial iteration.
+                dist.barrier()
 
         if opt:
             # log performance metrics
