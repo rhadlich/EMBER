@@ -86,6 +86,8 @@ class Trainer:
         self.loss_logger = float('inf')
         self.mse_logger = float('inf')
         self.mae_logger = float('inf')
+        self.dp_logger = float('inf')
+        self.work_logger = float('inf')
         self.val_loss = float('inf')
         self.val_mse = float('inf')
         self.val_mae = float('inf')
@@ -104,6 +106,9 @@ class Trainer:
         self.loss_logger += loss
         self.mse_logger += mse(output, targets)
         self.mae_logger += mae(output, targets)
+        if hasattr(criterion, "last_terms") and criterion.last_terms is not None:
+            self.dp_logger += criterion.last_terms["dp"]
+            self.work_logger += criterion.last_terms["work"]
         loss.backward()
         self.optimizer.step()
 
@@ -141,6 +146,8 @@ class Trainer:
         self.loss_logger = 0
         self.mse_logger = 0
         self.mae_logger = 0
+        self.dp_logger = 0
+        self.work_logger = 0
 
         if self.train_method == 'default':
             for batch_idx, (source, targets) in enumerate(self.train_data):
@@ -161,7 +168,18 @@ class Trainer:
                 self._run_batch(input_tuple, targets)
 
         if self.global_rank == 0:
-            print(f"[Epoch {epoch} | Loss: {(self.loss_logger / (batch_idx + 1)):.4f} | MSE: {self.mse_logger/(batch_idx+1)} | Steps: {len(self.train_data)}")
+            avg_loss = self.loss_logger / (batch_idx + 1)
+            avg_mse = self.mse_logger / (batch_idx + 1)
+            avg_dp = self.dp_logger / (batch_idx + 1)
+            avg_work = self.work_logger / (batch_idx + 1)
+            avg_mse_value = avg_mse.item() if torch.is_tensor(avg_mse) else float(avg_mse)
+            avg_dp_value = avg_dp.item() if torch.is_tensor(avg_dp) else float(avg_dp)
+            avg_work_value = avg_work.item() if torch.is_tensor(avg_work) else float(avg_work)
+            print(
+                f"[Epoch {epoch} | Loss: {avg_loss:.4f} | MSE: {avg_mse_value:.6e} "
+                f"| DP: {avg_dp_value:.6e} | Work: {avg_work_value:.6e} "
+                f"| Steps: {len(self.train_data)}]"
+            )
 
         self.avg_loss = self.loss_logger / (batch_idx + 1)
         self.avg_mae = self.mae_logger / (batch_idx + 1)
@@ -597,8 +615,8 @@ if __name__ == "__main__":
     parser.add_argument('--method', default='dummy', type=str, help='Distributed init method (dummy, gloo, nccl, nccl-*)')
     parser.add_argument('--num_layers', default=4, type=int, help='Number of hidden layers (default: 4)')
     parser.add_argument('--num_nodes_exp', default=10, type=int,
-                        help='Exponential factor for 2**n nodes per layer (default: 8)')
-    parser.add_argument('--lr', default=0.0003, type=float, help='Learning rate (default: 0.00064)')
+                        help='Exponential factor for 2**n nodes per layer (default: 10)')
+    parser.add_argument('--lr', default=0.0003, type=float, help='Learning rate (default: 0.0003)')
     parser.add_argument('--batch_size', default=128, type=int, help='Input batch size on each device (default: 32)')
     parser.add_argument('--p', default=0.1, type=float, help='Dropout probability (default: 0.1)')
     parser.add_argument('--n_trials', default=1, type=int, help='Number of consecutive trials (default: 1)')
@@ -630,6 +648,8 @@ if __name__ == "__main__":
         choices=['auto', 'cpu', 'mps', 'cuda'],
         help='Training device: auto, cpu, mps, or cuda (default: auto)',
     )
+    parser.add_argument('--alpha', default=0.5, type=float, help='Alpha parameter for MSEWithDp (default: 0.1)')
+    parser.add_argument('--beta', default=0.0, type=float, help='Beta parameter for MSEWithDp (default: 0.0)')
     args = parser.parse_args()
 
     # ---------------- HYPERPARAMETERS ----------------#
@@ -637,7 +657,7 @@ if __name__ == "__main__":
     scheduler_step = 10
     scheduler_gamma = 0.5
     mse = nn.MSELoss(reduction='mean')
-    criterion = MSEWithDp(alpha=0.1, beta=0.0)
+    criterion = MSEWithDp(alpha=args.alpha, beta=args.beta)
     mae = nn.L1Loss()
 
     main(

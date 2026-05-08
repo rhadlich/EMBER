@@ -132,6 +132,7 @@ class MSEWithDp(nn.Module):
             )
         )
         self.register_buffer("volume_trace", volume)
+        self.last_terms = None
 
 
     def forward(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -154,12 +155,32 @@ class MSEWithDp(nn.Module):
 
         # Work/integral term computed with a precomputed volume trace.
         volume = self.volume_trace.to(device=output.device, dtype=output.dtype)
-        W_target = torch.trapz(target, x=volume, dim=1)
-        W_output = torch.trapz(output, x=volume, dim=1)
+        W_target = torch.trapz(target*100000, x=volume, dim=1)
+        W_output = torch.trapz(output*100000, x=volume, dim=1)
         W_diff = (W_target - W_output)**2
 
         if self.reduction == "mean":
-            return diff.mean() + self.alpha * diff_dp.mean() + self.beta * W_diff.mean()
+            mse_term = diff.mean()
+            dp_term = self.alpha * diff_dp.mean()
+            work_term = self.beta * W_diff.mean()
+            total = mse_term + dp_term + work_term
+            self.last_terms = {
+                "mse": mse_term.detach(),
+                "dp": dp_term.detach(),
+                "work": work_term.detach(),
+                "total": total.detach(),
+            }
+            return total
         if self.reduction == "sum":
-            return diff.sum() + self.alpha * diff_dp.sum() + self.beta * W_diff.sum()
+            mse_term = diff.sum()
+            dp_term = self.alpha * diff_dp.sum()
+            work_term = self.beta * W_diff.sum()
+            total = mse_term + dp_term + work_term
+            self.last_terms = {
+                "mse": mse_term.detach(),
+                "dp": dp_term.detach(),
+                "work": work_term.detach(),
+                "total": total.detach(),
+            }
+            return total
 
