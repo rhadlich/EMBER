@@ -98,6 +98,13 @@ def init(method, batchnorm_group_size=1):
         dist.init_process_group(backend="nccl",
                                 rank=rank,
                                 world_size=world_size)
+    elif method == "nccl":
+        # Torchrun-compatible NCCL initialization via environment variables
+        # (RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT, LOCAL_RANK).
+        dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            local_rank = int(os.getenv("LOCAL_RANK", 0))
+            torch.cuda.set_device(local_rank)
     elif method == "dummy":
         rank = 0
         world_size = 1

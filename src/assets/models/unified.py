@@ -587,13 +587,13 @@ if __name__ == "__main__":
     parser.add_argument('root_dir', type=str,
                         help='Root directory where train, validation, and test folders are located')
     parser.add_argument('node_type', type=str, help='Model tag used in checkpoint filename')
-    parser.add_argument('--method', default='dummy', type=str, help='Distributed init method (dummy, gloo, nccl-*)')
+    parser.add_argument('--method', default='dummy', type=str, help='Distributed init method (dummy, gloo, nccl, nccl-*)')
     parser.add_argument('--num_layers', default=4, type=int, help='Number of hidden layers (default: 4)')
     parser.add_argument('--num_nodes_exp', default=10, type=int,
                         help='Exponential factor for 2**n nodes per layer (default: 8)')
     parser.add_argument('--lr', default=0.0003, type=float, help='Learning rate (default: 0.00064)')
     parser.add_argument('--batch_size', default=128, type=int, help='Input batch size on each device (default: 32)')
-    parser.add_argument('--p', default=0.1, type=float, help='Dropout probability (default: 0.3)')
+    parser.add_argument('--p', default=0.1, type=float, help='Dropout probability (default: 0.1)')
     parser.add_argument('--n_trials', default=1, type=int, help='Number of consecutive trials (default: 1)')
     parser.add_argument('--hpo_iters', default=0, type=int, help='Number of HPO samples (default: 0)')
     parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
@@ -630,7 +630,7 @@ if __name__ == "__main__":
     scheduler_step = 10
     scheduler_gamma = 0.5
     mse = nn.MSELoss(reduction='mean')
-    criterion = MSEWithDp()
+    criterion = MSEWithDp(alpha=0.1, beta=0.0)
     mae = nn.L1Loss()
 
     main(
