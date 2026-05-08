@@ -10,3 +10,4 @@ migrate_repo.py
 **/__pycache__/
 .cursor/
 scripts/
+visualize_predictions.py

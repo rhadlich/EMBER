@@ -544,6 +544,9 @@ def main(
             opt.log_performance(loss_store, metric="mse_dp")
             opt.log_performance(mse_store, metric="mse")
             opt.log_performance(mae_store, metric="mae")
+            # Persist HPO history each iteration so long cluster jobs can resume/analyze progress.
+            if rank == 0:
+                opt.save_log('test.parquet')
 
         # save things in hdf5 file
         # if rank == 0:
@@ -594,8 +597,8 @@ def main(
         #                             dtype='f',
         #                             data=mae, )
 
-    if opt:
-        # save log
+    if opt and rank == 0:
+        # save final log snapshot
         opt.save_log('test.parquet')
 
     # end distributed process group
