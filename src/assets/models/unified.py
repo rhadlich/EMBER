@@ -447,7 +447,8 @@ def main(
             # Start training model
             checkpoint = torch.load(filename_model, map_location=device)
             state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) else checkpoint
-            model.load_state_dict(state_dict)
+            load_target = model.module if distributed else model
+            load_target.load_state_dict(state_dict)
             optimizer.load_state_dict(torch.load(filename_optimizer, map_location=device))
             model.train()
             trainer = Trainer(
