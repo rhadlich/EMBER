@@ -521,20 +521,22 @@ def main(
             if rank == 0:
                 print(
                     f'Iteration: {j} | Trial: {i} | Val Loss {loss} | Model Training Time: {toc - tic} seconds | Number of Threads: {torch.get_num_threads()} | World Size: {size}')
-                base_model = model.module if distributed else model
-                torch.save(
-                    {
-                        "model_state_dict": base_model.state_dict(),
-                        "model_config": {
-                            "input_dim": data_shape,
-                            "output_dim": out_size,
-                            "num_hidden": num_layers,
-                            "hidden_exp": layer_exp,
-                            "dropout": dropout,
+                
+                if not hpo_iters:
+                    base_model = model.module if distributed else model
+                    torch.save(
+                        {
+                            "model_state_dict": base_model.state_dict(),
+                            "model_config": {
+                                "input_dim": data_shape,
+                                "output_dim": out_size,
+                                "num_hidden": num_layers,
+                                "hidden_exp": layer_exp,
+                                "dropout": dropout,
+                            },
                         },
-                    },
-                    filename_model,
-                )
+                        filename_model,
+                    )
             if distributed:
                 # Ensure all ranks wait for rank 0 save completion before next trial iteration.
                 dist.barrier()
@@ -545,8 +547,10 @@ def main(
             opt.log_performance(mse_store, metric="mse")
             opt.log_performance(mae_store, metric="mae")
             # Persist HPO history each iteration so long cluster jobs can resume/analyze progress.
+            print(f"Saving HPO log")
             if rank == 0:
                 opt.save_log('test.parquet')
+                print(f"HPO log saved")
 
         # save things in hdf5 file
         # if rank == 0:
