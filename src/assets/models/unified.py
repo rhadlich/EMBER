@@ -440,6 +440,8 @@ def main(
 
         # Set optimizer, scheduler
         optimizer_lr = learning_rate * size if distributed else learning_rate
+        base_batch_size = 64    # This was working well, LR with this as the baseline
+        optimizer_lr *= batch_size / base_batch_size    # This is the scaling factor for the learning rate
         optimizer = optim.AdamW(model.parameters(), lr=optimizer_lr)
         # optimizer = optim.Adam(model.parameters(), lr=learning_rate)            # Not considering number of processes
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
