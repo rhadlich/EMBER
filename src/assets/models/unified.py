@@ -353,13 +353,13 @@ def main(
                 param_configs = {
                     "num_layers": {
                         "type": "int",
-                        "low": 2,
-                        "high": 10,
+                        "low": 1,
+                        "high": 5,
                     },
                     "layer_exp": {
                         "type": "int",
                         "low": 7,
-                        "high": 10,
+                        "high": 11,
                     },
                     "dropout": {
                         "type": "int",
