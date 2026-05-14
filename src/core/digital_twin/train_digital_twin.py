@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import random
 import time
@@ -16,7 +17,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from core.digital_twin.architectures import MLP, MSEWithDp, ResidualMLP
 from core.digital_twin.datasets import InMemoryRowDataset
 from core.training import distributed as dist_utils
-from core.training.hpo import HPOGeneral
+from core.training.hpo import (
+    HPOGeneral,
+    RayTunePruningConfig,
+    build_asha_scheduler,
+    build_combined_stopper,
+    build_tune_search_space,
+    flatten_tuner_result_grid,
+    ray_trials_to_hpo_logger,
+)
 from core.training.loaders import create_dataloaders
 from core.training.trainer import Trainer, resolve_device
 
@@ -63,6 +72,20 @@ def _build_model(
     raise ValueError(f"Unsupported architecture '{architecture}'.")
 
 
+def _default_hpo_param_configs():
+    return {
+        "num_layers": {"type": "int", "low": 2, "high": 10},
+        "layer_exp": {"type": "int", "low": 7, "high": 10},
+        "dropout": {"type": "int", "low": 0, "high": 3},
+        "learning_rate": {
+            "type": "float",
+            "low": 1e-6,
+            "high": 1e-3,
+            "scale": "log",
+        },
+    }
+
+
 def main(
     total_epochs,
     root_dir,
@@ -87,6 +110,15 @@ def main(
     beta=0.0,
     per_epoch_validation=True,
     seed=None,
+    hpo_backend="legacy",
+    ray_asha_grace_period=3,
+    ray_asha_reduction_factor=2.0,
+    ray_plateau_patience=6,
+    ray_plateau_min_delta=1e-4,
+    ray_overfit_ratio_threshold=0.25,
+    ray_overfit_patience=3,
+    ray_cpus_per_trial=1.0,
+    ray_gpus_per_trial=None,
 ):
     device = resolve_device(device_name)
     if distributed:
@@ -149,6 +181,18 @@ def main(
 
     training_iters = max(1, hpo_iters)
     hpo_logger = None
+    param_configs = _default_hpo_param_configs()
+    hpo_metrics = [
+        "mse_dp",
+        "mse",
+        "mae",
+        "mse_dp_epoch_train",
+        "mse_epoch_train",
+        "mae_epoch_train",
+        "mse_dp_epoch_val",
+        "mse_epoch_val",
+        "mae_epoch_val",
+    ]
     if output_dir is None:
         output_dir = Path(__file__).resolve().parent / "models"
     else:
@@ -158,32 +202,168 @@ def main(
     scheduler_step = 10
     scheduler_gamma = 0.5
 
+    if hpo_backend not in {"legacy", "ray"}:
+        raise ValueError(f"Unsupported hpo_backend '{hpo_backend}'. Use 'legacy' or 'ray'.")
+
+    if hpo_backend == "ray":
+        if distributed:
+            raise ValueError("Ray backend currently supports only non-distributed training.")
+        if hpo_iters <= 0:
+            raise ValueError("Ray backend requires --hpo_iters > 0 (number of sampled configs).")
+        if not per_epoch_validation:
+            raise ValueError("Ray backend requires --per-epoch-validation enabled for pruning.")
+        if n_trials != 1:
+            raise ValueError("Ray backend currently requires --n_trials=1.")
+
+        from ray import tune
+        from ray import train as ray_train
+
+        if ray_gpus_per_trial is None:
+            ray_gpus_per_trial = 1.0 if device.type == "cuda" else 0.0
+
+        pruning_cfg = RayTunePruningConfig(
+            grace_period=ray_asha_grace_period,
+            reduction_factor=ray_asha_reduction_factor,
+            plateau_patience=ray_plateau_patience,
+            plateau_min_delta=ray_plateau_min_delta,
+            overfit_ratio_threshold=ray_overfit_ratio_threshold,
+            overfit_patience=ray_overfit_patience,
+        )
+        scheduler = build_asha_scheduler(
+            metric="val_loss",
+            mode="min",
+            max_t=total_epochs,
+            grace_period=pruning_cfg.grace_period,
+            reduction_factor=pruning_cfg.reduction_factor,
+        )
+        stopper = build_combined_stopper(pruning_cfg, val_metric="val_loss", train_metric="train_loss")
+        search_space = build_tune_search_space(param_configs)
+
+        def _trainable(config):
+            trial_seed = int(effective_seed if effective_seed is not None else 0)
+            random.seed(trial_seed)
+            np.random.seed(trial_seed)
+            torch.manual_seed(trial_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(trial_seed)
+
+            local_train_dataset = InMemoryRowDataset(
+                os.path.join(root_dir, "train"),
+                allow_uneven_distribution=False,
+                shuffle=True,
+                size=1,
+                rank=0,
+            )
+            local_validation_dataset = InMemoryRowDataset(
+                os.path.join(root_dir, "validation"),
+                allow_uneven_distribution=True,
+                shuffle=False,
+                size=1,
+                rank=0,
+            )
+            local_train_loader, _, local_validation_loader, _ = create_dataloaders(
+                train_dataset=local_train_dataset,
+                validation_dataset=local_validation_dataset,
+                batch_size=batch_size,
+                size=1,
+                rank=0,
+                distributed=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+                train_drop_last=True,
+                validation_batch_size=1,
+                seed=trial_seed,
+            )
+            local_data_sample, local_label_sample = next(iter(local_train_loader))
+            local_data_shape = int(local_data_sample.shape[-1])
+            local_label_shape = int(local_label_sample.shape[-1])
+
+            trial_num_layers = int(config["num_layers"])
+            trial_layer_exp = int(config["layer_exp"])
+            trial_dropout = float(config["dropout"]) * 0.1
+            trial_lr = float(config["learning_rate"])
+
+            local_model = _build_model(
+                architecture=architecture,
+                data_shape=local_data_shape,
+                label_shape=local_label_shape,
+                num_layers=trial_num_layers,
+                layer_exp=trial_layer_exp,
+                dropout=trial_dropout,
+            ).to(device)
+            local_criterion = MSEWithDp(alpha=alpha, beta=beta)
+            local_mse = nn.MSELoss(reduction="mean")
+            local_mae = nn.L1Loss()
+            optimizer_lr = trial_lr * batch_size / 64
+            local_optimizer = optim.AdamW(local_model.parameters(), lr=optimizer_lr)
+            local_scheduler = optim.lr_scheduler.StepLR(
+                local_optimizer, step_size=scheduler_step, gamma=scheduler_gamma
+            )
+            initial_model_state = copy.deepcopy(local_model.state_dict())
+            initial_optimizer_state = copy.deepcopy(local_optimizer.state_dict())
+            local_model.load_state_dict(initial_model_state)
+            local_optimizer.load_state_dict(initial_optimizer_state)
+
+            trainer = Trainer(
+                model=local_model,
+                train_data=local_train_loader,
+                val_data=local_validation_loader,
+                optimizer=local_optimizer,
+                scheduler=local_scheduler,
+                criterion=local_criterion,
+                metric_fns={"mse": local_mse, "mae": local_mae},
+                val_fn=None,
+                epoch_end_callback=lambda metrics: tune.report(metrics),
+                train_method="default",
+                validate_each_epoch=True,
+                distributed=False,
+                rank=0,
+                world_size=1,
+                device=device,
+            )
+            trainer.train(total_epochs)
+
+        tuner = tune.Tuner(
+            tune.with_resources(
+                _trainable,
+                resources={"cpu": float(ray_cpus_per_trial), "gpu": float(ray_gpus_per_trial)},
+            ),
+            tune_config=tune.TuneConfig(
+                num_samples=training_iters,
+                scheduler=scheduler,
+            ),
+            run_config=tune.RunConfig(
+                name=f"digital_twin_hpo_{node_type}",
+                storage_path=str(output_dir / "ray_results"),
+                stop=stopper,
+                verbose=1,
+            ),
+            param_space=search_space,
+        )
+        result_grid = tuner.fit()
+        trial_results = flatten_tuner_result_grid(result_grid)
+        ray_hpo_logger = ray_trials_to_hpo_logger(
+            trial_results=trial_results, param_configs=param_configs, seed=effective_seed
+        )
+        ray_hpo_logger.save_log(str(output_dir / "hpo_log.parquet"))
+
+        if rank == 0:
+            best_result = result_grid.get_best_result(metric="val_loss", mode="min")
+            print(f"Best Ray Tune config: {best_result.config}")
+            print(f"Best Ray Tune val_loss: {best_result.metrics.get('val_loss')}")
+
+        if distributed and dist.is_initialized():
+            destroy_process_group()
+        return
+
     for hpo_iter in range(training_iters):
         if hpo_iters:
             if hpo_logger is None:
                 hpo_logger = HPOGeneral(
-                    param_configs={
-                        "num_layers": {"type": "int", "low": 2, "high": 10},
-                        "layer_exp": {"type": "int", "low": 7, "high": 10},
-                        "dropout": {"type": "int", "low": 0, "high": 3},
-                        "learning_rate": {
-                            "type": "float",
-                            "low": 1e-6,
-                            "high": 1e-3,
-                            "scale": "log",
-                        },
-                    },
-                    metrics=[
-                        "mse_dp",
-                        "mse",
-                        "mae",
-                        "mse_dp_epoch_train",
-                        "mse_epoch_train",
-                        "mae_epoch_train",
-                        "mse_dp_epoch_val",
-                        "mse_epoch_val",
-                        "mae_epoch_val",
-                    ],
+                    param_configs=param_configs,
+                    metrics=hpo_metrics,
                     seed=effective_seed,
                 )
             sample = hpo_logger.sample()
@@ -380,6 +560,13 @@ if __name__ == "__main__":
     parser.add_argument("--p", default=0.1, type=float, help="Dropout probability")
     parser.add_argument("--n_trials", default=1, type=int, help="Number of consecutive trials")
     parser.add_argument("--hpo_iters", default=0, type=int, help="Number of HPO samples")
+    parser.add_argument(
+        "--hpo-backend",
+        default="legacy",
+        choices=["legacy", "ray"],
+        type=str,
+        help="HPO backend. 'legacy' keeps random search, 'ray' enables Tune + pruning.",
+    )
     parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
     parser.add_argument(
         "--output_dir",
@@ -412,6 +599,54 @@ if __name__ == "__main__":
         default=True,
         help="Run and print validation metrics each epoch (default: enabled).",
     )
+    parser.add_argument(
+        "--ray-asha-grace-period",
+        default=3,
+        type=int,
+        help="Minimum epochs before ASHA can prune a trial.",
+    )
+    parser.add_argument(
+        "--ray-asha-reduction-factor",
+        default=2.0,
+        type=float,
+        help="ASHA reduction factor (eta).",
+    )
+    parser.add_argument(
+        "--ray-plateau-patience",
+        default=6,
+        type=int,
+        help="Epochs without meaningful val-loss improvement before stopping.",
+    )
+    parser.add_argument(
+        "--ray-plateau-min-delta",
+        default=1e-4,
+        type=float,
+        help="Minimum val-loss improvement to reset plateau patience.",
+    )
+    parser.add_argument(
+        "--ray-overfit-ratio-threshold",
+        default=0.25,
+        type=float,
+        help="Overfitting threshold on (val_loss-train_loss)/train_loss.",
+    )
+    parser.add_argument(
+        "--ray-overfit-patience",
+        default=3,
+        type=int,
+        help="Consecutive epochs over overfit threshold before stopping.",
+    )
+    parser.add_argument(
+        "--ray-cpus-per-trial",
+        default=1.0,
+        type=float,
+        help="CPU resources allocated to each Ray Tune trial.",
+    )
+    parser.add_argument(
+        "--ray-gpus-per-trial",
+        default=None,
+        type=float,
+        help="GPU resources per Ray trial (default auto: 1 on CUDA, else 0).",
+    )
     args = parser.parse_args()
 
     main(
@@ -438,4 +673,13 @@ if __name__ == "__main__":
         beta=args.beta,
         per_epoch_validation=args.per_epoch_validation,
         seed=args.seed,
+        hpo_backend=args.hpo_backend,
+        ray_asha_grace_period=args.ray_asha_grace_period,
+        ray_asha_reduction_factor=args.ray_asha_reduction_factor,
+        ray_plateau_patience=args.ray_plateau_patience,
+        ray_plateau_min_delta=args.ray_plateau_min_delta,
+        ray_overfit_ratio_threshold=args.ray_overfit_ratio_threshold,
+        ray_overfit_patience=args.ray_overfit_patience,
+        ray_cpus_per_trial=args.ray_cpus_per_trial,
+        ray_gpus_per_trial=args.ray_gpus_per_trial,
     )

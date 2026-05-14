@@ -56,6 +56,7 @@ class Trainer:
         metric_fns: Optional[Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]] = None,
         *,
         val_fn: Optional[Callable] = None,
+        epoch_end_callback: Optional[Callable[[Dict[str, float]], None]] = None,
         train_method: str = "default",
         validate_each_epoch: bool = True,
         distributed: bool = False,
@@ -71,6 +72,7 @@ class Trainer:
         self.criterion = criterion
         self.metric_fns = metric_fns or {}
         self.val_fn = val_fn
+        self.epoch_end_callback = epoch_end_callback
         self.train_method = train_method
         self.validate_each_epoch = validate_each_epoch
         self.distributed = distributed
@@ -256,6 +258,19 @@ class Trainer:
             self._record_train_history(epoch, steps, epoch_time)
             if self.validate_each_epoch:
                 self._record_val_history(epoch)
+            if self.epoch_end_callback is not None:
+                report = {
+                    "epoch": int(epoch),
+                    "train_loss": self._to_float(self.avg_loss),
+                    "training_iteration": int(epoch + 1),
+                }
+                for metric_name, metric_value in self.train_metrics.items():
+                    report[f"train_{metric_name}"] = self._to_float(metric_value)
+                if self.validate_each_epoch:
+                    report["val_loss"] = self._to_float(self.val_loss)
+                    for metric_name, metric_value in self.val_metrics.items():
+                        report[f"val_{metric_name}"] = self._to_float(metric_value)
+                self.epoch_end_callback(report)
             if self.global_rank == 0 and self.validate_each_epoch:
                 val_parts = [f"[Epoch {epoch}", f"ValLoss: {self.val_loss.item():.4f}"]
                 for metric_name, metric_value in self.val_metrics.items():
