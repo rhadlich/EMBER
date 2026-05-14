@@ -11,3 +11,5 @@ migrate_repo.py
 .cursor/
 scripts/
 visualize_predictions.py
+*.parquet
+*.pth
