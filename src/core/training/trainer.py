@@ -57,6 +57,7 @@ class Trainer:
         *,
         val_fn: Optional[Callable] = None,
         train_method: str = "default",
+        validate_each_epoch: bool = True,
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
@@ -71,6 +72,7 @@ class Trainer:
         self.metric_fns = metric_fns or {}
         self.val_fn = val_fn
         self.train_method = train_method
+        self.validate_each_epoch = validate_each_epoch
         self.distributed = distributed
         self.global_rank = rank
         self.world_size = world_size
@@ -83,6 +85,35 @@ class Trainer:
         self.train_metrics: Dict[str, torch.Tensor] = {}
         self.val_metrics: Dict[str, torch.Tensor] = {}
         self.time_epoch = torch.tensor(0.0, device=self.device)
+        self.history: Dict[str, list] = {"train": [], "val": []}
+
+    @staticmethod
+    def _to_float(value: Any) -> float:
+        if torch.is_tensor(value):
+            return float(value.detach().cpu().item())
+        return float(value)
+
+    def _record_train_history(self, epoch: int, steps: int, epoch_time: float) -> None:
+        train_entry = {
+            "epoch": int(epoch),
+            "steps": int(steps),
+            "time_s": float(epoch_time),
+            "loss": self._to_float(self.avg_loss),
+        }
+        for metric_name, metric_value in self.train_metrics.items():
+            train_entry[metric_name] = self._to_float(metric_value)
+        for term_name, term_sum in self.extra_term_loggers.items():
+            train_entry[term_name] = self._to_float(term_sum / steps)
+        self.history["train"].append(train_entry)
+
+    def _record_val_history(self, epoch: int) -> None:
+        val_entry = {
+            "epoch": int(epoch),
+            "loss": self._to_float(self.val_loss),
+        }
+        for metric_name, metric_value in self.val_metrics.items():
+            val_entry[metric_name] = self._to_float(metric_value)
+        self.history["val"].append(val_entry)
 
     def _split_batch(self, batch):
         if not isinstance(batch, (list, tuple)) or len(batch) != 2:
@@ -209,15 +240,28 @@ class Trainer:
             print(" | ".join(train_parts))
 
         self.scheduler.step()
+        return steps
 
     def train(self, max_epochs):
         time_epoch = 0.0
+        self.history = {"train": [], "val": []}
         for epoch in range(self.epochs_run, max_epochs):
             tic_epoch = time.time()
-            self._run_epoch(epoch)
+            steps = self._run_epoch(epoch)
+            if self.validate_each_epoch:
+                self._run_val(self.val_data)
             toc_epoch = time.time()
             epoch_time = toc_epoch - tic_epoch
             time_epoch += epoch_time
+            self._record_train_history(epoch, steps, epoch_time)
+            if self.validate_each_epoch:
+                self._record_val_history(epoch)
+            if self.global_rank == 0 and self.validate_each_epoch:
+                val_parts = [f"[Epoch {epoch}", f"ValLoss: {self.val_loss.item():.4f}"]
+                for metric_name, metric_value in self.val_metrics.items():
+                    val_parts.append(f"VAL_{metric_name.upper()}: {metric_value.item():.6e}")
+                val_parts.append("]")
+                print(" | ".join(val_parts))
             if self.global_rank == 0:
                 print(f"Epoch time: {epoch_time}s")
 
@@ -230,6 +274,7 @@ class Trainer:
         if self.global_rank == 0:
             print(f"The average time per epoch is {self.time_epoch}s")
 
-        self._run_val(self.val_data)
+        if not self.validate_each_epoch:
+            self._run_val(self.val_data)
         if self.global_rank == 0:
             print(f"The validation loss is {self.val_loss}.")

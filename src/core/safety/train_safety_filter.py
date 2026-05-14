@@ -15,6 +15,10 @@ from core.training.loaders import create_dataloaders
 from core.training.trainer import Trainer, resolve_device
 
 
+def _history_curve(history_rows, key):
+    return [float(row[key]) for row in history_rows if key in row]
+
+
 class StatePredictorTrainAdapter(nn.Module):
     def __init__(self, predictor: StatePredictor):
         super().__init__()
@@ -45,6 +49,7 @@ def main(
     pin_memory: bool,
     persistent_workers: bool,
     prefetch_factor: int,
+    per_epoch_validation: bool,
 ):
     device = resolve_device(device_name)
     output_path = Path(output_path)
@@ -105,12 +110,19 @@ def main(
         scheduler=scheduler,
         criterion=criterion,
         metric_fns={"mse": nn.MSELoss(), "mae": nn.L1Loss()},
+        validate_each_epoch=per_epoch_validation,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
         device=device,
     )
     trainer.train(total_epochs)
+    train_history = trainer.history.get("train", [])
+    val_history = trainer.history.get("val", [])
+    mse_epoch_train = _history_curve(train_history, "mse")
+    mae_epoch_train = _history_curve(train_history, "mae")
+    mse_epoch_val = _history_curve(val_history, "mse")
+    mae_epoch_val = _history_curve(val_history, "mae")
 
     if rank == 0:
         base_predictor = model.module.predictor if distributed else predictor
@@ -125,6 +137,12 @@ def main(
                     "dropout": dropout,
                 },
                 "dataset_path": dataset_path,
+                "training_history": {
+                    "mse_epoch_train": mse_epoch_train,
+                    "mae_epoch_train": mae_epoch_train,
+                    "mse_epoch_val": mse_epoch_val,
+                    "mae_epoch_val": mae_epoch_val,
+                },
             },
             str(output_path),
         )
@@ -159,6 +177,13 @@ if __name__ == "__main__":
     parser.add_argument("--persistent_workers", action="store_true", help="Keep workers alive")
     parser.add_argument("--prefetch_factor", default=2, type=int, help="Prefetch factor")
     parser.add_argument(
+        "--per-epoch-validation",
+        dest="per_epoch_validation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run and print validation metrics each epoch (default: enabled).",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "cpu", "mps", "cuda"],
@@ -185,4 +210,5 @@ if __name__ == "__main__":
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
+        per_epoch_validation=args.per_epoch_validation,
     )

@@ -19,6 +19,10 @@ from core.training.loaders import create_dataloaders
 from core.training.trainer import Trainer, resolve_device
 
 
+def _history_curve(history_rows, key):
+    return [float(row[key]) for row in history_rows if key in row]
+
+
 def main(
     total_epochs,
     root_dir,
@@ -40,6 +44,7 @@ def main(
     prefetch_factor=2,
     alpha=0.5,
     beta=0.0,
+    per_epoch_validation=True,
 ):
     device = resolve_device(device_name)
     if distributed:
@@ -117,7 +122,17 @@ def main(
                             "scale": "log",
                         },
                     },
-                    metrics=["mse_dp", "mse", "mae"],
+                    metrics=[
+                        "mse_dp",
+                        "mse",
+                        "mae",
+                        "mse_dp_epoch_train",
+                        "mse_epoch_train",
+                        "mae_epoch_train",
+                        "mse_dp_epoch_val",
+                        "mse_epoch_val",
+                        "mae_epoch_val",
+                    ],
                 )
             sample = hpo_logger.sample()
             num_layers = int(sample["num_layers"])
@@ -175,6 +190,12 @@ def main(
         loss_store = np.zeros([n_trials])
         mse_store = np.zeros([n_trials])
         mae_store = np.zeros([n_trials])
+        mse_dp_epoch_train_store = []
+        mse_epoch_train_store = []
+        mae_epoch_train_store = []
+        mse_dp_epoch_val_store = []
+        mse_epoch_val_store = []
+        mae_epoch_val_store = []
 
         for trial_idx in range(n_trials):
             if distributed:
@@ -197,6 +218,7 @@ def main(
                 metric_fns={"mse": mse, "mae": mae},
                 val_fn=val_fn,
                 train_method=train_method,
+                validate_each_epoch=per_epoch_validation,
                 distributed=distributed,
                 rank=rank,
                 world_size=world_size,
@@ -210,6 +232,14 @@ def main(
             loss_store[trial_idx] = float(trainer.val_loss.detach().cpu().numpy())
             mse_store[trial_idx] = float(trainer.val_metrics["mse"].detach().cpu().numpy())
             mae_store[trial_idx] = float(trainer.val_metrics["mae"].detach().cpu().numpy())
+            train_history = trainer.history.get("train", [])
+            val_history = trainer.history.get("val", [])
+            mse_dp_epoch_train_store.append(_history_curve(train_history, "loss"))
+            mse_epoch_train_store.append(_history_curve(train_history, "mse"))
+            mae_epoch_train_store.append(_history_curve(train_history, "mae"))
+            mse_dp_epoch_val_store.append(_history_curve(val_history, "loss"))
+            mse_epoch_val_store.append(_history_curve(val_history, "mse"))
+            mae_epoch_val_store.append(_history_curve(val_history, "mae"))
 
             if rank == 0:
                 print(
@@ -238,6 +268,24 @@ def main(
             hpo_logger.log_performance(loss_store, metric="mse_dp")
             hpo_logger.log_performance(mse_store, metric="mse")
             hpo_logger.log_performance(mae_store, metric="mae")
+            hpo_logger.log_performance(
+                np.asarray(mse_dp_epoch_train_store, dtype=float), metric="mse_dp_epoch_train"
+            )
+            hpo_logger.log_performance(
+                np.asarray(mse_epoch_train_store, dtype=float), metric="mse_epoch_train"
+            )
+            hpo_logger.log_performance(
+                np.asarray(mae_epoch_train_store, dtype=float), metric="mae_epoch_train"
+            )
+            hpo_logger.log_performance(
+                np.asarray(mse_dp_epoch_val_store, dtype=float), metric="mse_dp_epoch_val"
+            )
+            hpo_logger.log_performance(
+                np.asarray(mse_epoch_val_store, dtype=float), metric="mse_epoch_val"
+            )
+            hpo_logger.log_performance(
+                np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
+            )
             hpo_logger.save_log(str(output_dir / "hpo_log.parquet"))
 
     if distributed and dist.is_initialized():
@@ -276,6 +324,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--alpha", default=0.5, type=float, help="MSEWithDp alpha")
     parser.add_argument("--beta", default=0.0, type=float, help="MSEWithDp beta")
+    parser.add_argument(
+        "--per-epoch-validation",
+        dest="per_epoch_validation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run and print validation metrics each epoch (default: enabled).",
+    )
     args = parser.parse_args()
 
     main(
@@ -299,4 +354,5 @@ if __name__ == "__main__":
         prefetch_factor=args.prefetch_factor,
         alpha=args.alpha,
         beta=args.beta,
+        per_epoch_validation=args.per_epoch_validation,
     )
