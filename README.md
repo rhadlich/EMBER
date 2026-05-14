@@ -54,6 +54,20 @@ conda env create -f environment.yml
 conda activate rayenv2
 ```
 
+### Install project in editable mode
+
+To make imports like `from core...` work consistently across scripts and IDE runs, install EMBER as an editable package:
+
+```bash
+python -m pip install -e .
+```
+
+After this, you can run modules from the project root, for example:
+
+```bash
+python -m core.digital_twin.train_digital_twin --help
+```
+
 ### Quickstart: run a local training loop
 
 The primary entrypoint is `setup_run.py`. It configures an RLlib algorithm, spins up a custom `EnvRunner`, and schedules a “minion” worker that collects rollouts via shared memory.
@@ -111,9 +125,9 @@ Note: `app/RLapp.py` is currently a research/monitoring script and may need smal
   - **`src/core/environments/`**: engine environments and learned surrogate model interface (`engine_env.py`, `predictor.py`, `define_models.py`, `reward_typing.py`)
   - **`src/core/rl_modules/`**: custom RL modules for APPO and IMPALA (`appo_rl_modules.py`, `impala_rl_modules.py`)
   - **`src/core/safety/`**: learned dynamics + runtime safety filter (`safety_filter.py`)
+  - **`src/core/digital_twin/`**: digital twin architectures, datasets, visualization script, and model weights
   - **`src/utils/`**: utility modules (`utils.py`, `logging_setup.py`, `ray_primitives.py`, `shared_memory_utils.py`)
   - **`src/app/`**: GUI application (`RLapp.py`)
-  - **`src/assets/models/`**: model weights used by the surrogate predictor (`model_weights.pth`, `model_weights_mac.pth`)
 - **`legacy/`**: archived pre-reorg code (see `legacy/README.md`)
 
 ### Troubleshooting

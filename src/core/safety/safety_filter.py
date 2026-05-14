@@ -10,13 +10,34 @@ import utils.logging_setup as logging_setup
 class StatePredictor(nn.Module):
     def __init__(self,
     state_dim,
+    output_dim,
     action_dim,
     num_hidden,
     hidden_exp,
     dropout,
     ):
+        """
+        Initialize StatePredictor.
+
+        This will calculate y_next = f(x) + G(x) * u
+        where:
+            f(x) is the drift term
+            G(x) is the control-affine sensitivity matrix
+            u is the action
+            x is the rich state (or conditioning variables) that are used to predict the next state but are not propagated forward
+            y_next is the next state, contains only the variables that directly affect the barrier function
+        
+        Args:
+            state_dim: Dimension of x
+            output_dim: Dimension of y_next
+            action_dim: Dimension of u
+            num_hidden: Number of hidden layers
+            hidden_exp: Exponent of hidden layer width
+            dropout: Dropout probability
+        """
         super(StatePredictor, self).__init__()
         self.state_dim = state_dim
+        self.output_dim = output_dim
         self.action_dim = action_dim
         self.dropout = nn.Dropout(dropout)
         hidden_dim = int((2 ** hidden_exp) / (1-dropout))
@@ -25,21 +46,21 @@ class StatePredictor(nn.Module):
         layers += [nn.Linear(state_dim, hidden_dim), nn.SiLU()]
         for _ in range(num_hidden):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), self.dropout]
-        layers += [nn.Linear(hidden_dim, state_dim+state_dim*action_dim)]
+        layers += [nn.Linear(hidden_dim, output_dim+output_dim*action_dim)]
         self.network = nn.Sequential(*layers)
 
     def forward(self, x, u):
         # x is of shape (batch_size, state_dim)
         # u is of shape (batch_size, action_dim)
-        # return is of shape (batch_size, state_dim)
+        # return is of shape (batch_size, output_dim)
 
         # forward pass through the network
         x = self.network(x)
 
         # split network output into state equation components
-        f_x = x[:, :self.state_dim]
-        G_x = x[:, self.state_dim:]
-        G_x = torch.reshape(G_x, (G_x.shape[0], self.state_dim, self.action_dim))
+        f_x = x[:, :self.output_dim]
+        G_x = x[:, self.output_dim:]
+        G_x = torch.reshape(G_x, (G_x.shape[0], self.output_dim, self.action_dim))
 
         # compute state equation
         x_next = f_x + torch.bmm(G_x, u.unsqueeze(-1)).squeeze(-1)

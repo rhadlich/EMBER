@@ -76,7 +76,7 @@ class EngineEnvDiscrete(gym.Env):
         dropout = 0.1
         self.predictor = Predictor()
         # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
-        path = 'src/assets/models/model_weights_mac.pth'
+        path = 'src/core/digital_twin/models/model_weights_mac_local_new.pth'
         self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
@@ -242,7 +242,7 @@ class EngineEnvContinuous(gym.Env):
         self.predictor = Predictor()
         # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
 
-        path = 'src/assets/models/model_weights_mac.pth'
+        path = 'src/core/digital_twin/models/model_weights_mac_local_new.pth'
         self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
