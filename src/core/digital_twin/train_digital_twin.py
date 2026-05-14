@@ -1,7 +1,9 @@
 import argparse
 import os
+import random
 import time
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -11,7 +13,7 @@ import torch.optim as optim
 from torch.distributed import destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from core.digital_twin.architectures import MLP, MLP_with_GRU_head, MSEWithDp
+from core.digital_twin.architectures import MLP, MSEWithDp, ResidualMLP
 from core.digital_twin.datasets import InMemoryRowDataset
 from core.training import distributed as dist_utils
 from core.training.hpo import HPOGeneral
@@ -23,10 +25,49 @@ def _history_curve(history_rows, key):
     return [float(row[key]) for row in history_rows if key in row]
 
 
+def _set_global_seed(seed: int, rank: int = 0) -> int:
+    effective_seed = int(seed) + int(rank)
+    random.seed(effective_seed)
+    np.random.seed(effective_seed)
+    torch.manual_seed(effective_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(effective_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return effective_seed
+
+
+def _build_model(
+    architecture: Literal["mlp", "residual_mlp"],
+    data_shape: int,
+    label_shape: int,
+    num_layers: int,
+    layer_exp: int,
+    dropout: float,
+):
+    if architecture == "mlp":
+        return MLP(
+            input_dim=data_shape,
+            output_dim=label_shape,
+            num_hidden=num_layers,
+            hidden_exp=layer_exp,
+            dropout=dropout,
+        )
+    if architecture == "residual_mlp":
+        return ResidualMLP(
+            input_dim=data_shape,
+            output_dim=label_shape,
+            num_blocks=num_layers,
+            hidden_exp=layer_exp,
+        )
+    raise ValueError(f"Unsupported architecture '{architecture}'.")
+
+
 def main(
     total_epochs,
     root_dir,
     node_type,
+    architecture,
     method,
     num_layers,
     layer_exp,
@@ -45,6 +86,7 @@ def main(
     alpha=0.5,
     beta=0.0,
     per_epoch_validation=True,
+    seed=None,
 ):
     device = resolve_device(device_name)
     if distributed:
@@ -52,6 +94,14 @@ def main(
 
     rank = dist_utils.get_rank() if distributed else 0
     world_size = dist_utils.get_size() if distributed else 1
+    effective_seed = None
+    if seed is not None:
+        effective_seed = _set_global_seed(seed, rank=rank)
+        if rank == 0:
+            print(
+                f"Random seed set to {seed}"
+                + (f" (effective rank-0 seed {effective_seed})" if distributed else "")
+            )
 
     train_dataset = InMemoryRowDataset(
         os.path.join(root_dir, "train"),
@@ -81,6 +131,7 @@ def main(
         prefetch_factor=prefetch_factor,
         train_drop_last=True,
         validation_batch_size=1,
+        seed=effective_seed,
     )
     data_sample, label_sample = next(iter(train_loader))
     data_shape = int(data_sample.shape[-1])
@@ -133,6 +184,7 @@ def main(
                         "mse_epoch_val",
                         "mae_epoch_val",
                     ],
+                    seed=effective_seed,
                 )
             sample = hpo_logger.sample()
             num_layers = int(sample["num_layers"])
@@ -142,16 +194,17 @@ def main(
             if rank == 0:
                 print(f"HPO sample {hpo_iter}: {sample}")
 
-        model = MLP(
-            input_dim=data_shape,
-            output_dim=label_shape,
-            num_hidden=num_layers,
-            hidden_exp=layer_exp,
+        model = _build_model(
+            architecture=architecture,
+            data_shape=data_shape,
+            label_shape=label_shape,
+            num_layers=num_layers,
+            layer_exp=layer_exp,
             dropout=dropout,
         ).to(device)
         val_fn = None
         train_method = "default"
-        _ = MLP_with_GRU_head
+
         if distributed:
             model = DDP(model, device_ids=None, output_device=None)
 
@@ -162,12 +215,14 @@ def main(
                 {
                     "model_state_dict": base_model.state_dict(),
                     "model_config": {
+                        "architecture": architecture,
                         "input_dim": data_shape,
                         "output_dim": label_shape,
                         "num_hidden": num_layers,
                         "hidden_exp": layer_exp,
                         "dropout": dropout,
                     },
+                    "random_seed": effective_seed,
                     "normalization": {
                         "expected_feature_order": ["inj_pressure", "inj_timing", "inj_duration"],
                     },
@@ -252,12 +307,14 @@ def main(
                         {
                             "model_state_dict": base_model.state_dict(),
                             "model_config": {
+                                "architecture": architecture,
                                 "input_dim": data_shape,
                                 "output_dim": label_shape,
                                 "num_hidden": num_layers,
                                 "hidden_exp": layer_exp,
                                 "dropout": dropout,
                             },
+                            "random_seed": effective_seed,
                         },
                         filename_model,
                     )
@@ -297,8 +354,26 @@ if __name__ == "__main__":
     parser.add_argument("total_epochs", type=int, help="Total epochs to train the model")
     parser.add_argument("root_dir", type=str, help="Root directory with train/validation datasets")
     parser.add_argument("node_type", type=str, help="Model tag used in checkpoint filename")
+    parser.add_argument(
+        "--architecture",
+        default="mlp",
+        choices=["mlp", "residual_mlp"],
+        type=str,
+        help=(
+            "Model architecture. 'mlp' uses --num_layers as hidden-layer count. "
+            "'residual_mlp' uses --num_layers as residual-block count (each block has 2 linear layers)."
+        ),
+    )
     parser.add_argument("--method", default="dummy", type=str, help="Distributed init method")
-    parser.add_argument("--num_layers", default=4, type=int, help="Number of hidden layers")
+    parser.add_argument(
+        "--num_layers",
+        default=4,
+        type=int,
+        help=(
+            "Depth control. For 'mlp': number of hidden layers after the input layer. "
+            "For 'residual_mlp': number of residual blocks."
+        ),
+    )
     parser.add_argument("--num_nodes_exp", default=10, type=int, help="Exponential width factor")
     parser.add_argument("--lr", default=0.0003, type=float, help="Learning rate")
     parser.add_argument("--batch_size", default=128, type=int, help="Batch size")
@@ -325,6 +400,12 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", default=0.5, type=float, help="MSEWithDp alpha")
     parser.add_argument("--beta", default=0.0, type=float, help="MSEWithDp beta")
     parser.add_argument(
+        "--seed",
+        default=None,
+        type=int,
+        help="Global random seed for reproducible and recoverable training runs.",
+    )
+    parser.add_argument(
         "--per-epoch-validation",
         dest="per_epoch_validation",
         action=argparse.BooleanOptionalAction,
@@ -337,6 +418,7 @@ if __name__ == "__main__":
         args.total_epochs,
         args.root_dir,
         args.node_type,
+        args.architecture,
         args.method,
         args.num_layers,
         args.num_nodes_exp,
@@ -355,4 +437,5 @@ if __name__ == "__main__":
         alpha=args.alpha,
         beta=args.beta,
         per_epoch_validation=args.per_epoch_validation,
+        seed=args.seed,
     )

@@ -5,28 +5,31 @@ import pandas as pd
 import torch.distributed as dist
 
 
-def suggest_float(low, high, scale="linear"):
+def suggest_float(low, high, scale="linear", rng: Optional[np.random.Generator] = None):
+    rng = rng or np.random.default_rng()
     if scale == "linear":
-        num = np.random.rand() * (high - low) + low
+        num = rng.random() * (high - low) + low
     elif scale == "log":
         if low <= 0 or high <= 0:
             raise ValueError("Log scale sampling requires low > 0 and high > 0")
         if low > high:
             raise ValueError(f"Expected low <= high, got low={low}, high={high}")
-        num = np.exp(np.random.uniform(np.log(low), np.log(high)))
+        num = np.exp(rng.uniform(np.log(low), np.log(high)))
     else:
         raise ValueError("scale must be linear or log")
     return float(num)
 
 
-def suggest_int(low, high, step=1):
+def suggest_int(low, high, step=1, rng: Optional[np.random.Generator] = None):
+    rng = rng or np.random.default_rng()
     rescale = int((high - low) / step)
-    sample = np.random.randint(rescale + 1)
+    sample = int(rng.integers(rescale + 1))
     return int(sample * step + low)
 
 
-def suggest_categorical(cats):
-    sample = np.random.randint(len(cats))
+def suggest_categorical(cats, rng: Optional[np.random.Generator] = None):
+    rng = rng or np.random.default_rng()
+    sample = int(rng.integers(len(cats)))
     return cats[sample]
 
 
@@ -37,9 +40,7 @@ class HPOGeneral:
         metrics: Optional[Sequence[str]] = ("metric",),
         seed: Optional[int] = None,
     ):
-        if seed is not None:
-            np.random.seed(seed)
-
+        self._rng = np.random.default_rng(seed)
         self.param_configs = param_configs
         self.pg_avail = dist.is_available() and dist.is_initialized()
         self.logger: Dict[str, Any] = {
@@ -74,11 +75,13 @@ class HPOGeneral:
         for name, cfg in self.param_configs.items():
             param_type = cfg.get("type")
             if param_type == "float":
-                val = suggest_float(cfg["low"], cfg["high"], cfg.get("scale", "linear"))
+                val = suggest_float(
+                    cfg["low"], cfg["high"], cfg.get("scale", "linear"), rng=self._rng
+                )
             elif param_type == "int":
-                val = suggest_int(cfg["low"], cfg["high"], cfg.get("step", 1))
+                val = suggest_int(cfg["low"], cfg["high"], cfg.get("step", 1), rng=self._rng)
             elif param_type == "categorical":
-                val = suggest_categorical(cfg["choices"])
+                val = suggest_categorical(cfg["choices"], rng=self._rng)
             else:
                 raise ValueError(f"Unknown type '{param_type}' for hyperparameter '{name}'")
             if isinstance(val, np.generic):

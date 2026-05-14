@@ -68,6 +68,54 @@ class MLP_with_GRU_head(nn.Module):
         return p_hat
 
 
+class ResidualMLPBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_exp: int,
+    ):
+        super().__init__()
+        hidden_dim = int((2 ** hidden_exp))
+        self.activation = nn.SiLU()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            self.activation,
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, x):
+        return self.activation(x + self.net(x))
+
+
+class ResidualMLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_blocks: int,
+        hidden_exp: int,
+    ):
+        super().__init__()
+
+        hidden_dim = int((2 ** hidden_exp))
+
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU()
+        )
+
+        self.blocks = nn.Sequential(
+            *[ResidualMLPBlock(hidden_exp) for _ in range(num_blocks)],
+        )
+
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        x = self.input_layer(x)
+        x = self.blocks(x)
+        x = self.output_layer(x)
+        return x
+
+
 class MSEWithDp(nn.Module):
     def __init__(self, alpha: float = 1, beta: float = 0.01, reduction: str = "mean"):
         super().__init__()

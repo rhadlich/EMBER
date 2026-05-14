@@ -1,6 +1,8 @@
 import argparse
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +19,18 @@ from core.training.trainer import Trainer, resolve_device
 
 def _history_curve(history_rows, key):
     return [float(row[key]) for row in history_rows if key in row]
+
+
+def _set_global_seed(seed: int, rank: int = 0) -> int:
+    effective_seed = int(seed) + int(rank)
+    random.seed(effective_seed)
+    np.random.seed(effective_seed)
+    torch.manual_seed(effective_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(effective_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return effective_seed
 
 
 class StatePredictorTrainAdapter(nn.Module):
@@ -50,6 +64,7 @@ def main(
     persistent_workers: bool,
     prefetch_factor: int,
     per_epoch_validation: bool,
+    seed: int | None,
 ):
     device = resolve_device(device_name)
     output_path = Path(output_path)
@@ -59,6 +74,14 @@ def main(
 
     rank = dist_utils.get_rank() if distributed else 0
     world_size = dist_utils.get_size() if distributed else 1
+    effective_seed = None
+    if seed is not None:
+        effective_seed = _set_global_seed(seed, rank=rank)
+        if rank == 0:
+            print(
+                f"Random seed set to {seed}"
+                + (f" (effective rank-0 seed {effective_seed})" if distributed else "")
+            )
 
     dataset = SafetyInMemoryRowDataset(
         dataset_path,
@@ -71,7 +94,12 @@ def main(
     if train_len == 0 or val_len == 0:
         raise ValueError("Dataset split produced empty train or validation split.")
 
-    train_data, val_data = random_split(dataset, [train_len, val_len])
+    split_generator = None
+    if effective_seed is not None:
+        split_generator = torch.Generator().manual_seed(effective_seed)
+    train_data, val_data = random_split(
+        dataset, [train_len, val_len], generator=split_generator
+    )
     train_loader, _, val_loader, _ = create_dataloaders(
         train_dataset=train_data,
         validation_dataset=val_data,
@@ -85,6 +113,7 @@ def main(
         prefetch_factor=prefetch_factor,
         train_drop_last=True,
         validation_batch_size=batch_size,
+        seed=effective_seed,
     )
 
     predictor = StatePredictor(
@@ -137,6 +166,7 @@ def main(
                     "dropout": dropout,
                 },
                 "dataset_path": dataset_path,
+                "random_seed": effective_seed,
                 "training_history": {
                     "mse_epoch_train": mse_epoch_train,
                     "mae_epoch_train": mae_epoch_train,
@@ -177,6 +207,12 @@ if __name__ == "__main__":
     parser.add_argument("--persistent_workers", action="store_true", help="Keep workers alive")
     parser.add_argument("--prefetch_factor", default=2, type=int, help="Prefetch factor")
     parser.add_argument(
+        "--seed",
+        default=None,
+        type=int,
+        help="Global random seed for reproducible and recoverable training runs.",
+    )
+    parser.add_argument(
         "--per-epoch-validation",
         dest="per_epoch_validation",
         action=argparse.BooleanOptionalAction,
@@ -211,4 +247,5 @@ if __name__ == "__main__":
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
         per_epoch_validation=args.per_epoch_validation,
+        seed=args.seed,
     )

@@ -1,6 +1,17 @@
-from typing import Tuple
+import random
+from functools import partial
+from typing import Callable, Optional, Tuple
 
+import numpy as np
+import torch
 from torch.utils.data import DataLoader, DistributedSampler
+
+
+def _seed_worker(worker_id: int, *, base_seed: int) -> None:
+    worker_seed = base_seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def create_dataloaders(
@@ -17,6 +28,7 @@ def create_dataloaders(
     prefetch_factor: int = 2,
     train_drop_last: bool = True,
     validation_batch_size: int = 1,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, int, DataLoader, int]:
     if batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -35,12 +47,20 @@ def create_dataloaders(
             rank=rank,
             shuffle=True,
             drop_last=train_drop_last,
+            seed=0 if seed is None else seed,
         )
 
     loader_kwargs = {}
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = persistent_workers
         loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    generator = None
+    worker_init_fn = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        worker_init_fn = partial(_seed_worker, base_seed=seed)
 
     train_loader = DataLoader(
         train_dataset,
@@ -50,6 +70,8 @@ def create_dataloaders(
         shuffle=not distributed,
         pin_memory=pin_memory,
         drop_last=train_drop_last,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
         **loader_kwargs,
     )
 
@@ -59,6 +81,8 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
         **loader_kwargs,
     )
 
