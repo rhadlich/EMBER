@@ -106,8 +106,10 @@ class InMemoryRowDataset(Dataset):
             raise ValueError("Found zeros in feature_std; cannot normalize safely.")
         data_all = (data_all - ref_mean) / ref_std
 
-        self.data = data_all[self.local_start : self.local_end]
-        self.labels = label_all[self.local_start : self.local_end]
+        # Ensure samples are writable contiguous arrays so PyTorch collation
+        # does not warn about non-writable NumPy buffers.
+        self.data = np.array(data_all[self.local_start : self.local_end], copy=True, order="C")
+        self.labels = np.array(label_all[self.local_start : self.local_end], copy=True, order="C")
         self.data_shape = (self.feature_dim,)
         self.label_shape = (self.label_dim,)
 
