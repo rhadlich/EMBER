@@ -34,15 +34,19 @@ def _history_curve(history_rows, key):
     return [float(row[key]) for row in history_rows if key in row]
 
 
-def _set_global_seed(seed: int, rank: int = 0) -> int:
+def _set_global_seed(seed: int, rank: int = 0, strict_reproducibility: bool = False) -> int:
     effective_seed = int(seed) + int(rank)
     random.seed(effective_seed)
     np.random.seed(effective_seed)
     torch.manual_seed(effective_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(effective_seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if strict_reproducibility:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
     return effective_seed
 
 
@@ -107,9 +111,11 @@ def main(
     persistent_workers=False,
     prefetch_factor=2,
     alpha=0.5,
-    beta=0.0,
     per_epoch_validation=True,
     seed=None,
+    use_amp=None,
+    strict_reproducibility=False,
+    validation_batch_size=256,
     hpo_backend="legacy",
     ray_asha_grace_period=3,
     ray_asha_reduction_factor=2.0,
@@ -126,9 +132,20 @@ def main(
 
     rank = dist_utils.get_rank() if distributed else 0
     world_size = dist_utils.get_size() if distributed else 1
+
+    if device.type == "cuda" and not strict_reproducibility:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+    if use_amp is None:
+        use_amp = device.type == "cuda"
+    use_amp = bool(use_amp) and device.type == "cuda"
+
     effective_seed = None
     if seed is not None:
-        effective_seed = _set_global_seed(seed, rank=rank)
+        effective_seed = _set_global_seed(
+            seed, rank=rank, strict_reproducibility=strict_reproducibility
+        )
         if rank == 0:
             print(
                 f"Random seed set to {seed}"
@@ -162,7 +179,7 @@ def main(
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
         train_drop_last=True,
-        validation_batch_size=1,
+        validation_batch_size=validation_batch_size,
         seed=effective_seed,
     )
     data_sample, label_sample = next(iter(train_loader))
@@ -171,13 +188,16 @@ def main(
 
     if rank == 0:
         print(f"Using device: {device}")
+        print(f"AMP fp16: {'enabled' if use_amp else 'disabled'}")
+        print(f"Strict reproducibility: {'on' if strict_reproducibility else 'off'}")
+        print(f"Validation batch size: {validation_batch_size}")
         print(f"Train rows: {train_size}")
         print(f"Validation rows: {validation_size}")
         print(f"Data shape: {data_shape}, label shape: {label_shape}")
 
     mse = nn.MSELoss(reduction="mean")
     mae = nn.L1Loss()
-    criterion = MSEWithDp(alpha=alpha, beta=beta)
+    criterion = MSEWithDp(alpha=alpha)
 
     training_iters = max(1, hpo_iters)
     hpo_logger = None
@@ -273,7 +293,7 @@ def main(
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
                 train_drop_last=True,
-                validation_batch_size=1,
+                validation_batch_size=validation_batch_size,
                 seed=trial_seed,
             )
             local_data_sample, local_label_sample = next(iter(local_train_loader))
@@ -293,7 +313,7 @@ def main(
                 layer_exp=trial_layer_exp,
                 dropout=trial_dropout,
             ).to(device)
-            local_criterion = MSEWithDp(alpha=alpha, beta=beta)
+            local_criterion = MSEWithDp(alpha=alpha)
             local_mse = nn.MSELoss(reduction="mean")
             local_mae = nn.L1Loss()
             optimizer_lr = trial_lr * batch_size / 64
@@ -322,6 +342,7 @@ def main(
                 rank=0,
                 world_size=1,
                 device=device,
+                use_amp=use_amp,
             )
             trainer.train(total_epochs)
 
@@ -458,6 +479,7 @@ def main(
                 rank=rank,
                 world_size=world_size,
                 device=device,
+                use_amp=use_amp,
             )
 
             tic = time.time()
@@ -585,7 +607,31 @@ if __name__ == "__main__":
         help="Training device",
     )
     parser.add_argument("--alpha", default=0.5, type=float, help="MSEWithDp alpha")
-    parser.add_argument("--beta", default=0.0, type=float, help="MSEWithDp beta")
+    parser.add_argument(
+        "--amp",
+        dest="use_amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable fp16 automatic mixed precision (CUDA only). "
+            "Default: enabled when device is CUDA, otherwise disabled."
+        ),
+    )
+    parser.add_argument(
+        "--strict-reproducibility",
+        dest="strict_reproducibility",
+        action="store_true",
+        help=(
+            "Force cuDNN deterministic mode and disable the autotuner. "
+            "Slower but bitwise reproducible for a given seed."
+        ),
+    )
+    parser.add_argument(
+        "--validation_batch_size",
+        default=256,
+        type=int,
+        help="Validation DataLoader batch size (default: 256).",
+    )
     parser.add_argument(
         "--seed",
         default=None,
@@ -670,9 +716,11 @@ if __name__ == "__main__":
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
         alpha=args.alpha,
-        beta=args.beta,
         per_epoch_validation=args.per_epoch_validation,
         seed=args.seed,
+        use_amp=args.use_amp,
+        strict_reproducibility=args.strict_reproducibility,
+        validation_batch_size=args.validation_batch_size,
         hpo_backend=args.hpo_backend,
         ray_asha_grace_period=args.ray_asha_grace_period,
         ray_asha_reduction_factor=args.ray_asha_reduction_factor,

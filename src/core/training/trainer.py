@@ -1,3 +1,4 @@
+import random
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -34,6 +35,8 @@ def resolve_device(device_name: str = "auto") -> torch.device:
 
 def _to_device(batch: Any, device: torch.device):
     if torch.is_tensor(batch):
+        if device.type == "cuda":
+            return batch.to(device, non_blocking=True)
         return batch.to(device)
     if isinstance(batch, tuple):
         return tuple(_to_device(item, device) for item in batch)
@@ -63,6 +66,7 @@ class Trainer:
         rank: int = 0,
         world_size: int = 1,
         device: Optional[torch.device] = None,
+        use_amp: bool = False,
     ) -> None:
         self.model = model
         self.train_data = train_data
@@ -79,6 +83,8 @@ class Trainer:
         self.global_rank = rank
         self.world_size = world_size
         self.device = device or resolve_device("auto")
+        self.use_amp = bool(use_amp) and self.device.type == "cuda"
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         self.epochs_run = 0
         self.loss = float("inf")
@@ -125,9 +131,10 @@ class Trainer:
         return batch[0], batch[1]
 
     def _run_batch(self, source, targets):
-        self.optimizer.zero_grad()
-        output = self.model(source)
-        loss = self.criterion(output, targets)
+        self.optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=torch.float16):
+            output = self.model(source)
+            loss = self.criterion(output, targets)
         self.loss = loss
         self.loss_logger += loss.detach()
         for metric_name, metric_fn in self.metric_fns.items():
@@ -144,45 +151,53 @@ class Trainer:
                     term_name, torch.tensor(0.0, device=self.device)
                 ) + term_tensor
 
-        loss.backward()
-        self.optimizer.step()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
 
     def _run_val(self, loader):
         self.model.eval()
         step_fn = self.val_fn or self.model
-        val_logger = torch.tensor(0.0, device=self.device)
-        val_metric_loggers = {
+        val_sum = torch.tensor(0.0, device=self.device)
+        val_metric_sums = {
             name: torch.tensor(0.0, device=self.device) for name in self.metric_fns.keys()
         }
+        total_samples = torch.tensor(0.0, device=self.device)
 
-        val_steps = 0
         with torch.no_grad():
             for batch in loader:
                 source, targets = self._split_batch(batch)
                 source = _to_device(source, self.device)
                 targets = _to_device(targets, self.device)
-                output = step_fn(source)
-                loss = self.criterion(output, targets)
-                val_logger += loss.detach()
+                with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=torch.float16):
+                    output = step_fn(source)
+                    loss = self.criterion(output, targets)
+                if torch.is_tensor(targets):
+                    batch_n = targets.shape[0]
+                elif isinstance(targets, (list, tuple)) and len(targets) > 0 and torch.is_tensor(targets[0]):
+                    batch_n = targets[0].shape[0]
+                else:
+                    batch_n = 1
+                weight = torch.tensor(float(batch_n), device=self.device)
+                val_sum += loss.detach() * weight
                 for metric_name, metric_fn in self.metric_fns.items():
-                    val_metric_loggers[metric_name] += metric_fn(output, targets).detach()
-                val_steps += 1
-
-        if val_steps == 0:
-            raise ValueError("Validation loader produced zero batches.")
-
-        self.val_loss = val_logger / val_steps
-        self.val_metrics = {
-            metric_name: metric_value / val_steps
-            for metric_name, metric_value in val_metric_loggers.items()
-        }
+                    val_metric_sums[metric_name] += metric_fn(output, targets).detach() * weight
+                total_samples += weight
 
         if self.distributed and dist.is_initialized():
-            dist.all_reduce(self.val_loss)
-            self.val_loss /= self.world_size
-            for metric_name in list(self.val_metrics.keys()):
-                dist.all_reduce(self.val_metrics[metric_name])
-                self.val_metrics[metric_name] /= self.world_size
+            dist.all_reduce(val_sum)
+            dist.all_reduce(total_samples)
+            for metric_name in list(val_metric_sums.keys()):
+                dist.all_reduce(val_metric_sums[metric_name])
+
+        if float(total_samples.item()) == 0.0:
+            raise ValueError("Validation loader produced zero samples.")
+
+        self.val_loss = val_sum / total_samples
+        self.val_metrics = {
+            metric_name: metric_value / total_samples
+            for metric_name, metric_value in val_metric_sums.items()
+        }
 
         self.model.train()
 
@@ -213,7 +228,7 @@ class Trainer:
                 source, targets = self._split_batch(batch)
                 source = _to_device(source, self.device)
                 targets = _to_device(targets, self.device)
-                if torch.rand(1, device=self.device) < tf_ratio:
+                if random.random() < tf_ratio:
                     p_in = targets
                 else:
                     p_in = self.val_fn(source)
