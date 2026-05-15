@@ -3,6 +3,7 @@ import os
 
 import h5py as h5
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 
@@ -106,10 +107,24 @@ class InMemoryRowDataset(Dataset):
             raise ValueError("Found zeros in feature_std; cannot normalize safely.")
         data_all = (data_all - ref_mean) / ref_std
 
-        # Ensure samples are writable contiguous arrays so PyTorch collation
-        # does not warn about non-writable NumPy buffers.
-        self.data = np.array(data_all[self.local_start : self.local_end], copy=True, order="C")
-        self.labels = np.array(label_all[self.local_start : self.local_end], copy=True, order="C")
+        # Materialize contiguous writable arrays and convert once to tensors so
+        # DataLoader collation does not need to convert NumPy views.
+        self.data = torch.from_numpy(
+            np.array(
+                data_all[self.local_start : self.local_end],
+                dtype=np.float32,
+                copy=True,
+                order="C",
+            )
+        )
+        self.labels = torch.from_numpy(
+            np.array(
+                label_all[self.local_start : self.local_end],
+                dtype=np.float32,
+                copy=True,
+                order="C",
+            )
+        )
         self.data_shape = (self.feature_dim,)
         self.label_shape = (self.label_dim,)
 
