@@ -1,4 +1,6 @@
+import secrets
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -47,13 +49,33 @@ class HPOGeneral:
         metrics: Optional[Sequence[str]] = ("metric",),
         seed: Optional[int] = None,
     ):
-        self._rng = np.random.default_rng(seed)
         self.param_configs = param_configs
         self.pg_avail = dist.is_available() and dist.is_initialized()
+        self.run_id = self._generate_run_id()
+        self._rng = np.random.default_rng(seed)
         self.logger: Dict[str, Any] = {
             "hyperparameter": {name: [] for name in param_configs},
             "performance": {m: [] for m in (metrics or [])},
         }
+
+    @staticmethod
+    def _random_run_id() -> str:
+        return f"{secrets.randbelow(1000):03d}"
+
+    def _generate_run_id(self) -> str:
+        if self.pg_avail:
+            run_id = self._random_run_id() if dist.get_rank() == 0 else None
+            payload = [run_id]
+            dist.broadcast_object_list(payload, src=0)
+            return payload[0]
+        return self._random_run_id()
+
+    def unique_log_path(self, filename: str) -> str:
+        path = Path(filename)
+        suffix = f"_{self.run_id}"
+        if path.stem.endswith(suffix):
+            return str(path)
+        return str(path.with_name(f"{path.stem}{suffix}{path.suffix}"))
 
     @staticmethod
     def _serialize_value(value: Any) -> Any:
@@ -128,6 +150,7 @@ class HPOGeneral:
         self.logger["performance"][metric].append(value)
 
     def save_log(self, filename: str) -> None:
+        filename = self.unique_log_path(filename)
         pg_avail = self.pg_avail and dist.is_available() and dist.is_initialized()
         is_writer = (dist.get_rank() == 0) if pg_avail else True
         if is_writer:

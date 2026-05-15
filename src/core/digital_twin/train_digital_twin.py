@@ -79,8 +79,8 @@ def _build_model(
 
 def _default_hpo_param_configs():
     return {
-        "num_layers": {"type": "int", "low": 2, "high": 10},
-        "layer_exp": {"type": "int", "low": 7, "high": 10},
+        "num_layers": {"type": "int", "low": 1, "high": 10},
+        "layer_exp": {"type": "int", "low": 7, "high": 12},
         "dropout": {"type": "int", "low": 0, "high": 3},
         "learning_rate": {
             "type": "float",
