@@ -1,6 +1,7 @@
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -72,6 +73,9 @@ class HPOGeneral:
 
     def unique_log_path(self, filename: str) -> str:
         path = Path(filename)
+        # Respect explicit run-suffixed names passed by callers.
+        if re.search(r"_\d{3}$", path.stem):
+            return str(path)
         run_suffix = f"_{self.run_id}"
         if path.stem.endswith(run_suffix):
             return str(path)

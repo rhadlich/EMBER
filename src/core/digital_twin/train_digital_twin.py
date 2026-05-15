@@ -2,6 +2,7 @@ import argparse
 import copy
 import os
 import random
+import secrets
 import time
 from pathlib import Path
 from typing import Literal
@@ -32,6 +33,11 @@ from core.training.trainer import Trainer, resolve_device
 
 def _history_curve(history_rows, key):
     return [float(row[key]) for row in history_rows if key in row]
+
+
+def _build_hpo_log_path(output_dir: Path) -> Path:
+    run_id = f"{secrets.randbelow(1000):03d}"
+    return output_dir / f"hpo_log_{run_id}.parquet"
 
 
 def _set_global_seed(seed: int, rank: int = 0, strict_reproducibility: bool = False) -> int:
@@ -219,6 +225,9 @@ def main(
     else:
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    hpo_log_path = _build_hpo_log_path(output_dir)
+    if rank == 0:
+        print(f"HPO log path: {hpo_log_path}")
 
     scheduler_step = 10
     scheduler_gamma = 0.5
@@ -357,7 +366,7 @@ def main(
         ray_hpo_logger = ray_trials_to_hpo_logger(
             trial_results=trial_results, param_configs=param_configs, seed=effective_seed
         )
-        ray_hpo_logger.save_log(ray_hpo_logger.build_log_path(output_dir))
+        ray_hpo_logger.save_log(str(hpo_log_path))
 
         if rank == 0:
             best_result = result_grid.get_best_result(metric="val_loss", mode="min")
@@ -534,7 +543,7 @@ def main(
             hpo_logger.log_performance(
                 np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
             )
-            hpo_logger.save_log(hpo_logger.build_log_path(output_dir))
+            hpo_logger.save_log(str(hpo_log_path))
 
     if distributed and dist.is_initialized():
         destroy_process_group()
