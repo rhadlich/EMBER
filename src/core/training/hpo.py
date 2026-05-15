@@ -72,10 +72,20 @@ class HPOGeneral:
 
     def unique_log_path(self, filename: str) -> str:
         path = Path(filename)
-        suffix = f"_{self.run_id}"
-        if path.stem.endswith(suffix):
+        run_suffix = f"_{self.run_id}"
+        if path.stem.endswith(run_suffix):
             return str(path)
-        return str(path.with_name(f"{path.stem}{suffix}{path.suffix}"))
+        ext = path.suffix
+        return str(path.with_name(f"{path.stem}{run_suffix}{ext}"))
+
+    def build_log_path(
+        self,
+        directory: Union[str, Path],
+        stem: str = "hpo_log",
+        ext: str = "parquet",
+    ) -> str:
+        ext = ext.lstrip(".")
+        return self.unique_log_path(str(Path(directory) / f"{stem}.{ext}"))
 
     @staticmethod
     def _serialize_value(value: Any) -> Any:
@@ -149,7 +159,7 @@ class HPOGeneral:
             )
         self.logger["performance"][metric].append(value)
 
-    def save_log(self, filename: str) -> None:
+    def save_log(self, filename: str) -> str:
         filename = self.unique_log_path(filename)
         pg_avail = self.pg_avail and dist.is_available() and dist.is_initialized()
         is_writer = (dist.get_rank() == 0) if pg_avail else True
@@ -160,7 +170,7 @@ class HPOGeneral:
                 for key, values in raw_data.items()
             }
             df = pd.DataFrame(data)
-            ext = filename.lower().split(".")[-1]
+            ext = Path(filename).suffix.lstrip(".").lower()
             if ext == "csv":
                 df.to_csv(filename, index=False)
             elif ext == "json":
@@ -171,8 +181,10 @@ class HPOGeneral:
                 df.to_parquet(filename, index=False)
             else:
                 df.to_parquet(filename)
+            print(f"Wrote HPO log to {filename} (run_id={self.run_id})")
         if pg_avail:
             dist.barrier()
+        return filename
 
 
 @dataclass

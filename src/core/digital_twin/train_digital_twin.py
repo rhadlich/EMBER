@@ -357,7 +357,7 @@ def main(
         ray_hpo_logger = ray_trials_to_hpo_logger(
             trial_results=trial_results, param_configs=param_configs, seed=effective_seed
         )
-        ray_hpo_logger.save_log(str(output_dir / "hpo_log.parquet"))
+        ray_hpo_logger.save_log(ray_hpo_logger.build_log_path(output_dir))
 
         if rank == 0:
             best_result = result_grid.get_best_result(metric="val_loss", mode="min")
@@ -534,7 +534,7 @@ def main(
             hpo_logger.log_performance(
                 np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
             )
-            hpo_logger.save_log(str(output_dir / "hpo_log.parquet"))
+            hpo_logger.save_log(hpo_logger.build_log_path(output_dir))
 
     if distributed and dist.is_initialized():
         destroy_process_group()
