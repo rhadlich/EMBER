@@ -236,7 +236,6 @@ def main(
             raise ValueError("Ray backend currently requires --n_trials=1.")
 
         from ray import tune
-        from ray import train as ray_train
 
         if ray_gpus_per_trial is None:
             ray_gpus_per_trial = 1.0 if device.type == "cuda" else 0.0
@@ -259,31 +258,16 @@ def main(
         stopper = build_combined_stopper(pruning_cfg, val_metric="val_loss", train_metric="train_loss")
         search_space = build_tune_search_space(param_configs)
 
-        def _trainable(config):
+        def _trainable(config, train_dataset, validation_dataset):
             trial_seed = int(effective_seed if effective_seed is not None else 0)
             random.seed(trial_seed)
             np.random.seed(trial_seed)
             torch.manual_seed(trial_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(trial_seed)
-
-            local_train_dataset = InMemoryRowDataset(
-                os.path.join(root_dir, "train"),
-                allow_uneven_distribution=False,
-                shuffle=True,
-                size=1,
-                rank=0,
-            )
-            local_validation_dataset = InMemoryRowDataset(
-                os.path.join(root_dir, "validation"),
-                allow_uneven_distribution=True,
-                shuffle=False,
-                size=1,
-                rank=0,
-            )
             local_train_loader, _, local_validation_loader, _ = create_dataloaders(
-                train_dataset=local_train_dataset,
-                validation_dataset=local_validation_dataset,
+                train_dataset=train_dataset,
+                validation_dataset=validation_dataset,
                 batch_size=batch_size,
                 size=1,
                 rank=0,
@@ -348,7 +332,11 @@ def main(
 
         tuner = tune.Tuner(
             tune.with_resources(
-                _trainable,
+                tune.with_parameters(
+                    _trainable,
+                    train_dataset=train_dataset,
+                    validation_dataset=validation_dataset,
+                ),
                 resources={"cpu": float(ray_cpus_per_trial), "gpu": float(ray_gpus_per_trial)},
             ),
             tune_config=tune.TuneConfig(
