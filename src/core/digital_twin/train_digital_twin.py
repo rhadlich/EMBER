@@ -72,6 +72,7 @@ def _build_model(
             output_dim=label_shape,
             num_blocks=num_layers,
             hidden_exp=layer_exp,
+            dropout=dropout,
         )
     raise ValueError(f"Unsupported architecture '{architecture}'.")
 
