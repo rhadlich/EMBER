@@ -13,3 +13,5 @@ scripts/
 visualize_predictions.py
 *.parquet
 *.pth
+*.local
+*.MacBookPro
