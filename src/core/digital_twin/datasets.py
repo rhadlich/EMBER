@@ -56,7 +56,7 @@ class InMemoryRowDataset(Dataset):
         for filename in self.files:
             with h5.File(filename, "r") as fin:
                 data = fin["features/data"][...]
-                label = fin["labels/pressure"][...]
+                label = fin["labels"][...]
                 mean = fin["normalization/feature_mean"][...].reshape(-1)
                 std_dev = fin["normalization/feature_std"][...].reshape(-1)
 
