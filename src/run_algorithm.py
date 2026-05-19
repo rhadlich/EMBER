@@ -202,8 +202,13 @@ def _load_filter_model(filter_model, args, logger) -> bool:
             f"Filter model checkpoint at {filter_dir} has incompatible spec. "
             f"Saved: {saved_spec}. Expected: {filter_spec}. Refusing to load."
         )
-    state = torch.load(pt_path, map_location="cpu")
-    filter_model.load_state_dict(state)
+    checkpoint = torch.load(pt_path, map_location="cpu")
+    state_dict = (
+        checkpoint.get("model_state_dict", checkpoint)
+        if isinstance(checkpoint, dict)
+        else checkpoint
+    )
+    filter_model.load_state_dict(state_dict)
     logger.info(f"Loaded filter model from {pt_path}")
     return True
 

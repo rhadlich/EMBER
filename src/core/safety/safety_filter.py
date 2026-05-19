@@ -8,13 +8,14 @@ import logging
 import utils.logging_setup as logging_setup
 
 class StatePredictor(nn.Module):
-    def __init__(self,
-    state_dim,
-    output_dim,
-    action_dim,
-    num_hidden,
-    hidden_exp,
-    dropout,
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        num_hidden,
+        hidden_exp,
+        dropout,
+        output_dim=None,
     ):
         """
         Initialize StatePredictor.
@@ -37,7 +38,7 @@ class StatePredictor(nn.Module):
         """
         super(StatePredictor, self).__init__()
         self.state_dim = state_dim
-        self.output_dim = output_dim
+        self.output_dim = state_dim if output_dim is None else output_dim
         self.action_dim = action_dim
         self.dropout = nn.Dropout(dropout)
         hidden_dim = int((2 ** hidden_exp) / (1-dropout))
@@ -46,7 +47,7 @@ class StatePredictor(nn.Module):
         layers += [nn.Linear(state_dim, hidden_dim), nn.SiLU()]
         for _ in range(num_hidden):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), self.dropout]
-        layers += [nn.Linear(hidden_dim, output_dim+output_dim*action_dim)]
+        layers += [nn.Linear(hidden_dim, self.output_dim + self.output_dim * action_dim)]
         self.network = nn.Sequential(*layers)
 
     def forward(self, x, u):
