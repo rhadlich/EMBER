@@ -408,5 +408,25 @@ def custom_args(
         help="'create': Always create new models from scratch. "
         "'load': Load existing models if found (error on spec mismatch, warn and create new if missing).",
     )
+    parser.add_argument(
+        "--predictor-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Predictor .pth file (absolute path, project-relative path, or filename under "
+            "src/core/digital_twin/models/) used by engine environments. "
+            "If omitted, the default predictor checkpoint is used."
+        ),
+    )
+    parser.add_argument(
+        "--filter-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Safety filter checkpoint (.pth/.pt). If provided, this file is used as "
+            "the starting filter model and its model_config (when present) overrides "
+            "filter architecture args."
+        ),
+    )
 
     return parser

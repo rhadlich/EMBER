@@ -213,10 +213,17 @@ class Minion:
 
         # initialize environment
         env_type = self.config.env_config['env_type']
+        predictor_checkpoint_path = self.config.env_config.get("predictor_checkpoint_path")
         if env_type == 'continuous':
-            self.env = EngineEnvContinuous(reward=reward_fn)
+            self.env = EngineEnvContinuous(
+                reward=reward_fn,
+                predictor_weights_path=predictor_checkpoint_path,
+            )
         elif env_type == 'discrete':
-            self.env = EngineEnvDiscrete(reward=reward_fn)
+            self.env = EngineEnvDiscrete(
+                reward=reward_fn,
+                predictor_weights_path=predictor_checkpoint_path,
+            )
         else:
             raise NotImplementedError(f"Environment type not supported or not provided.")
 

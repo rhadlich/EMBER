@@ -2,12 +2,66 @@ import gymnasium as gym
 from gymnasium import spaces
 from .reward_typing import RewardFn
 import numpy as np
+import torch
 from typing import Union
+from pathlib import Path
 
 from core.environments.predictor import Predictor
 
 import logging
 import utils.logging_setup as logging_setup
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_PREDICTOR_WEIGHTS = PROJECT_ROOT / "src/core/digital_twin/models/model_weights_mac_local_new.pth"
+FALLBACK_PREDICTOR_CONFIG = {
+    "input_dim": 3,
+    "output_dim": 3600,
+    "num_hidden": 4,
+    "hidden_exp": 10,
+    "dropout": 0.1,
+}
+
+
+def _build_predictor_from_checkpoint(weights_path: Path) -> Predictor:
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Predictor checkpoint not found: {weights_path}")
+
+    checkpoint = torch.load(str(weights_path), map_location="cpu")
+    model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+    if model_config is None:
+        model_config = FALLBACK_PREDICTOR_CONFIG
+        logging.getLogger("MyRLApp.Environment").warning(
+            "No model_config found in %s; using fallback predictor architecture values.",
+            weights_path,
+        )
+
+    required_keys = ("input_dim", "output_dim", "num_hidden", "hidden_exp", "dropout")
+    missing_keys = [key for key in required_keys if key not in model_config]
+    if missing_keys:
+        raise KeyError(
+            f"Missing required model_config keys in checkpoint {weights_path}: {missing_keys}"
+        )
+
+    predictor = Predictor()
+    predictor.init_model(
+        input_size=int(model_config["input_dim"]),
+        num_layers=int(model_config["num_hidden"]),
+        layer_exp=int(model_config["hidden_exp"]),
+        out_size=int(model_config["output_dim"]),
+        dropout=float(model_config["dropout"]),
+        weights_path=str(weights_path),
+    )
+    return predictor
+
+
+def _resolve_predictor_weights_path(weights_path: Union[str, Path, None]) -> Path:
+    if weights_path is None:
+        return DEFAULT_PREDICTOR_WEIGHTS
+    path = Path(weights_path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
 
 
 class EngineEnvDiscrete(gym.Env):
@@ -31,6 +85,7 @@ class EngineEnvDiscrete(gym.Env):
                  observation_space: spaces.Space = None,
                  action_space: spaces.Space = None,
                  reward: RewardFn = None,
+                 predictor_weights_path: Union[str, Path, None] = None,
                  ):
 
         if observation_space is not None:
@@ -67,17 +122,8 @@ class EngineEnvDiscrete(gym.Env):
         self._current_imep = None
         self._desired_imep = None
 
-        # import torch model
-        # define predictor model parameters
-        num_layers = 4
-        layer_exp = 10
-        out_size = 3600  # Need to adjust this based on the format in hdf5 file
-        input_size = 3  # number of features
-        dropout = 0.1
-        self.predictor = Predictor()
-        # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
-        path = 'src/core/digital_twin/models/model_weights_mac_local_new.pth'
-        self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
+        predictor_weights = _resolve_predictor_weights_path(predictor_weights_path)
+        self.predictor = _build_predictor_from_checkpoint(predictor_weights)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
 
@@ -188,24 +234,27 @@ class EngineEnvContinuous(gym.Env):
                  observation_space: spaces.Space = None,
                  action_space: spaces.Space = None,
                  reward: RewardFn = None,
+                 predictor_weights_path: Union[str, Path, None] = None,
                  ):
 
         if action_space is not None:
             self.action_space = action_space
         else:
-            self.inj_p_lims = [450, 950]
-            self.soi_lims = [-5.6, 2.7]
-            self.inj_d_lims = [0.31, 0.64]
+            self.ID1_lims = [0.6, 0.9]
+            self.ID2_lims = [0.0, 1.0]
+            self.SOI2_lims = [-140, -10]
             self.action_space = spaces.Box(
-                low=np.array([self.soi_lims[0], self.inj_d_lims[0]], dtype=np.float32),
-                high=np.array([self.soi_lims[1], self.inj_d_lims[1]], dtype=np.float32),
+                low=np.array([self.ID1_lims[0], self.ID2_lims[0], self.SOI2_lims[0]], dtype=np.float32),
+                high=np.array([self.ID1_lims[1], self.ID2_lims[1], self.SOI2_lims[1]], dtype=np.float32),
             )
         
         if observation_space is not None:
             self.observation_space = observation_space
         else:
-            self.imep_lims = [1.6, 4.1]
-            self.mprr_lims = [1, 15]
+            self.imep_sample_lims = [1.6, 4.1]
+            self.mprr_sample_lims = [1, 8]
+            self.imep_env_limits = [-1.5, 6.0]
+            self.mprr_env_limits = [0, 15]
             self.observation_space = spaces.Box(
                 low=np.array([
                     self.soi_lims[0],
@@ -232,18 +281,8 @@ class EngineEnvContinuous(gym.Env):
         self._current_imep = None
         self._desired_imep = None
 
-        # import torch model
-        # define predictor model parameters
-        num_layers = 4
-        layer_exp = 10
-        out_size = 3600  # Need to adjust this based on the format in hdf5 file
-        input_size = 3  # number of features
-        dropout = 0.1
-        self.predictor = Predictor()
-        # path = '/Users/rodrigohadlich/PycharmProjects/RayProject/AmpereBM/model_weights_mac.pth'
-
-        path = 'src/core/digital_twin/models/model_weights_mac_local_new.pth'
-        self.predictor.init_model(input_size, num_layers, layer_exp, out_size, dropout, path)
+        predictor_weights = _resolve_predictor_weights_path(predictor_weights_path)
+        self.predictor = _build_predictor_from_checkpoint(predictor_weights)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
 
@@ -279,7 +318,7 @@ class EngineEnvContinuous(gym.Env):
 
         # send action values to torch model and get new state
         pressure, self._current_imep, self._current_mprr, cad = (
-            self.predictor.model_predict(filtered_action_vals, noise_in_percent=1))
+            self.predictor.model_predict(filtered_action_vals, noise_in_percent=3))
 
         # package inputs for reward
         reward_inputs = {

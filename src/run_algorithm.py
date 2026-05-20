@@ -213,6 +213,25 @@ def _load_filter_model(filter_model, args, logger) -> bool:
     return True
 
 
+def _load_filter_checkpoint_from_path(
+    checkpoint_path: str,
+    logger,
+) -> tuple[Optional[Dict[str, Any]], Dict[str, torch.Tensor]]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+    state_dict = (
+        checkpoint.get("model_state_dict", checkpoint)
+        if isinstance(checkpoint, dict)
+        else checkpoint
+    )
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"Unsupported filter checkpoint format at {checkpoint_path}: expected a state_dict-like object."
+        )
+    logger.info(f"Loaded explicit filter checkpoint from {checkpoint_path}")
+    return model_config, state_dict
+
+
 def _save_models(algo, filter_model_refs, args, logger) -> None:
     """Save RLlib module and filter models plus spec sidecars. Called on shutdown."""
     rllib_module_spec = getattr(args, "rllib_module_spec", None)
@@ -986,10 +1005,60 @@ def run_rllib_shared_memory(
         filter_num_hidden = config.env_config.get("filter_num_hidden", 2)
         filter_hidden_exp = config.env_config.get("filter_hidden_exp", 7)
         filter_dropout = config.env_config.get("filter_dropout", 0.0)
+        filter_output_dim = filter_state_dim
+        explicit_filter_checkpoint_path = (
+            config.env_config.get("filter_checkpoint_path")
+            or getattr(args, "filter_checkpoint_path", None)
+        )
+        explicit_filter_state_dict = None
 
-        logger.debug(f"run_algorithm: Initializing filter model with state_dim={filter_state_dim}, "
-                    f"action_dim={filter_action_dim}, num_hidden={filter_num_hidden}, "
-                    f"hidden_exp={filter_hidden_exp}, dropout={filter_dropout}")
+        if explicit_filter_checkpoint_path is not None:
+            model_cfg, explicit_filter_state_dict = _load_filter_checkpoint_from_path(
+                explicit_filter_checkpoint_path, logger
+            )
+            if model_cfg is not None:
+                if "state_dim" in model_cfg and int(model_cfg["state_dim"]) != int(filter_state_dim):
+                    raise ValueError(
+                        "Explicit filter checkpoint has incompatible state_dim: "
+                        f"{model_cfg['state_dim']} (checkpoint) vs {filter_state_dim} (runtime)."
+                    )
+                if "action_dim" in model_cfg and int(model_cfg["action_dim"]) != int(filter_action_dim):
+                    raise ValueError(
+                        "Explicit filter checkpoint has incompatible action_dim: "
+                        f"{model_cfg['action_dim']} (checkpoint) vs {filter_action_dim} (runtime)."
+                    )
+                if "output_dim" in model_cfg:
+                    filter_output_dim = int(model_cfg["output_dim"])
+                    if filter_output_dim != int(filter_state_dim):
+                        raise ValueError(
+                            "Explicit filter checkpoint output_dim must match runtime filter state dimension. "
+                            f"Got output_dim={filter_output_dim}, state_dim={filter_state_dim}."
+                        )
+                if "num_hidden" in model_cfg:
+                    filter_num_hidden = int(model_cfg["num_hidden"])
+                if "hidden_exp" in model_cfg:
+                    filter_hidden_exp = int(model_cfg["hidden_exp"])
+                if "dropout" in model_cfg:
+                    filter_dropout = float(model_cfg["dropout"])
+                logger.info(
+                    "Using filter architecture from checkpoint model_config: "
+                    "num_hidden=%s, hidden_exp=%s, dropout=%s",
+                    filter_num_hidden,
+                    filter_hidden_exp,
+                    filter_dropout,
+                )
+            else:
+                logger.info(
+                    "No model_config found in explicit filter checkpoint. "
+                    "Using configured filter architecture values."
+                )
+
+        logger.debug(
+            f"run_algorithm: Initializing filter model with state_dim={filter_state_dim}, "
+            f"action_dim={filter_action_dim}, output_dim={filter_output_dim}, "
+            f"num_hidden={filter_num_hidden}, hidden_exp={filter_hidden_exp}, "
+            f"dropout={filter_dropout}"
+        )
         #
         # Initialize filter storage buffer configuration
         filter_storage_max_samples = config.env_config.get("filter_storage_max_samples", 50000)
@@ -1016,17 +1085,43 @@ def run_rllib_shared_memory(
             action_dim=filter_action_dim,
             num_hidden=filter_num_hidden,
             hidden_exp=filter_hidden_exp,
-            dropout=filter_dropout
+            dropout=filter_dropout,
+            output_dim=filter_output_dim,
         )
         filter_model.eval()
 
+        # Keep spec/config aligned with the architecture actually used.
+        config.env_config["filter_num_hidden"] = int(filter_num_hidden)
+        config.env_config["filter_hidden_exp"] = int(filter_hidden_exp)
+        config.env_config["filter_dropout"] = float(filter_dropout)
+        args.filter_spec = {
+            "filter_state_dim": int(filter_state_dim),
+            "filter_action_dim": int(filter_action_dim),
+            "filter_num_hidden": int(filter_num_hidden),
+            "filter_hidden_exp": int(filter_hidden_exp),
+            "filter_dropout": float(filter_dropout),
+        }
+
         # Load filter model if model_mode=load and compatible checkpoint exists
         filter_loaded = False
-        try:
-            filter_loaded = _load_filter_model(filter_model, args, logger)
-        except ValueError as e:
-            logger.error(str(e))
-            raise
+        if explicit_filter_state_dict is not None:
+            try:
+                filter_model.load_state_dict(explicit_filter_state_dict)
+                filter_loaded = True
+                logger.info(
+                    "Initialized filter model weights from explicit checkpoint %s",
+                    explicit_filter_checkpoint_path,
+                )
+            except RuntimeError as e:
+                raise ValueError(
+                    f"Could not load explicit filter checkpoint at {explicit_filter_checkpoint_path}: {e}"
+                ) from e
+        else:
+            try:
+                filter_loaded = _load_filter_model(filter_model, args, logger)
+            except ValueError as e:
+                logger.error(str(e))
+                raise
 
         if getattr(args, "model_mode", "create") == "load" and (rllib_module_loaded != filter_loaded):
             logger.warning(

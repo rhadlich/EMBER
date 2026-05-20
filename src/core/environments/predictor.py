@@ -22,7 +22,7 @@ class Predictor:
         self.cad_plt = np.arange(-360, 360, 0.1)
         # For IMEP/work computations we use the center window (-180..180) -> 3600 samples,
         # which matches the predictor network output size used elsewhere.
-        self.cad_window = self.cad_plt[1800:-1800]
+        self.cad_window = self.cad_plt[:]
         self.res = 720 / self.cad_plt.size      # resolution of pressure trace (CAD/sample)
         self.cad = np.reshape(self.cad_plt, [1, -1, 1])
 
@@ -38,7 +38,7 @@ class Predictor:
         Vc = self.Vs / (CR - 1)  # clearance volume
         self.V = Vc * (1 + (0.5 * (CR - 1)) * (R + 1 - np.cos(np.radians(self.cad_plt)) - np.sqrt(
             R ** 2 - (np.sin(np.radians(self.cad_plt)) + delta) ** 2)))  # Total Volume vector
-        self.V = self.V[1800:-1800]
+        self.V = self.V[:]
         self.V_p = self.V[1:]
         self.V_m = self.V[:-1]
 
@@ -92,8 +92,8 @@ class Predictor:
         work = np.sum((p_p + p_m) / 2 * (self.V_p - self.V_m))  # net work
         imep = work / self.Vs
 
-        # MPRR calculation
-        prr = np.diff(p, 1)*1/self.res
+        # MPRR calculation (central finite difference)
+        prr = (p[2:] - p[:-2]) / (2 * self.res)
         mprr = max(prr)
 
         # add noise if desired
@@ -103,10 +103,3 @@ class Predictor:
         # Return a CAD vector aligned with `p`
         cad = self.cad_window if p.shape[0] == self.V.shape[0] else self.cad_plt
         return p, imep, mprr, cad
-
-# For RL, the states would have to be (assuming only IMEP matters) the current IMEP and the desired IMEP, and the
-# reward would be a negative of the MAE between current and desired IMEP.
-
-# Start with SARSA, then build from there
-
-# Define episode as 10 time steps

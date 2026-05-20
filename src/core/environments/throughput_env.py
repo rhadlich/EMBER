@@ -23,8 +23,12 @@ class ThroughputEngineEnvContinuous(gym.Env):
         config = config or {}
         self._episode_step = 0
         self._max_episode_steps = int(config.get("max_episode_steps", 32))
+        predictor_checkpoint_path = config.get("predictor_checkpoint_path")
 
-        self._env = EngineEnvContinuous(reward=reward_fn)
+        self._env = EngineEnvContinuous(
+            reward=reward_fn,
+            predictor_weights_path=predictor_checkpoint_path,
+        )
         self.action_space = self._env.action_space
         self.observation_space = self._env.observation_space
 

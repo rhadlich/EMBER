@@ -15,6 +15,7 @@ import numpy as np
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from gymnasium import spaces
 from core.environments.engine_env import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
@@ -36,6 +37,11 @@ from utils.utils import ActionAdapter
 from core.rl_modules.impala_rl_modules import ImpalaMlpModule
 
 import logging
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PREDICTOR_MODELS_DIR = PROJECT_ROOT / "src/core/digital_twin/models"
+FILTER_MODELS_DIR = PROJECT_ROOT / "src/core/safety/models"
+CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
 
 parser = get_full_parser()
 parser.set_defaults(
@@ -72,6 +78,43 @@ parser.add_argument(
         "'throughput' uses standard RLlib sampling for intra-node cluster speed."
     ),
 )
+
+
+def _resolve_checkpoint_path(
+    raw_path: str | None,
+    *,
+    label: str,
+    extra_search_dirs: tuple[Path, ...],
+    allowed_suffixes: tuple[str, ...],
+) -> str | None:
+    if raw_path is None:
+        return None
+
+    user_value = str(raw_path).strip()
+    if not user_value:
+        return None
+
+    candidate = Path(user_value).expanduser()
+    if candidate.is_absolute():
+        base_paths = [candidate]
+    else:
+        base_paths = [Path.cwd() / candidate, PROJECT_ROOT / candidate]
+        base_paths.extend(search_dir / candidate for search_dir in extra_search_dirs)
+
+    search_paths: list[Path] = []
+    for base in base_paths:
+        search_paths.append(base)
+        if base.suffix == "":
+            search_paths.extend(base.with_suffix(sfx) for sfx in allowed_suffixes)
+
+    for path in search_paths:
+        if path.is_file():
+            return str(path.resolve())
+
+    searched_locations = ", ".join(str(path) for path in search_paths)
+    raise FileNotFoundError(
+        f"Could not resolve {label} checkpoint '{raw_path}'. Searched: {searched_locations}"
+    )
 
 
 def _get_buffer_action_dim(action_space, adapter) -> int:
@@ -112,7 +155,11 @@ def _run_throughput_profile(args, logger) -> None:
     if not _flag_present("--num-gpus-per-learner"):
         args.num_gpus_per_learner = None
 
-    env = EngineEnvContinuous(reward=reward_fn)
+    predictor_checkpoint_path = getattr(args, "predictor_checkpoint_path", None)
+    env = EngineEnvContinuous(
+        reward=reward_fn,
+        predictor_weights_path=predictor_checkpoint_path,
+    )
     obs_space = env.observation_space
     action_space = env.action_space
     adapter = ActionAdapter(action_space)
@@ -136,6 +183,8 @@ def _run_throughput_profile(args, logger) -> None:
         "env_type": args.env_type.lower(),
         "max_episode_steps": int(getattr(args, "throughput_max_episode_steps", 32)),
     }
+    if predictor_checkpoint_path is not None:
+        env_config["predictor_checkpoint_path"] = predictor_checkpoint_path
     if getattr(args, "seed", None) is not None:
         base_seed = int(args.seed)
         env_config["global_seed"] = base_seed
@@ -246,6 +295,22 @@ if __name__ == "__main__":
 
     logger = logging.getLogger("MyRLApp.setup_run")
     logger.info(f"setup_run, PID={os.getpid()}")
+    args.predictor_checkpoint_path = _resolve_checkpoint_path(
+        getattr(args, "predictor_checkpoint", None),
+        label="predictor",
+        extra_search_dirs=(PREDICTOR_MODELS_DIR,),
+        allowed_suffixes=(".pth",),
+    )
+    if args.predictor_checkpoint_path is not None:
+        logger.info("Using predictor checkpoint: %s", args.predictor_checkpoint_path)
+    args.filter_checkpoint_path = _resolve_checkpoint_path(
+        getattr(args, "filter_checkpoint", None),
+        label="filter",
+        extra_search_dirs=(FILTER_MODELS_DIR, CHECKPOINTS_DIR),
+        allowed_suffixes=(".pth", ".pt"),
+    )
+    if args.filter_checkpoint_path is not None:
+        logger.info("Using filter checkpoint: %s", args.filter_checkpoint_path)
 
     # If a global seed is provided, make this driver process deterministic.
     # RLlib will additionally receive this seed via AlgorithmConfig.debugging(seed=...).
@@ -280,17 +345,23 @@ if __name__ == "__main__":
 
     # make environment to have access to observation and action spaces
     if args.env_type.lower() == 'continuous':
-        env = EngineEnvContinuous(reward=reward_fn)
+        env = EngineEnvContinuous(
+            reward=reward_fn,
+            predictor_weights_path=args.predictor_checkpoint_path,
+        )
     elif args.env_type.lower() == 'discrete':
-        env = EngineEnvDiscrete(reward=reward_fn)
+        env = EngineEnvDiscrete(
+            reward=reward_fn,
+            predictor_weights_path=args.predictor_checkpoint_path,
+        )
     else:
         raise NotImplementedError(f"Environment type not supported or not provided.")
     obs_space = env.observation_space
     action_space = env.action_space
 
     if isinstance(obs_space, spaces.Discrete):
-        imep_space = env.imep_space
-        mprr_space = env.mprr_space
+        imep_space = env.imep_env_space
+        mprr_space = env.mprr_env_space
 
         # patch up the dimensions issue when running a discrete observation space
         flat_dim = len(imep_space)
@@ -319,9 +390,26 @@ if __name__ == "__main__":
         _algo_cfg_mod = None
 
     action_dim = _get_buffer_action_dim(action_space, adapter)
-    # Runtime observations stored in shared memory are the previous action signal
-    # plus three IMEP-related values.
-    state_dim = action_dim + 3
+    # Runtime observations stored in shared memory are the following:
+    state_features = [
+        'IMEP setpoint, k',
+        'IMEP setpoint, k-1',
+        'IMEP actual, k-1',
+        'Injection duration before IVC (ID1), k',
+        'Injection duration before IVC (ID1), k-1',
+        'Start of injection after IVC (SOI2), k-1',
+        'Injection duration after IVC (ID2), k-1',
+        'Pressure intake @ IVC, k-1',
+        # 'Temperature intake, k-1',
+        'CA50, k-1',
+        'CA10 to CA90, k-1',
+        'Net heat release, k-1',
+        'Pressure max, k-1',
+        'MPRR, k-1',
+        'Moving average IMEP (20 cycles), k-1',
+        'Skewness of moving averate IMEP (20 cycles), k-1',
+    ]
+    state_dim = len(state_features)
 
     if _algo_cfg_mod is not None and hasattr(_algo_cfg_mod, "get_actor_episode_buffer_spec"):
         ep_shm_properties = _algo_cfg_mod.get_actor_episode_buffer_spec(
@@ -355,10 +443,27 @@ if __name__ == "__main__":
     # Filter data format: (current_state, action_filtered, next_state, action_nominal)
     filter_ep_shm_properties = None
     if enable_safety_filter:
+        filter_state_features = [
+            'IMEP actual, k-1',
+            'Injection duration before IVC (ID1), k',
+            'Injection duration before IVC (ID1), k-1',
+            'Start of injection after IVC (SOI2), k-1',
+            'Injection duration after IVC (ID2), k-1',
+            'Pressure intake @ IVC, k-1',
+            # 'Temperature intake, k-1',
+            'CA50, k-1',
+            'CA10 to CA90, k-1',
+            'Net heat release, k-1',
+            'Pressure max, k-1',
+            'MPRR, k-1',
+            'Moving average IMEP (20 cycles), k-1',
+            'Skewness of moving averate IMEP (20 cycles), k-1',
+        ]
+        filter_state_dim = len(filter_state_features)
         filter_dims = {
-            "state": state_dim,
+            "state": filter_state_dim,
             "action": action_dim,
-            "next_state": state_dim,
+            "next_state": filter_state_dim,
             "nominal_action": action_dim,
         }
         FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
@@ -411,6 +516,8 @@ if __name__ == "__main__":
         "realtime_priority": 80,  # Default real-time priority for minion
         "enable_safety_filter": enable_safety_filter,
     }
+    if args.predictor_checkpoint_path is not None:
+        env_config["predictor_checkpoint_path"] = args.predictor_checkpoint_path
 
     # Propagate a single global seed from CLI into per-component seeds used by
     # the EnvRunner/minion/env processes. If no seed is provided, behavior
@@ -428,6 +535,8 @@ if __name__ == "__main__":
         env_config["filter_num_hidden"] = getattr(args, "filter_num_hidden", 2)
         env_config["filter_hidden_exp"] = getattr(args, "filter_hidden_exp", 7)
         env_config["filter_dropout"] = getattr(args, "filter_dropout", 0.0)
+        if args.filter_checkpoint_path is not None:
+            env_config["filter_checkpoint_path"] = args.filter_checkpoint_path
 
     # Define the RLlib config.
     base_config = (
