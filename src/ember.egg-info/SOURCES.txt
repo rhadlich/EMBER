@@ -26,6 +26,7 @@ src/core/rl_modules/impala_rl_modules.py
 src/core/rl_modules/td3_rl_modules.py
 src/core/safety/__init__.py
 src/core/safety/datasets.py
+src/core/safety/evaluate_safety_filter.py
 src/core/safety/safety_filter.py
 src/core/safety/train_safety_filter.py
 src/core/training/__init__.py
