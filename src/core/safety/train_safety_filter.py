@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -28,6 +29,27 @@ from core.training.trainer import Trainer, resolve_device
 
 def _history_curve(history_rows, key):
     return [float(row[key]) for row in history_rows if key in row]
+
+
+def _build_seed_progression_rows(seed_idx, seed_value, trial_idx, train_history, val_history):
+    rows = []
+    max_epochs = max(len(train_history), len(val_history))
+    for epoch_idx in range(max_epochs):
+        train_row = train_history[epoch_idx] if epoch_idx < len(train_history) else {}
+        val_row = val_history[epoch_idx] if epoch_idx < len(val_history) else {}
+        rows.append(
+            {
+                "seed_idx": int(seed_idx),
+                "seed": int(seed_value),
+                "trial_idx": int(trial_idx),
+                "epoch": int(epoch_idx),
+                "train_mse": float(train_row["mse"]) if "mse" in train_row else np.nan,
+                "train_mae": float(train_row["mae"]) if "mae" in train_row else np.nan,
+                "val_mse": float(val_row["mse"]) if "mse" in val_row else np.nan,
+                "val_mae": float(val_row["mae"]) if "mae" in val_row else np.nan,
+            }
+        )
+    return rows
 
 
 def _set_global_seed(seed: int, rank: int = 0, strict_reproducibility: bool = False) -> int:
@@ -164,6 +186,7 @@ def main(
     prefetch_factor: int,
     per_epoch_validation: bool,
     seed: Optional[int],
+    n_seeds: int = 1,
     use_amp: Optional[bool] = None,
     strict_reproducibility: bool = False,
     validation_batch_size: int = 256,
@@ -179,6 +202,13 @@ def main(
     ray_cpus_per_trial: float = 1.0,
     ray_gpus_per_trial: Optional[float] = None,
 ):
+    if n_seeds < 1:
+        raise ValueError("--n_seeds must be >= 1.")
+    if hpo_iters != 0 and n_seeds != 1:
+        raise ValueError("--n_seeds is only supported when --hpo_iters == 0.")
+    if hpo_iters == 0 and n_seeds > 1 and seed is None:
+        raise ValueError("--n_seeds > 1 requires an explicit --seed value.")
+
     device = resolve_device(device_name)
     if output_path is None:
         output_dir = Path(__file__).resolve().parent / "models"
@@ -406,191 +436,243 @@ def main(
             destroy_process_group()
         return
 
-    for hpo_iter in range(training_iters):
-        trial_num_hidden = int(num_hidden)
-        trial_hidden_exp = int(hidden_exp)
-        trial_dropout = float(dropout)
-        trial_learning_rate = float(learning_rate)
+    record_seed_progression = hpo_iters == 0 and n_seeds > 1
+    seed_schedule = [seed]
+    if record_seed_progression:
+        seed_schedule = [int(seed) * (seed_idx + 1) for seed_idx in range(n_seeds)]
+    seed_progression_rows = []
 
-        if hpo_iters:
-            if hpo_logger is None:
-                hpo_logger = HPOGeneral(
-                    param_configs=param_configs,
-                    metrics=[
-                        "loss",
-                        "mse",
-                        "mae",
-                        "loss_epoch_train",
-                        "mse_epoch_train",
-                        "mae_epoch_train",
-                        "loss_epoch_val",
-                        "mse_epoch_val",
-                        "mae_epoch_val",
-                    ],
-                    seed=effective_seed,
-                )
-            sample = hpo_logger.sample()
-            trial_num_hidden = int(sample["num_hidden"])
-            trial_hidden_exp = int(sample["hidden_exp"])
-            trial_dropout = float(sample["dropout"]) * 0.1
-            trial_learning_rate = float(sample["learning_rate"])
-            if rank == 0:
-                print(f"HPO sample {hpo_iter}: {sample}")
-
-        predictor = _build_predictor(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            output_dim=output_dim,
-            num_hidden=trial_num_hidden,
-            hidden_exp=trial_hidden_exp,
-            dropout=trial_dropout,
-        ).to(device)
-        model = StatePredictorTrainAdapter(predictor).to(device)
-        if distributed:
-            model = DDP(model, device_ids=None, output_device=None)
-
-        filename_model = output_dir / f"model_weights_filter_new.pth"
-        if rank == 0:
-            base_model = model.module if distributed else model
-            torch.save(
-                {
-                    "model_state_dict": base_model.state_dict(),
-                    "model_config": {
-                        "state_dim": state_dim,
-                        "output_dim": output_dim,
-                        "action_dim": action_dim,
-                        "num_hidden": trial_num_hidden,
-                        "hidden_exp": trial_hidden_exp,
-                        "dropout": trial_dropout,
-                    },
-                    "random_seed": effective_seed,
-                },
-                filename_model,
+    for seed_idx, run_seed in enumerate(seed_schedule):
+        run_effective_seed = None
+        if run_seed is not None:
+            run_effective_seed = _set_global_seed(
+                int(run_seed), rank=rank, strict_reproducibility=strict_reproducibility
             )
+            if rank == 0 and record_seed_progression:
+                print(
+                    f"Seed sweep {seed_idx + 1}/{len(seed_schedule)}: "
+                    f"seed={run_seed}, effective_rank0_seed={run_effective_seed}"
+                )
 
-        optimizer_lr = trial_learning_rate * world_size if distributed else trial_learning_rate
-        optimizer_lr *= batch_size / 64
-        optimizer = optim.AdamW(model.parameters(), lr=optimizer_lr)
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=scheduler_step, gamma=scheduler_gamma
+        train_loader, _, val_loader, _ = create_dataloaders(
+            train_dataset=train_data,
+            validation_dataset=val_data,
+            batch_size=batch_size,
+            size=world_size,
+            rank=rank,
+            distributed=distributed,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            train_drop_last=True,
+            validation_batch_size=validation_batch_size,
+            seed=run_effective_seed,
         )
-        filename_optimizer = output_dir / f"optimizer_weights_filter.pth"
-        if rank == 0:
-            torch.save(optimizer.state_dict(), filename_optimizer)
-        if distributed:
-            dist.barrier()
 
-        loss_store = np.zeros([n_trials], dtype=float)
-        mse_store = np.zeros([n_trials], dtype=float)
-        mae_store = np.zeros([n_trials], dtype=float)
-        loss_epoch_train_store = []
-        mse_epoch_train_store = []
-        mae_epoch_train_store = []
-        loss_epoch_val_store = []
-        mse_epoch_val_store = []
-        mae_epoch_val_store = []
+        for hpo_iter in range(training_iters):
+            trial_num_hidden = int(num_hidden)
+            trial_hidden_exp = int(hidden_exp)
+            trial_dropout = float(dropout)
+            trial_learning_rate = float(learning_rate)
 
-        for trial_idx in range(n_trials):
+            if hpo_iters:
+                if hpo_logger is None:
+                    hpo_logger = HPOGeneral(
+                        param_configs=param_configs,
+                        metrics=[
+                            "loss",
+                            "mse",
+                            "mae",
+                            "loss_epoch_train",
+                            "mse_epoch_train",
+                            "mae_epoch_train",
+                            "loss_epoch_val",
+                            "mse_epoch_val",
+                            "mae_epoch_val",
+                        ],
+                        seed=effective_seed,
+                    )
+                sample = hpo_logger.sample()
+                trial_num_hidden = int(sample["num_hidden"])
+                trial_hidden_exp = int(sample["hidden_exp"])
+                trial_dropout = float(sample["dropout"]) * 0.1
+                trial_learning_rate = float(sample["learning_rate"])
+                if rank == 0:
+                    print(f"HPO sample {hpo_iter}: {sample}")
+
+            predictor = _build_predictor(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                output_dim=output_dim,
+                num_hidden=trial_num_hidden,
+                hidden_exp=trial_hidden_exp,
+                dropout=trial_dropout,
+            ).to(device)
+            model = StatePredictorTrainAdapter(predictor).to(device)
+            if distributed:
+                model = DDP(model, device_ids=None, output_device=None)
+
+            filename_model = output_dir / f"model_weights_filter_new.pth"
+            if rank == 0:
+                base_model = model.module if distributed else model
+                torch.save(
+                    {
+                        "model_state_dict": base_model.state_dict(),
+                        "model_config": {
+                            "state_dim": state_dim,
+                            "output_dim": output_dim,
+                            "action_dim": action_dim,
+                            "num_hidden": trial_num_hidden,
+                            "hidden_exp": trial_hidden_exp,
+                            "dropout": trial_dropout,
+                        },
+                        "random_seed": run_effective_seed,
+                    },
+                    filename_model,
+                )
+
+            optimizer_lr = trial_learning_rate * world_size if distributed else trial_learning_rate
+            optimizer_lr *= batch_size / 64
+            optimizer = optim.AdamW(model.parameters(), lr=optimizer_lr)
+            scheduler = optim.lr_scheduler.StepLR(
+                optimizer, step_size=scheduler_step, gamma=scheduler_gamma
+            )
+            filename_optimizer = output_dir / f"optimizer_weights_filter.pth"
+            if rank == 0:
+                torch.save(optimizer.state_dict(), filename_optimizer)
             if distributed:
                 dist.barrier()
 
-            checkpoint = torch.load(filename_model, map_location=device)
-            state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) else checkpoint
-            load_target = model.module if distributed else model
-            load_target.load_state_dict(state_dict)
-            optimizer.load_state_dict(torch.load(filename_optimizer, map_location=device))
-            model.train()
+            loss_store = np.zeros([n_trials], dtype=float)
+            mse_store = np.zeros([n_trials], dtype=float)
+            mae_store = np.zeros([n_trials], dtype=float)
+            loss_epoch_train_store = []
+            mse_epoch_train_store = []
+            mae_epoch_train_store = []
+            loss_epoch_val_store = []
+            mse_epoch_val_store = []
+            mae_epoch_val_store = []
 
-            trainer = Trainer(
-                model=model,
-                train_data=train_loader,
-                val_data=val_loader,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                criterion=criterion,
-                metric_fns={"mse": mse_metric, "mae": mae_metric},
-                train_method="default",
-                validate_each_epoch=per_epoch_validation,
-                distributed=distributed,
-                rank=rank,
-                world_size=world_size,
-                device=device,
-                use_amp=use_amp,
-            )
-            trainer.train(total_epochs)
+            for trial_idx in range(n_trials):
+                if distributed:
+                    dist.barrier()
 
-            val_loss_scalar = float(trainer.val_loss.detach().cpu().item())
-            val_mse_scalar = float(trainer.val_metrics["mse"].detach().cpu().item())
-            val_mae_scalar = float(trainer.val_metrics["mae"].detach().cpu().item())
-            loss_store[trial_idx] = val_loss_scalar
-            mse_store[trial_idx] = val_mse_scalar
-            mae_store[trial_idx] = val_mae_scalar
+                checkpoint = torch.load(filename_model, map_location=device)
+                state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) else checkpoint
+                load_target = model.module if distributed else model
+                load_target.load_state_dict(state_dict)
+                optimizer.load_state_dict(torch.load(filename_optimizer, map_location=device))
+                model.train()
 
-            train_history = trainer.history.get("train", [])
-            val_history = trainer.history.get("val", [])
-            loss_epoch_train = _history_curve(train_history, "loss")
-            mse_epoch_train = _history_curve(train_history, "mse")
-            mae_epoch_train = _history_curve(train_history, "mae")
-            loss_epoch_val = _history_curve(val_history, "loss")
-            mse_epoch_val = _history_curve(val_history, "mse")
-            mae_epoch_val = _history_curve(val_history, "mae")
-            loss_epoch_train_store.append(loss_epoch_train)
-            mse_epoch_train_store.append(mse_epoch_train)
-            mae_epoch_train_store.append(mae_epoch_train)
-            loss_epoch_val_store.append(loss_epoch_val)
-            mse_epoch_val_store.append(mse_epoch_val)
-            mae_epoch_val_store.append(mae_epoch_val)
-
-            if rank == 0:
-                print(
-                    f"HPO iter={hpo_iter} trial={trial_idx} "
-                    f"val_loss={val_loss_scalar:.6e} world_size={world_size}"
+                trainer = Trainer(
+                    model=model,
+                    train_data=train_loader,
+                    val_data=val_loader,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    criterion=criterion,
+                    metric_fns={"mse": mse_metric, "mae": mae_metric},
+                    train_method="default",
+                    validate_each_epoch=per_epoch_validation,
+                    distributed=distributed,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    use_amp=use_amp,
                 )
-                if not hpo_iters:
-                    base_model = model.module if distributed else model
-                    torch.save(
-                        {
-                            "model_state_dict": base_model.state_dict(),
-                            "model_config": {
-                                "state_dim": state_dim,
-                                "output_dim": output_dim,
-                                "action_dim": action_dim,
-                                "num_hidden": trial_num_hidden,
-                                "hidden_exp": trial_hidden_exp,
-                                "dropout": trial_dropout,
-                            },
-                            "random_seed": effective_seed,
-                        },
-                        filename_model,
+                trainer.train(total_epochs)
+
+                val_loss_scalar = float(trainer.val_loss.detach().cpu().item())
+                val_mse_scalar = float(trainer.val_metrics["mse"].detach().cpu().item())
+                val_mae_scalar = float(trainer.val_metrics["mae"].detach().cpu().item())
+                loss_store[trial_idx] = val_loss_scalar
+                mse_store[trial_idx] = val_mse_scalar
+                mae_store[trial_idx] = val_mae_scalar
+
+                train_history = trainer.history.get("train", [])
+                val_history = trainer.history.get("val", [])
+                loss_epoch_train = _history_curve(train_history, "loss")
+                mse_epoch_train = _history_curve(train_history, "mse")
+                mae_epoch_train = _history_curve(train_history, "mae")
+                loss_epoch_val = _history_curve(val_history, "loss")
+                mse_epoch_val = _history_curve(val_history, "mse")
+                mae_epoch_val = _history_curve(val_history, "mae")
+                loss_epoch_train_store.append(loss_epoch_train)
+                mse_epoch_train_store.append(mse_epoch_train)
+                mae_epoch_train_store.append(mae_epoch_train)
+                loss_epoch_val_store.append(loss_epoch_val)
+                mse_epoch_val_store.append(mse_epoch_val)
+                mae_epoch_val_store.append(mae_epoch_val)
+
+                if record_seed_progression:
+                    seed_progression_rows.extend(
+                        _build_seed_progression_rows(
+                            seed_idx=seed_idx,
+                            seed_value=run_seed,
+                            trial_idx=trial_idx,
+                            train_history=train_history,
+                            val_history=val_history,
+                        )
                     )
 
-            if distributed:
-                dist.barrier()
+                if rank == 0:
+                    print(
+                        f"HPO iter={hpo_iter} trial={trial_idx} "
+                        f"val_loss={val_loss_scalar:.6e} world_size={world_size}"
+                    )
+                    if not hpo_iters:
+                        base_model = model.module if distributed else model
+                        torch.save(
+                            {
+                                "model_state_dict": base_model.state_dict(),
+                                "model_config": {
+                                    "state_dim": state_dim,
+                                    "output_dim": output_dim,
+                                    "action_dim": action_dim,
+                                    "num_hidden": trial_num_hidden,
+                                    "hidden_exp": trial_hidden_exp,
+                                    "dropout": trial_dropout,
+                                },
+                                "random_seed": run_effective_seed,
+                            },
+                            filename_model,
+                        )
 
-        if hpo_logger is not None:
-            hpo_logger.log_performance(loss_store, metric="loss")
-            hpo_logger.log_performance(mse_store, metric="mse")
-            hpo_logger.log_performance(mae_store, metric="mae")
-            hpo_logger.log_performance(
-                np.asarray(loss_epoch_train_store, dtype=float), metric="loss_epoch_train"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mse_epoch_train_store, dtype=float), metric="mse_epoch_train"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mae_epoch_train_store, dtype=float), metric="mae_epoch_train"
-            )
-            hpo_logger.log_performance(
-                np.asarray(loss_epoch_val_store, dtype=float), metric="loss_epoch_val"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mse_epoch_val_store, dtype=float), metric="mse_epoch_val"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
-            )
-            if rank == 0:
-                hpo_logger.save_log(hpo_logger.build_log_path(output_dir))
+                if distributed:
+                    dist.barrier()
+
+            if hpo_logger is not None:
+                hpo_logger.log_performance(loss_store, metric="loss")
+                hpo_logger.log_performance(mse_store, metric="mse")
+                hpo_logger.log_performance(mae_store, metric="mae")
+                hpo_logger.log_performance(
+                    np.asarray(loss_epoch_train_store, dtype=float), metric="loss_epoch_train"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mse_epoch_train_store, dtype=float), metric="mse_epoch_train"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mae_epoch_train_store, dtype=float), metric="mae_epoch_train"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(loss_epoch_val_store, dtype=float), metric="loss_epoch_val"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mse_epoch_val_store, dtype=float), metric="mse_epoch_val"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
+                )
+                if rank == 0:
+                    hpo_logger.save_log(hpo_logger.build_log_path(output_dir))
+
+    if record_seed_progression and rank == 0 and seed_progression_rows:
+        seed_progression_path = output_dir / "seed_progression_safety_filter.parquet"
+        pd.DataFrame(seed_progression_rows).to_parquet(seed_progression_path, index=False)
+        print(f"Wrote seed progression log to {seed_progression_path}")
+    if record_seed_progression and distributed:
+        dist.barrier()
 
     if distributed and dist.is_initialized():
         destroy_process_group()
@@ -617,6 +699,15 @@ if __name__ == "__main__":
     parser.add_argument("--lr", default=1e-3, type=float, help="Learning rate")
     parser.add_argument("--n_trials", default=1, type=int, help="Number of consecutive trials")
     parser.add_argument("--hpo_iters", default=0, type=int, help="Number of HPO samples")
+    parser.add_argument(
+        "--n_seeds",
+        default=1,
+        type=int,
+        help=(
+            "Number of seed-multiple runs (1 keeps current behavior). "
+            "Only supported when --hpo_iters=0."
+        ),
+    )
     parser.add_argument(
         "--hpo-backend",
         default="legacy",
@@ -742,6 +833,7 @@ if __name__ == "__main__":
         prefetch_factor=args.prefetch_factor,
         per_epoch_validation=args.per_epoch_validation,
         seed=args.seed,
+        n_seeds=args.n_seeds,
         use_amp=args.use_amp,
         strict_reproducibility=args.strict_reproducibility,
         validation_batch_size=args.validation_batch_size,
