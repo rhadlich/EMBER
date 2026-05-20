@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -32,6 +33,27 @@ from core.training.trainer import Trainer, resolve_device
 
 def _history_curve(history_rows, key):
     return [float(row[key]) for row in history_rows if key in row]
+
+
+def _build_seed_progression_rows(seed_idx, seed_value, trial_idx, train_history, val_history):
+    rows = []
+    max_epochs = max(len(train_history), len(val_history))
+    for epoch_idx in range(max_epochs):
+        train_row = train_history[epoch_idx] if epoch_idx < len(train_history) else {}
+        val_row = val_history[epoch_idx] if epoch_idx < len(val_history) else {}
+        rows.append(
+            {
+                "seed_idx": int(seed_idx),
+                "seed": int(seed_value),
+                "trial_idx": int(trial_idx),
+                "epoch": int(epoch_idx),
+                "train_mse": float(train_row["mse"]) if "mse" in train_row else np.nan,
+                "train_mae": float(train_row["mae"]) if "mae" in train_row else np.nan,
+                "val_mse": float(val_row["mse"]) if "mse" in val_row else np.nan,
+                "val_mae": float(val_row["mae"]) if "mae" in val_row else np.nan,
+            }
+        )
+    return rows
 
 
 def _set_global_seed(seed: int, rank: int = 0, strict_reproducibility: bool = False) -> int:
@@ -114,6 +136,7 @@ def main(
     alpha=0.5,
     per_epoch_validation=True,
     seed=None,
+    n_seeds=1,
     use_amp=None,
     strict_reproducibility=False,
     validation_batch_size=256,
@@ -127,6 +150,13 @@ def main(
     ray_cpus_per_trial=1.0,
     ray_gpus_per_trial=None,
 ):
+    if n_seeds < 1:
+        raise ValueError("--n_seeds must be >= 1.")
+    if hpo_iters != 0 and n_seeds != 1:
+        raise ValueError("--n_seeds is only supported when --hpo_iters == 0.")
+    if hpo_iters == 0 and n_seeds > 1 and seed is None:
+        raise ValueError("--n_seeds > 1 requires an explicit --seed value.")
+
     device = resolve_device(device_name)
     if distributed:
         dist_utils.init_process_group(method)
@@ -368,173 +398,225 @@ def main(
             destroy_process_group()
         return
 
-    for hpo_iter in range(training_iters):
-        if hpo_iters:
-            if hpo_logger is None:
-                hpo_logger = HPOGeneral(
-                    param_configs=param_configs,
-                    metrics=hpo_metrics,
-                    seed=effective_seed,
-                )
-            sample = hpo_logger.sample()
-            num_layers = int(sample["num_layers"])
-            layer_exp = int(sample["layer_exp"])
-            dropout = float(sample["dropout"]) * 0.1
-            learning_rate = float(sample["learning_rate"])
-            if rank == 0:
-                print(f"HPO sample {hpo_iter}: {sample}")
+    record_seed_progression = hpo_iters == 0 and n_seeds > 1
+    seed_schedule = [seed]
+    if record_seed_progression:
+        seed_schedule = [int(seed) * (seed_idx + 1) for seed_idx in range(n_seeds)]
+    seed_progression_rows = []
 
-        model = _build_model(
-            architecture=architecture,
-            data_shape=data_shape,
-            label_shape=label_shape,
-            num_layers=num_layers,
-            layer_exp=layer_exp,
-            dropout=dropout,
-        ).to(device)
-        val_fn = None
-        train_method = "default"
-
-        if distributed:
-            model = DDP(model, device_ids=None, output_device=None)
-
-        filename_model = output_dir / f"model_weights_{node_type}_new.pth"
-        if rank == 0:
-            base_model = model.module if distributed else model
-            torch.save(
-                {
-                    "model_state_dict": base_model.state_dict(),
-                    "model_config": {
-                        "architecture": architecture,
-                        "input_dim": data_shape,
-                        "output_dim": label_shape,
-                        "num_hidden": num_layers,
-                        "hidden_exp": layer_exp,
-                        "dropout": dropout,
-                    },
-                    "random_seed": effective_seed,
-                    "normalization": {
-                        "expected_feature_order": ["inj_pressure", "inj_timing", "inj_duration"],
-                    },
-                },
-                filename_model,
+    for seed_idx, run_seed in enumerate(seed_schedule):
+        run_effective_seed = None
+        if run_seed is not None:
+            run_effective_seed = _set_global_seed(
+                int(run_seed), rank=rank, strict_reproducibility=strict_reproducibility
             )
-
-        optimizer_lr = learning_rate * world_size if distributed else learning_rate
-        optimizer_lr *= batch_size / 64
-        optimizer = optim.AdamW(model.parameters(), lr=optimizer_lr)
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=scheduler_step, gamma=scheduler_gamma
-        )
-        filename_optimizer = output_dir / f"optimizer_weights_{node_type}.pth"
-        if rank == 0:
-            torch.save(optimizer.state_dict(), filename_optimizer)
-        if distributed:
-            dist.barrier()
-
-        loss_store = np.zeros([n_trials])
-        mse_store = np.zeros([n_trials])
-        mae_store = np.zeros([n_trials])
-        mse_dp_epoch_train_store = []
-        mse_epoch_train_store = []
-        mae_epoch_train_store = []
-        mse_dp_epoch_val_store = []
-        mse_epoch_val_store = []
-        mae_epoch_val_store = []
-
-        for trial_idx in range(n_trials):
-            if distributed:
-                dist.barrier()
-
-            checkpoint = torch.load(filename_model, map_location=device)
-            state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) else checkpoint
-            load_target = model.module if distributed else model
-            load_target.load_state_dict(state_dict)
-            optimizer.load_state_dict(torch.load(filename_optimizer, map_location=device))
-            model.train()
-
-            trainer = Trainer(
-                model=model,
-                train_data=train_loader,
-                val_data=validation_loader,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                criterion=criterion,
-                metric_fns={"mse": mse, "mae": mae},
-                val_fn=val_fn,
-                train_method=train_method,
-                validate_each_epoch=per_epoch_validation,
-                distributed=distributed,
-                rank=rank,
-                world_size=world_size,
-                device=device,
-                use_amp=use_amp,
-            )
-
-            tic = time.time()
-            trainer.train(total_epochs)
-            toc = time.time()
-
-            loss_store[trial_idx] = float(trainer.val_loss.detach().cpu().numpy())
-            mse_store[trial_idx] = float(trainer.val_metrics["mse"].detach().cpu().numpy())
-            mae_store[trial_idx] = float(trainer.val_metrics["mae"].detach().cpu().numpy())
-            train_history = trainer.history.get("train", [])
-            val_history = trainer.history.get("val", [])
-            mse_dp_epoch_train_store.append(_history_curve(train_history, "loss"))
-            mse_epoch_train_store.append(_history_curve(train_history, "mse"))
-            mae_epoch_train_store.append(_history_curve(train_history, "mae"))
-            mse_dp_epoch_val_store.append(_history_curve(val_history, "loss"))
-            mse_epoch_val_store.append(_history_curve(val_history, "mse"))
-            mae_epoch_val_store.append(_history_curve(val_history, "mae"))
-
-            if rank == 0:
+            if rank == 0 and record_seed_progression:
                 print(
-                    f"HPO iter={hpo_iter} trial={trial_idx} val_loss={trainer.val_loss} "
-                    f"time={toc - tic:.2f}s world_size={world_size}"
+                    f"Seed sweep {seed_idx + 1}/{len(seed_schedule)}: "
+                    f"seed={run_seed}, effective_rank0_seed={run_effective_seed}"
                 )
-                if not hpo_iters:
-                    base_model = model.module if distributed else model
-                    torch.save(
-                        {
-                            "model_state_dict": base_model.state_dict(),
-                            "model_config": {
-                                "architecture": architecture,
-                                "input_dim": data_shape,
-                                "output_dim": label_shape,
-                                "num_hidden": num_layers,
-                                "hidden_exp": layer_exp,
-                                "dropout": dropout,
-                            },
-                            "random_seed": effective_seed,
-                        },
-                        filename_model,
+
+        train_loader, _, validation_loader, _ = create_dataloaders(
+            train_dataset=train_dataset,
+            validation_dataset=validation_dataset,
+            batch_size=batch_size,
+            size=world_size,
+            rank=rank,
+            distributed=distributed,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            train_drop_last=True,
+            validation_batch_size=validation_batch_size,
+            seed=run_effective_seed,
+        )
+
+        for hpo_iter in range(training_iters):
+            if hpo_iters:
+                if hpo_logger is None:
+                    hpo_logger = HPOGeneral(
+                        param_configs=param_configs,
+                        metrics=hpo_metrics,
+                        seed=effective_seed,
                     )
+                sample = hpo_logger.sample()
+                num_layers = int(sample["num_layers"])
+                layer_exp = int(sample["layer_exp"])
+                dropout = float(sample["dropout"]) * 0.1
+                learning_rate = float(sample["learning_rate"])
+                if rank == 0:
+                    print(f"HPO sample {hpo_iter}: {sample}")
+
+            model = _build_model(
+                architecture=architecture,
+                data_shape=data_shape,
+                label_shape=label_shape,
+                num_layers=num_layers,
+                layer_exp=layer_exp,
+                dropout=dropout,
+            ).to(device)
+            val_fn = None
+            train_method = "default"
+
+            if distributed:
+                model = DDP(model, device_ids=None, output_device=None)
+
+            filename_model = output_dir / f"model_weights_{node_type}_new.pth"
+            if rank == 0:
+                base_model = model.module if distributed else model
+                torch.save(
+                    {
+                        "model_state_dict": base_model.state_dict(),
+                        "model_config": {
+                            "architecture": architecture,
+                            "input_dim": data_shape,
+                            "output_dim": label_shape,
+                            "num_hidden": num_layers,
+                            "hidden_exp": layer_exp,
+                            "dropout": dropout,
+                        },
+                        "random_seed": run_effective_seed,
+                        "normalization": {
+                            "expected_feature_order": ["inj_pressure", "inj_timing", "inj_duration"],
+                        },
+                    },
+                    filename_model,
+                )
+
+            optimizer_lr = learning_rate * world_size if distributed else learning_rate
+            optimizer_lr *= batch_size / 64
+            optimizer = optim.AdamW(model.parameters(), lr=optimizer_lr)
+            scheduler = optim.lr_scheduler.StepLR(
+                optimizer, step_size=scheduler_step, gamma=scheduler_gamma
+            )
+            filename_optimizer = output_dir / f"optimizer_weights_{node_type}.pth"
+            if rank == 0:
+                torch.save(optimizer.state_dict(), filename_optimizer)
             if distributed:
                 dist.barrier()
 
-        if hpo_logger is not None:
-            hpo_logger.log_performance(loss_store, metric="mse_dp")
-            hpo_logger.log_performance(mse_store, metric="mse")
-            hpo_logger.log_performance(mae_store, metric="mae")
-            hpo_logger.log_performance(
-                np.asarray(mse_dp_epoch_train_store, dtype=float), metric="mse_dp_epoch_train"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mse_epoch_train_store, dtype=float), metric="mse_epoch_train"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mae_epoch_train_store, dtype=float), metric="mae_epoch_train"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mse_dp_epoch_val_store, dtype=float), metric="mse_dp_epoch_val"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mse_epoch_val_store, dtype=float), metric="mse_epoch_val"
-            )
-            hpo_logger.log_performance(
-                np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
-            )
-            hpo_logger.save_log(hpo_logger.build_log_path(output_dir))
+            loss_store = np.zeros([n_trials])
+            mse_store = np.zeros([n_trials])
+            mae_store = np.zeros([n_trials])
+            mse_dp_epoch_train_store = []
+            mse_epoch_train_store = []
+            mae_epoch_train_store = []
+            mse_dp_epoch_val_store = []
+            mse_epoch_val_store = []
+            mae_epoch_val_store = []
+
+            for trial_idx in range(n_trials):
+                if distributed:
+                    dist.barrier()
+
+                checkpoint = torch.load(filename_model, map_location=device)
+                state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) else checkpoint
+                load_target = model.module if distributed else model
+                load_target.load_state_dict(state_dict)
+                optimizer.load_state_dict(torch.load(filename_optimizer, map_location=device))
+                model.train()
+
+                trainer = Trainer(
+                    model=model,
+                    train_data=train_loader,
+                    val_data=validation_loader,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    criterion=criterion,
+                    metric_fns={"mse": mse, "mae": mae},
+                    val_fn=val_fn,
+                    train_method=train_method,
+                    validate_each_epoch=per_epoch_validation,
+                    distributed=distributed,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    use_amp=use_amp,
+                )
+
+                tic = time.time()
+                trainer.train(total_epochs)
+                toc = time.time()
+
+                loss_store[trial_idx] = float(trainer.val_loss.detach().cpu().numpy())
+                mse_store[trial_idx] = float(trainer.val_metrics["mse"].detach().cpu().numpy())
+                mae_store[trial_idx] = float(trainer.val_metrics["mae"].detach().cpu().numpy())
+                train_history = trainer.history.get("train", [])
+                val_history = trainer.history.get("val", [])
+                mse_dp_epoch_train_store.append(_history_curve(train_history, "loss"))
+                mse_epoch_train_store.append(_history_curve(train_history, "mse"))
+                mae_epoch_train_store.append(_history_curve(train_history, "mae"))
+                mse_dp_epoch_val_store.append(_history_curve(val_history, "loss"))
+                mse_epoch_val_store.append(_history_curve(val_history, "mse"))
+                mae_epoch_val_store.append(_history_curve(val_history, "mae"))
+
+                if record_seed_progression:
+                    seed_progression_rows.extend(
+                        _build_seed_progression_rows(
+                            seed_idx=seed_idx,
+                            seed_value=run_seed,
+                            trial_idx=trial_idx,
+                            train_history=train_history,
+                            val_history=val_history,
+                        )
+                    )
+
+                if rank == 0:
+                    print(
+                        f"HPO iter={hpo_iter} trial={trial_idx} val_loss={trainer.val_loss} "
+                        f"time={toc - tic:.2f}s world_size={world_size}"
+                    )
+                    if not hpo_iters:
+                        base_model = model.module if distributed else model
+                        torch.save(
+                            {
+                                "model_state_dict": base_model.state_dict(),
+                                "model_config": {
+                                    "architecture": architecture,
+                                    "input_dim": data_shape,
+                                    "output_dim": label_shape,
+                                    "num_hidden": num_layers,
+                                    "hidden_exp": layer_exp,
+                                    "dropout": dropout,
+                                },
+                                "random_seed": run_effective_seed,
+                            },
+                            filename_model,
+                        )
+                if distributed:
+                    dist.barrier()
+
+            if hpo_logger is not None:
+                hpo_logger.log_performance(loss_store, metric="mse_dp")
+                hpo_logger.log_performance(mse_store, metric="mse")
+                hpo_logger.log_performance(mae_store, metric="mae")
+                hpo_logger.log_performance(
+                    np.asarray(mse_dp_epoch_train_store, dtype=float), metric="mse_dp_epoch_train"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mse_epoch_train_store, dtype=float), metric="mse_epoch_train"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mae_epoch_train_store, dtype=float), metric="mae_epoch_train"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mse_dp_epoch_val_store, dtype=float), metric="mse_dp_epoch_val"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mse_epoch_val_store, dtype=float), metric="mse_epoch_val"
+                )
+                hpo_logger.log_performance(
+                    np.asarray(mae_epoch_val_store, dtype=float), metric="mae_epoch_val"
+                )
+                hpo_logger.save_log(hpo_logger.build_log_path(output_dir))
+
+    if record_seed_progression and rank == 0 and seed_progression_rows:
+        seed_progression_path = output_dir / f"seed_progression_{node_type}.parquet"
+        pd.DataFrame(seed_progression_rows).to_parquet(seed_progression_path, index=False)
+        print(f"Wrote seed progression log to {seed_progression_path}")
+    if record_seed_progression and distributed:
+        dist.barrier()
 
     if distributed and dist.is_initialized():
         destroy_process_group()
@@ -628,6 +710,15 @@ if __name__ == "__main__":
         help="Global random seed for reproducible and recoverable training runs.",
     )
     parser.add_argument(
+        "--n_seeds",
+        default=1,
+        type=int,
+        help=(
+            "Number of seed-multiple runs (1 keeps current behavior). "
+            "Only supported when --hpo_iters=0."
+        ),
+    )
+    parser.add_argument(
         "--per-epoch-validation",
         dest="per_epoch_validation",
         action=argparse.BooleanOptionalAction,
@@ -707,6 +798,7 @@ if __name__ == "__main__":
         alpha=args.alpha,
         per_epoch_validation=args.per_epoch_validation,
         seed=args.seed,
+        n_seeds=args.n_seeds,
         use_amp=args.use_amp,
         strict_reproducibility=args.strict_reproducibility,
         validation_batch_size=args.validation_batch_size,
