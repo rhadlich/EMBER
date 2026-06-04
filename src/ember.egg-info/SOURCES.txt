@@ -11,6 +11,7 @@ src/core/__init__.py
 src/core/digital_twin/__init__.py
 src/core/digital_twin/architectures.py
 src/core/digital_twin/datasets.py
+src/core/digital_twin/engine_metrics.py
 src/core/digital_twin/train_digital_twin.py
 src/core/digital_twin/visualize_predictions.py
 src/core/environments/__init__.py
@@ -32,6 +33,7 @@ src/core/safety/train_safety_filter.py
 src/core/training/__init__.py
 src/core/training/distributed.py
 src/core/training/hpo.py
+src/core/training/interpretable_ai.py
 src/core/training/loaders.py
 src/core/training/trainer.py
 src/ember.egg-info/PKG-INFO
