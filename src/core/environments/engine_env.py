@@ -7,6 +7,8 @@ from typing import Union
 from pathlib import Path
 
 from core.environments.predictor import Predictor
+from core.digital_twin.datasets import list_h5_files
+from configs.args import DEFAULT_SAMPLE_DATA_DIR
 
 import logging
 import utils.logging_setup as logging_setup
@@ -23,7 +25,23 @@ FALLBACK_PREDICTOR_CONFIG = {
 }
 
 
-def _build_predictor_from_checkpoint(weights_path: Path) -> Predictor:
+def _resolve_sample_hdf5_path(sample_data_dir: Union[str, Path, None]) -> str:
+    if sample_data_dir is None:
+        sample_data_dir = DEFAULT_SAMPLE_DATA_DIR
+
+    path = Path(sample_data_dir).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    if path.is_file():
+        return str(path)
+    if path.is_dir():
+        return list_h5_files(str(path))[0]
+    raise FileNotFoundError(
+        f"Sample data path not found (expected directory or .h5 file): {path}"
+    )
+
+
+def _build_predictor_from_checkpoint(weights_path: Path, sample_data_dir: Union[str, Path, None]) -> Predictor:
     if not weights_path.exists():
         raise FileNotFoundError(f"Predictor checkpoint not found: {weights_path}")
 
@@ -51,6 +69,7 @@ def _build_predictor_from_checkpoint(weights_path: Path) -> Predictor:
         out_size=int(model_config["output_dim"]),
         dropout=float(model_config["dropout"]),
         weights_path=str(weights_path),
+        sample_data_path=_resolve_sample_hdf5_path(sample_data_dir),
     )
     return predictor
 
@@ -86,6 +105,7 @@ class EngineEnvDiscrete(gym.Env):
                  action_space: spaces.Space = None,
                  reward: RewardFn = None,
                  predictor_weights_path: Union[str, Path, None] = None,
+                 sample_data_dir: Union[str, Path, None] = None,
                  ):
 
         if observation_space is not None:
@@ -123,7 +143,7 @@ class EngineEnvDiscrete(gym.Env):
         self._desired_imep = None
 
         predictor_weights = _resolve_predictor_weights_path(predictor_weights_path)
-        self.predictor = _build_predictor_from_checkpoint(predictor_weights)
+        self.predictor = _build_predictor_from_checkpoint(predictor_weights, sample_data_dir)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
 
@@ -235,6 +255,7 @@ class EngineEnvContinuous(gym.Env):
                  action_space: spaces.Space = None,
                  reward: RewardFn = None,
                  predictor_weights_path: Union[str, Path, None] = None,
+                 sample_data_dir: Union[str, Path, None] = None,
                  ):
 
         if action_space is not None:
@@ -244,45 +265,82 @@ class EngineEnvContinuous(gym.Env):
             self.ID2_lims = [0.0, 1.0]
             self.SOI2_lims = [-140, -10]
             self.action_space = spaces.Box(
-                low=np.array([self.ID1_lims[0], self.ID2_lims[0], self.SOI2_lims[0]], dtype=np.float32),
-                high=np.array([self.ID1_lims[1], self.ID2_lims[1], self.SOI2_lims[1]], dtype=np.float32),
+                low=np.array([self.ID1_lims[0], self.SOI2_lims[0], self.ID2_lims[0]], dtype=np.float32),
+                high=np.array([self.ID1_lims[1], self.SOI2_lims[1], self.ID2_lims[1]], dtype=np.float32),
             )
         
         if observation_space is not None:
             self.observation_space = observation_space
         else:
-            self.imep_sample_lims = [1.6, 4.1]
+            self.imep_sample_lims = [1.0, 4.8]
             self.mprr_sample_lims = [1, 8]
             self.imep_env_limits = [-1.5, 6.0]
             self.mprr_env_limits = [0, 15]
+
+            # Other feature limits
+            self.Pint_lims = [0.9, 1.2]
+            self.CA50_lims = [0.0, 4000.0]
+            self.CA10_to_CA90_lims = [0.0, 150.0]
+            self.Net_heat_release_lims = [-100.0, 500.0]
+            self.Pressure_max_lims = [0.0, 100.0]
+            self.skewness_lims = [-1.0, 1.0]
+
+            # Define observation space
             self.observation_space = spaces.Box(
                 low=np.array([
-                    self.soi_lims[0],
-                    self.inj_d_lims[0],
-                    self.imep_lims[0],
-                    self.imep_lims[0],
-                    self.imep_lims[0]],
+                    self.imep_env_limits[0],
+                    self.imep_env_limits[0],
+                    self.imep_env_limits[0],
+                    self.ID1_lims[0],
+                    self.ID1_lims[0],
+                    self.SOI2_lims[0],
+                    self.ID2_lims[0],
+                    self.Pint_lims[0],
+                    self.CA50_lims[0],
+                    self.CA10_to_CA90_lims[0],
+                    self.Net_heat_release_lims[0],
+                    self.Pressure_max_lims[0],
+                    self.mprr_env_limits[0],
+                    self.imep_env_limits[0],
+                    self.skewness_lims[0]],
                     dtype=np.float32
                     ),
                 high=np.array([
-                    self.soi_lims[1],
-                    self.inj_d_lims[1],
-                    self.imep_lims[1],
-                    self.imep_lims[1],
-                    self.imep_lims[1]],
+                    self.imep_env_limits[1],
+                    self.imep_env_limits[1],
+                    self.imep_env_limits[1],
+                    self.ID1_lims[1],
+                    self.ID1_lims[1],
+                    self.SOI2_lims[1],
+                    self.ID2_lims[1],
+                    self.Pint_lims[1],
+                    self.CA50_lims[1],
+                    self.CA10_to_CA90_lims[1],
+                    self.Net_heat_release_lims[1],
+                    self.Pressure_max_lims[1],
+                    self.mprr_env_limits[1],
+                    self.imep_env_limits[1],
+                    self.skewness_lims[1]],
                     dtype=np.float32
                     ),
                 dtype=np.float32
             )
-
         self.reward = reward
 
         self._current_mprr = None
         self._current_imep = None
         self._desired_imep = None
+        # Initialize these values to reasonable defaults
+        self._current_CA50 = 3596.0
+        self._current_CA10_CA90 = 34.0
+        self._current_net_heat_release = 52.03
+        self._current_pressure_max = 51.35
+        self._current_imep_moving_average = 0.3505
+        self._current_skewness_moving_average = 0.2585
+        self._current_Pint = 0.9908
 
         predictor_weights = _resolve_predictor_weights_path(predictor_weights_path)
-        self.predictor = _build_predictor_from_checkpoint(predictor_weights)
+        self.predictor = _build_predictor_from_checkpoint(predictor_weights, sample_data_dir)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
 
@@ -294,12 +352,12 @@ class EngineEnvContinuous(gym.Env):
         super().reset(seed=seed)
 
         # sample random values for observations
-        self._current_imep = self.np_random.uniform(self.imep_lims[0], self.imep_lims[1])
-        self._current_mprr = self.np_random.uniform(1, 7)
+        self._current_imep = self.np_random.uniform(self.imep_sample_lims[0], self.imep_sample_lims[1])
+        self._current_mprr = self.np_random.uniform(self.mprr_sample_lims[0], self.mprr_sample_lims[1])
 
         # sample random desired IMEP (must be different from observation)
         while True:
-            self._desired_imep = self.np_random.uniform(self.imep_lims[0], self.imep_lims[1])
+            self._desired_imep = self.np_random.uniform(self.imep_sample_lims[0], self.imep_sample_lims[1])
             if self._desired_imep != self._current_imep:
                 break
 
@@ -314,12 +372,19 @@ class EngineEnvContinuous(gym.Env):
             nominal_action_vals: Union[list, np.ndarray] = None,
              ):
 
-        # action_vals should be in the order -> [inj_p, soi, inj_d]
-
         # send action values to torch model and get new state
-        pressure, self._current_imep, self._current_mprr, cad = (
+        pressure, cad, output = (
             self.predictor.model_predict(filtered_action_vals, noise_in_percent=3))
 
+        self._current_imep = float(output["imep"])
+        self._current_mprr = float(output["mprr"])
+        self._current_CA50 = float(output["CA50"])
+        self._current_CA10_CA90 = float(output["CA10_CA90"])
+        self._current_net_heat_release = float(output["Net_heat_release"])
+        self._current_pressure_max = float(output["Pressure_max"])
+        self._current_imep_moving_average = float(output["IMEP_moving_average"])
+        self._current_skewness_moving_average = float(output["Skewness_moving_average"])
+        self._current_Pint = float(output["Pint"])
         # package inputs for reward
         reward_inputs = {
             "target": self._desired_imep,
@@ -328,14 +393,22 @@ class EngineEnvContinuous(gym.Env):
             "filtered action": filtered_action_vals,
             "nominal action": nominal_action_vals
             }
+        print('reward_inputs: ', reward_inputs)
 
         # calculate reward
         reward_vec = self.reward(reward_inputs)
         reward = (np.sum(reward_vec) + 15.0) * 0.1
-
-        # clip observation values to make sure it is within the expected space
-        self._current_imep = np.clip(self._current_imep, self.imep_lims[0], self.imep_lims[-1])
-        self._current_mprr = np.clip(self._current_mprr, self.mprr_lims[0], self.mprr_lims[-1])
+        print('reward: ', reward)
+        # clip observation values to make sure it is within the expected space  
+        self._current_imep = float(np.clip(self._current_imep, self.imep_env_limits[0], self.imep_env_limits[1]))
+        self._current_mprr = float(np.clip(self._current_mprr, self.mprr_env_limits[0], self.mprr_env_limits[1]))
+        self._current_CA50 = float(np.clip(self._current_CA50, self.CA50_lims[0], self.CA50_lims[1]))
+        self._current_CA10_CA90 = float(np.clip(self._current_CA10_CA90, self.CA10_to_CA90_lims[0], self.CA10_to_CA90_lims[1]))
+        self._current_net_heat_release = float(np.clip(self._current_net_heat_release, self.Net_heat_release_lims[0], self.Net_heat_release_lims[1]))
+        self._current_pressure_max = float(np.clip(self._current_pressure_max, self.Pressure_max_lims[0], self.Pressure_max_lims[1]))
+        self._current_imep_moving_average = float(np.clip(self._current_imep_moving_average, self.imep_env_limits[0], self.imep_env_limits[1]))
+        self._current_skewness_moving_average = float(np.clip(self._current_skewness_moving_average, self.skewness_lims[0], self.skewness_lims[1]))
+        self._current_Pint = float(np.clip(self._current_Pint, self.Pint_lims[0], self.Pint_lims[1]))
         observation = self._get_obs()
 
         terminated = 0      # will decide in the controller if it is terminated or not
@@ -343,10 +416,20 @@ class EngineEnvContinuous(gym.Env):
 
         return observation, reward, reward_vec, terminated, False, info
 
-    # def _get_obs(self):
-    #     return {"state": np.array([self._current_imep, self._current_mprr]), "target": self._desired_imep}
     def _get_obs(self):
-        return self._desired_imep
+        return {
+            "desired_imep": self._desired_imep,
+            "achieved_imep": self._current_imep,
+            "achieved_mprr": self._current_mprr,
+            "achieved_CA50": self._current_CA50,
+            "achieved_CA10_CA90": self._current_CA10_CA90,
+            "achieved_net_heat_release": self._current_net_heat_release,
+            "achieved_pressure_max": self._current_pressure_max,
+            "achieved_imep_moving_average": self._current_imep_moving_average,
+            "achieved_skewness_moving_average": self._current_skewness_moving_average,
+            "achieved_Pint": self._current_Pint,
+        }
+   
 
 
 def reward_fn(inputs):

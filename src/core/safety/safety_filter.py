@@ -2,10 +2,15 @@ import torch
 import torch.nn as nn
 import numpy as np
 import onnxruntime as ort
-from typing import Callable, Optional, Tuple, List
+import h5py as h5
+from pathlib import Path
+from typing import Callable, Optional, Tuple, List, Union
 import random
 import logging
 import utils.logging_setup as logging_setup
+from core.safety.datasets import list_h5_files
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 class StatePredictor(nn.Module):
     def __init__(
@@ -75,7 +80,8 @@ class SafetyFilter:
                  action_dim: int,
                  ort_session: Optional[ort.InferenceSession] = None,
                  input_names: Optional[List[str]] = None,
-                 output_names: Optional[List[str]] = None) -> None:
+                 output_names: Optional[List[str]] = None,
+                 sample_data_dir: Optional[Union[str, Path]] = None) -> None:
         """
         Initialize SafetyFilter.
         
@@ -89,6 +95,8 @@ class SafetyFilter:
             ort_session: ONNXruntime inference session (optional; required for inference)
             input_names: Names of input tensors for ONNX model (required if ort_session is provided)
             output_names: Names of output tensors for ONNX model (required if ort_session is provided)
+            sample_data_dir: Directory or file path to safety HDF5 data used to
+                extract normalization/action_min and normalization/action_max.
         """
         self.logger = logging.getLogger("MyRLApp.safety_filter")
         self.logger.info(f"SafetyFilter initialized with state_dim={state_dim}, action_dim={action_dim}")
@@ -102,11 +110,71 @@ class SafetyFilter:
         self.ort_session = ort_session
         self.input_names = list(input_names) if input_names is not None else []
         self.output_names = list(output_names) if output_names is not None else []
+        self.action_min: Optional[np.ndarray] = None
+        self.action_max: Optional[np.ndarray] = None
+        self.action_range: Optional[np.ndarray] = None
+        if sample_data_dir is not None:
+            self._init_action_normalization(sample_data_dir)
+        else:
+            self.logger.info(
+                "SafetyFilter action normalization disabled (no sample_data_dir provided)."
+            )
 
         # define constants for barrier function (using numpy)
         self.a = np.zeros(state_dim, dtype=np.float32)
         self.a[-1] = 1.0
         self.eps = 1e-8  # to avoid division by zero
+
+    def _resolve_sample_hdf5_path(self, sample_data_dir: Union[str, Path]) -> str:
+        path = Path(sample_data_dir).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        if path.is_file():
+            return str(path)
+        if path.is_dir():
+            return list_h5_files(str(path))[0]
+        raise FileNotFoundError(
+            f"SafetyFilter sample data path not found (expected directory or .h5 file): {path}"
+        )
+
+    def _extract_action_normalization_values(self, sample_data_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        with h5.File(sample_data_path, "r") as fin:
+            action_min = fin["normalization/action_min"][...].reshape(-1)
+            action_max = fin["normalization/action_max"][...].reshape(-1)
+        return action_min, action_max
+
+    def _init_action_normalization(self, sample_data_dir: Union[str, Path]) -> None:
+        sample_data_path = self._resolve_sample_hdf5_path(sample_data_dir)
+        action_min, action_max = self._extract_action_normalization_values(sample_data_path)
+        if action_min.size != self.action_dim or action_max.size != self.action_dim:
+            raise ValueError(
+                "SafetyFilter action normalization shape mismatch: "
+                f"expected action_dim={self.action_dim}, "
+                f"got action_min={action_min.shape}, action_max={action_max.shape} "
+                f"from {sample_data_path}"
+            )
+        action_range = action_max - action_min
+        if np.any(action_range == 0):
+            raise ValueError(
+                "SafetyFilter found zeros in (action_max - action_min); cannot normalize safely."
+            )
+        self.action_min = action_min.astype(np.float32, copy=True)
+        self.action_max = action_max.astype(np.float32, copy=True)
+        self.action_range = action_range.astype(np.float32, copy=True)
+        self.logger.info(
+            "SafetyFilter action normalization loaded from %s",
+            sample_data_path,
+        )
+
+    def _normalize_action(self, action: np.ndarray) -> np.ndarray:
+        if self.action_min is None or self.action_range is None:
+            return action
+        return 2.0 * (action - self.action_min) / self.action_range - 1.0
+
+    def _denormalize_action(self, action_norm: np.ndarray) -> np.ndarray:
+        if self.action_min is None or self.action_range is None:
+            return action_norm
+        return 0.5 * (action_norm + 1.0) * self.action_range + self.action_min
 
     def _ort_session_run(self, x: np.ndarray, u: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -237,9 +305,10 @@ class SafetyFilter:
         # Ensure float32 dtype
         x = x.astype(np.float32)
         kn = kn.astype(np.float32)
+        kn_for_model = self._normalize_action(kn)
         
         # Predict state and get f_x, G_x using ORT
-        _, f_x, G_x = self._ort_session_run(x, kn)
+        _, f_x, G_x = self._ort_session_run(x, kn_for_model)
         # Outputs are already (state_dim,) and (state_dim, action_dim) after _ort_session_run
         
         # Compute Lie derivative terms
@@ -258,7 +327,7 @@ class SafetyFilter:
 
         
         # Compute correction term
-        correction_term = -(lie_F + np.dot(lie_G, kn) + alpha - rho) / (denom + self.eps)  # scalar
+        correction_term = -(lie_F + np.dot(lie_G, kn_for_model) + alpha - rho) / (denom + self.eps)  # scalar
         
         # Apply correction and return filtered action
         correction = max(correction_term, 0.0) * lie_G  # (action_dim,)
@@ -267,7 +336,8 @@ class SafetyFilter:
         self.logger.debug(f"compute_filtered_action: lie_G={lie_G}, denom={denom}, lie_F={lie_F}, alpha={alpha}, rho={rho}")
         self.logger.debug(f"compute_filtered_action: correction_term={correction_term}, correction={correction}")
 
-        return (kn + correction).astype(kn_dtype)  # (action_dim,)
+        filtered_action = self._denormalize_action(kn_for_model + correction)
+        return filtered_action.astype(kn_dtype)  # (action_dim,)
 
 
 class FilterStorageBuffer:
@@ -280,7 +350,7 @@ class FilterStorageBuffer:
     
     Expected sample layout (flat float32) for Critical classification:
       (state, action_filtered, next_state, action_nominal)
-    where state_dim == next_state_dim and action_dim == action_nominal_dim.
+    where action_dim == action_nominal_dim.
     """
     
     class _RingBuffer:
@@ -319,6 +389,7 @@ class FilterStorageBuffer:
         *,
         state_dim: Optional[int] = None,
         action_dim: Optional[int] = None,
+        next_state_dim: Optional[int] = None,
         critical_fraction: float = 0.20,
         critical_capacity_fraction: float = 0.20,
         h_critical_threshold: float = 2.0,
@@ -335,6 +406,8 @@ class FilterStorageBuffer:
                        If None, will be inferred from first batch added.
             state_dim: State dimension (required for Critical classification).
             action_dim: Action dimension (required for Critical classification).
+            next_state_dim: Next-state/output dimension stored in each sample. If None and
+                            state_dim is provided, defaults to state_dim for backward compatibility.
             critical_fraction: Fraction of each sampled batch to draw from the Critical buffer (default: 0.20).
             critical_capacity_fraction: Critical buffer capacity as a fraction of Recent capacity (default: 0.20).
             h_critical_threshold: Route to Critical if h(x) <= threshold (default: 2.0).
@@ -347,6 +420,11 @@ class FilterStorageBuffer:
         self.sample_dim = sample_dim
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.next_state_dim = (
+            int(next_state_dim) if next_state_dim is not None
+            else int(state_dim) if state_dim is not None
+            else None
+        )
         self.critical_fraction = float(critical_fraction)
         self.critical_capacity_fraction = float(critical_capacity_fraction)
         self.h_critical_threshold = float(h_critical_threshold)
@@ -361,6 +439,10 @@ class FilterStorageBuffer:
                 raise ValueError(
                     "FilterStorageBuffer requires compute_h_fn when state_dim/action_dim are provided "
                     "(needed to compute h(x) for Critical classification)"
+                )
+            if self.next_state_dim is None:
+                raise ValueError(
+                    "FilterStorageBuffer requires next_state_dim when state_dim/action_dim are provided"
                 )
 
         # Buffers are allocated once sample_dim is known.
@@ -393,14 +475,16 @@ class FilterStorageBuffer:
         if sample.shape[0] != self.sample_dim:
             raise ValueError(f"Sample dim {sample.shape[0]} doesn't match buffer dim {self.sample_dim}")
 
-        # Expected layout: [state (sdim), action_filtered (adim), next_state (sdim), action_nominal (adim)]
+        nsdim = int(self.next_state_dim) if self.next_state_dim is not None else sdim
+        # Expected layout: [state (sdim), action_filtered (adim), next_state (nsdim), action_nominal (adim)]
         u_f_start = sdim
         u_f_end = u_f_start + adim
-        u_n_start = u_f_end + sdim
+        u_n_start = u_f_end + nsdim
         u_n_end = u_n_start + adim
         if u_n_end != self.sample_dim:
             raise ValueError(
-                f"Sample layout mismatch: expected dim {u_n_end} from state_dim={sdim}, action_dim={adim}, got {self.sample_dim}"
+                f"Sample layout mismatch: expected dim {u_n_end} from "
+                f"state_dim={sdim}, action_dim={adim}, next_state_dim={nsdim}, got {self.sample_dim}"
             )
 
         x = sample[:sdim]

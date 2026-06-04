@@ -2,8 +2,8 @@
 
 How to run this script
 ----------------------
-`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --model-mode "create or load" --gui True --rllib-module-name "rllib_module_name" --filter-model-name "filter_model_name" --cpu-core-minion "core#"`
-python src/setup_run.py --algo 'SAC' --rllib-module-name 'rllib_module' --filter-model-name 'filter_model' --disable-safety-filter --model-mode 'create' --gui True --seed 123 --stop-iters 2000
+`python setup_run.py --algo "algo_name (like PPO, SAC, etc.)" --rllib-load-dir "<path>" --filter-load-dir "<path>" --gui True --rllib-module-name "rllib_module_name" --filter-model-name "filter_model_name" --cpu-core-minion "core#"`
+python src/setup_run.py --algo 'SAC' --rllib-module-name 'rllib_module' --filter-model-name 'filter_model' --disable-safety-filter --gui True --seed 123 --stop-iters 2000
 Determinism
 -----------
 Pass a global seed via `--seed <int>` to get fully reproducible training runs
@@ -11,6 +11,8 @@ for a fixed algorithm/env configuration. Running this script twice with the
 same CLI arguments (including `--seed`) should produce identical training
 metrics (e.g., `env_runners/episode_return_mean`) and filter MSE sequences.
 """
+from __future__ import annotations
+
 import numpy as np
 import os
 import subprocess
@@ -117,6 +119,36 @@ def _resolve_checkpoint_path(
     )
 
 
+def _resolve_directory_path(
+    raw_path: str | None,
+    *,
+    label: str,
+    extra_search_dirs: tuple[Path, ...] = (),
+) -> str | None:
+    if raw_path is None:
+        return None
+
+    user_value = str(raw_path).strip()
+    if not user_value:
+        return None
+
+    candidate = Path(user_value).expanduser()
+    if candidate.is_absolute():
+        base_paths = [candidate]
+    else:
+        base_paths = [Path.cwd() / candidate, PROJECT_ROOT / candidate]
+        base_paths.extend(search_dir / candidate for search_dir in extra_search_dirs)
+
+    for path in base_paths:
+        if path.is_dir():
+            return str(path.resolve())
+
+    searched_locations = ", ".join(str(path) for path in base_paths)
+    raise FileNotFoundError(
+        f"Could not resolve {label} directory '{raw_path}'. Searched: {searched_locations}"
+    )
+
+
 def _get_buffer_action_dim(action_space, adapter) -> int:
     if adapter.mode == "continuous":
         return int(action_space.shape[0])
@@ -159,6 +191,7 @@ def _run_throughput_profile(args, logger) -> None:
     env = EngineEnvContinuous(
         reward=reward_fn,
         predictor_weights_path=predictor_checkpoint_path,
+        sample_data_dir=getattr(args, "sample_data_dir", None),
     )
     obs_space = env.observation_space
     action_space = env.action_space
@@ -185,6 +218,7 @@ def _run_throughput_profile(args, logger) -> None:
     }
     if predictor_checkpoint_path is not None:
         env_config["predictor_checkpoint_path"] = predictor_checkpoint_path
+    env_config["sample_data_dir"] = getattr(args, "sample_data_dir", None)
     if getattr(args, "seed", None) is not None:
         base_seed = int(args.seed)
         env_config["global_seed"] = base_seed
@@ -303,14 +337,22 @@ if __name__ == "__main__":
     )
     if args.predictor_checkpoint_path is not None:
         logger.info("Using predictor checkpoint: %s", args.predictor_checkpoint_path)
-    args.filter_checkpoint_path = _resolve_checkpoint_path(
-        getattr(args, "filter_checkpoint", None),
-        label="filter",
-        extra_search_dirs=(FILTER_MODELS_DIR, CHECKPOINTS_DIR),
-        allowed_suffixes=(".pth", ".pt"),
+    logger.info("Using sample data directory: %s", args.sample_data_dir)
+    logger.info("Using safety-filter sample data directory: %s", args.filter_sample_data_dir)
+    args.rllib_load_dir = _resolve_directory_path(
+        getattr(args, "rllib_load_dir", None),
+        label="RLlib load",
+        extra_search_dirs=(CHECKPOINTS_DIR,),
     )
-    if args.filter_checkpoint_path is not None:
-        logger.info("Using filter checkpoint: %s", args.filter_checkpoint_path)
+    args.filter_load_dir = _resolve_directory_path(
+        getattr(args, "filter_load_dir", None),
+        label="filter load",
+        extra_search_dirs=(CHECKPOINTS_DIR, FILTER_MODELS_DIR),
+    )
+    if args.rllib_load_dir is not None:
+        logger.info("Using RLlib load directory: %s", args.rllib_load_dir)
+    if args.filter_load_dir is not None:
+        logger.info("Using filter load directory: %s", args.filter_load_dir)
 
     # If a global seed is provided, make this driver process deterministic.
     # RLlib will additionally receive this seed via AlgorithmConfig.debugging(seed=...).
@@ -348,11 +390,13 @@ if __name__ == "__main__":
         env = EngineEnvContinuous(
             reward=reward_fn,
             predictor_weights_path=args.predictor_checkpoint_path,
+            sample_data_dir=args.sample_data_dir,
         )
     elif args.env_type.lower() == 'discrete':
         env = EngineEnvDiscrete(
             reward=reward_fn,
             predictor_weights_path=args.predictor_checkpoint_path,
+            sample_data_dir=args.sample_data_dir,
         )
     else:
         raise NotImplementedError(f"Environment type not supported or not provided.")
@@ -360,8 +404,8 @@ if __name__ == "__main__":
     action_space = env.action_space
 
     if isinstance(obs_space, spaces.Discrete):
-        imep_space = env.imep_env_space
-        mprr_space = env.mprr_env_space
+        imep_space = env.imep_env_limits
+        mprr_space = env.mprr_env_limits
 
         # patch up the dimensions issue when running a discrete observation space
         flat_dim = len(imep_space)
@@ -371,8 +415,8 @@ if __name__ == "__main__":
         obs_is_discrete = True
     elif isinstance(obs_space, spaces.Box):
         obs_space_onehot = None
-        imep_space = env.imep_lims
-        mprr_space = env.mprr_lims
+        imep_space = env.imep_env_limits
+        mprr_space = env.mprr_env_limits
         obs_is_discrete = False
     else:
         raise NotImplementedError(f"Unsupported observation space {obs_space}")
@@ -442,6 +486,7 @@ if __name__ == "__main__":
     # Define filter training data ring buffer properties (4x larger than actor buffer)
     # Filter data format: (current_state, action_filtered, next_state, action_nominal)
     filter_ep_shm_properties = None
+    filter_spec = None
     if enable_safety_filter:
         filter_state_features = [
             'IMEP actual, k-1',
@@ -459,12 +504,27 @@ if __name__ == "__main__":
             'Moving average IMEP (20 cycles), k-1',
             'Skewness of moving averate IMEP (20 cycles), k-1',
         ]
+        filter_output_features = [
+            'achieved_mprr',
+        ]
         filter_state_dim = len(filter_state_features)
+        filter_output_dim = len(filter_output_features)
         filter_dims = {
             "state": filter_state_dim,
             "action": action_dim,
-            "next_state": filter_state_dim,
+            "next_state": filter_output_dim,
             "nominal_action": action_dim,
+        }
+        filter_num_hidden = getattr(args, "filter_num_hidden", 2)
+        filter_hidden_exp = getattr(args, "filter_hidden_exp", 7)
+        filter_dropout = getattr(args, "filter_dropout", 0.0)
+        filter_spec = {
+            "filter_state_dim": int(filter_state_dim),
+            "filter_action_dim": int(action_dim),
+            "filter_output_dim": int(filter_output_dim),
+            "filter_num_hidden": int(filter_num_hidden),
+            "filter_hidden_exp": int(filter_hidden_exp),
+            "filter_dropout": float(filter_dropout),
         }
         FILTER_BATCH_SIZE = BATCH_SIZE * 4  # 4x larger (128 vs 32)
         FILTER_NUM_SLOTS = NUM_SLOTS * 4  # 4x larger (32 vs 8)
@@ -518,6 +578,8 @@ if __name__ == "__main__":
     }
     if args.predictor_checkpoint_path is not None:
         env_config["predictor_checkpoint_path"] = args.predictor_checkpoint_path
+    env_config["sample_data_dir"] = args.sample_data_dir
+    env_config["filter_sample_data_dir"] = args.filter_sample_data_dir
 
     # Propagate a single global seed from CLI into per-component seeds used by
     # the EnvRunner/minion/env processes. If no seed is provided, behavior
@@ -532,11 +594,11 @@ if __name__ == "__main__":
     if enable_safety_filter:
         env_config["filter_ep_shm_properties"] = filter_ep_shm_properties
         env_config["filter_policy_shm_name"] = getattr(args, "filter_policy_shm_name", "filter_policy")
-        env_config["filter_num_hidden"] = getattr(args, "filter_num_hidden", 2)
-        env_config["filter_hidden_exp"] = getattr(args, "filter_hidden_exp", 7)
-        env_config["filter_dropout"] = getattr(args, "filter_dropout", 0.0)
-        if args.filter_checkpoint_path is not None:
-            env_config["filter_checkpoint_path"] = args.filter_checkpoint_path
+        env_config["filter_spec"] = dict(filter_spec)
+        env_config["filter_num_hidden"] = filter_spec["filter_num_hidden"]
+        env_config["filter_hidden_exp"] = filter_spec["filter_hidden_exp"]
+        env_config["filter_dropout"] = filter_spec["filter_dropout"]
+        env_config["filter_output_dim"] = filter_spec["filter_output_dim"]
 
     # Define the RLlib config.
     base_config = (
@@ -576,8 +638,6 @@ if __name__ == "__main__":
     env_type = getattr(args, "env_type", "continuous")
     args.rllib_module_name = getattr(args, "rllib_module_name", None) or f"{args.algo}_{env_type}_rllib_module"
     args.filter_model_name = getattr(args, "filter_model_name", None) or f"{args.algo}_{env_type}_filter"
-    args.model_mode = getattr(args, "model_mode", "create")
-
     obs_space_final = obs_space_onehot or obs_space
     obs_shape = list(obs_space_final.shape) if hasattr(obs_space_final, "shape") else [getattr(obs_space_final, "n", None)]
     action_shape = list(action_space.shape) if hasattr(action_space, "shape") else [int(sum(adapter.nvec))] if adapter.mode in ("discrete1", "multidiscrete") else None
@@ -601,16 +661,7 @@ if __name__ == "__main__":
     logger.debug(f"rllib_module_spec: {args.rllib_module_spec}")
 
     if enable_safety_filter:
-        filter_num_hidden = getattr(args, "filter_num_hidden", 2)
-        filter_hidden_exp = getattr(args, "filter_hidden_exp", 7)
-        filter_dropout = getattr(args, "filter_dropout", 0.0)
-        args.filter_spec = {
-            "filter_state_dim": filter_dims["state"],
-            "filter_action_dim": filter_dims["action"],
-            "filter_num_hidden": filter_num_hidden,
-            "filter_hidden_exp": filter_hidden_exp,
-            "filter_dropout": filter_dropout,
-        }
+        args.filter_spec = dict(filter_spec)
         logger.debug(f"filter_spec: {args.filter_spec}")
     else:
         args.filter_spec = None

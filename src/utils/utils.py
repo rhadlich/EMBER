@@ -127,6 +127,7 @@ class ActionAdapter:
             self.scale = (self.high - self.low) / 2.0
             self.center = (self.high + self.low) / 2.0
             self.act_dim = action_space.shape[0]
+            print('ACTION SPACE LIMITS: ', self.low, self.high)
         else:
             raise NotImplementedError(f"Unsupported space {action_space}")
 
@@ -273,7 +274,7 @@ class ActionAdapter:
                                               f"expected {2 * self.act_dim} or {self.act_dim} for action_dim={self.act_dim}")
             dist_inputs = np.concatenate([mu, log_sigma], axis=-1).astype(np.float32)
             if deterministic:
-                act = ((mu + 1.0) / 2.0) * (self.high - self.low) + self.low
+                act = self.normalize_action(torch.from_numpy(mu)).numpy().astype(np.float32)
                 logp = None
             else:
                 # use RLlib's built-in class to perform sampling

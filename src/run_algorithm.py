@@ -133,68 +133,76 @@ def _spec_matches(saved: Dict, expected: Dict) -> bool:
 
 def _build_or_restore_rllib_algo(config, args, logger):
     """
-    Build algo from config or restore from RLlib checkpoint if model_mode=load
-    and checkpoint exists with matching spec.
+    Build algo from config or restore from RLlib checkpoint when --rllib-load-dir
+    is provided.
     Returns (algo, was_restored: bool).
-    Raises ValueError if checkpoint exists but spec mismatches.
+    Raises ValueError if load is requested but fails or spec mismatches.
     """
-    model_mode = getattr(args, "model_mode", "create")
-    rllib_module_name = getattr(args, "rllib_module_name", "rllib_module")
+    checkpoint_dir = getattr(args, "rllib_load_dir", None)
     rllib_module_spec = getattr(args, "rllib_module_spec", None)
-    checkpoint_dir = _rllib_checkpoint_dir(rllib_module_name)
-    spec_path = os.path.join(checkpoint_dir, "rllib_spec.json")
-
     algo = config.build()
 
-    if model_mode == "load" and rllib_module_spec is not None and os.path.isdir(checkpoint_dir):
-        if os.path.isfile(spec_path):
-            with open(spec_path, "r") as f:
-                saved_spec = json.load(f)
-            if not _spec_matches(saved_spec, rllib_module_spec):
-                raise ValueError(
-                    f"RLlib module checkpoint at {checkpoint_dir} has incompatible spec. "
-                    f"Saved: {saved_spec}. Expected: {rllib_module_spec}. Refusing to load."
-                )
-        try:
-            algo.restore_from_path(checkpoint_dir)
-            algo.config.env_config['enable_zmq'] = args.enable_zmq
-            logger.info(f"Restored RLlib module from {checkpoint_dir}")
-            return algo, True
-        except Exception as e:
-            logger.warning(
-                f"Failed to restore RLlib module from {checkpoint_dir}: {e}. "
-                "Building from config."
-            )
-    elif model_mode == "load" and rllib_module_spec is not None:
-        logger.warning(
-            f"RLlib checkpoint not found at {checkpoint_dir}. Creating new RLlib module from config."
+    if checkpoint_dir is None:
+        return algo, False
+
+    if not os.path.isdir(checkpoint_dir):
+        raise ValueError(
+            "RLlib load failed: provided --rllib-load-dir is not a directory: "
+            f"{checkpoint_dir}"
         )
 
-    return algo, False
+    spec_path = os.path.join(checkpoint_dir, "rllib_spec.json")
+    if rllib_module_spec is not None and os.path.isfile(spec_path):
+        with open(spec_path, "r") as f:
+            saved_spec = json.load(f)
+        if not _spec_matches(saved_spec, rllib_module_spec):
+            raise ValueError(
+                f"RLlib module checkpoint at {checkpoint_dir} has incompatible spec. "
+                f"Saved: {saved_spec}. Expected: {rllib_module_spec}. Refusing to load."
+            )
+    try:
+        algo.restore_from_path(checkpoint_dir)
+        algo.config.env_config['enable_zmq'] = args.enable_zmq
+        logger.info(f"Restored RLlib module from {checkpoint_dir}")
+        return algo, True
+    except Exception as e:
+        try:
+            entries = sorted(os.listdir(checkpoint_dir))
+            entries_preview = ", ".join(entries[:10]) if entries else "<empty>"
+        except Exception:
+            entries_preview = "<unavailable>"
+        raise ValueError(
+            "RLlib load failed from --rllib-load-dir "
+            f"{checkpoint_dir}. Ensure this directory contains a valid RLlib "
+            f"checkpoint. Inner error: {e}. Directory entries: {entries_preview}"
+        ) from e
 
 
 def _load_filter_model(filter_model, args, logger) -> bool:
     """
-    Load StatePredictor weights if model_mode=load and files exist with matching spec.
-    Returns True if loaded, False if created new. Raises ValueError if spec mismatches.
+    Load StatePredictor weights when --filter-load-dir is provided.
+    Returns True if loaded, False if no load directory was requested.
+    Raises ValueError if load is requested but files are missing or incompatible.
     """
-    model_mode = getattr(args, "model_mode", "create")
-    if model_mode != "load":
+    filter_dir = getattr(args, "filter_load_dir", None)
+    if filter_dir is None:
         return False
-    filter_name = getattr(args, "filter_model_name", "filter")
     filter_spec = getattr(args, "filter_spec", None)
     if filter_spec is None:
-        logger.warning("filter_spec not set; cannot validate filter model. Skipping load.")
-        return False
-    filter_dir = _filter_checkpoint_dir(filter_name)
+        raise ValueError("Filter load failed: filter_spec is not available for compatibility validation.")
+    if not os.path.isdir(filter_dir):
+        raise ValueError(
+            "Filter load failed: provided --filter-load-dir is not a directory: "
+            f"{filter_dir}"
+        )
     pt_path = os.path.join(filter_dir, "filter.pt")
     spec_path = os.path.join(filter_dir, "filter_spec.json")
     if not os.path.isfile(pt_path) or not os.path.isfile(spec_path):
-        logger.warning(
-            f"Filter model not found at {pt_path} (or spec at {spec_path}). "
-            "Creating new filter from scratch."
+        raise ValueError(
+            "Filter load failed from --filter-load-dir "
+            f"{filter_dir}. Required files were not found. "
+            f"Expected: {pt_path} and {spec_path}."
         )
-        return False
     with open(spec_path, "r") as f:
         saved_spec = json.load(f)
     if not _spec_matches(saved_spec, filter_spec):
@@ -211,25 +219,6 @@ def _load_filter_model(filter_model, args, logger) -> bool:
     filter_model.load_state_dict(state_dict)
     logger.info(f"Loaded filter model from {pt_path}")
     return True
-
-
-def _load_filter_checkpoint_from_path(
-    checkpoint_path: str,
-    logger,
-) -> tuple[Optional[Dict[str, Any]], Dict[str, torch.Tensor]]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
-    state_dict = (
-        checkpoint.get("model_state_dict", checkpoint)
-        if isinstance(checkpoint, dict)
-        else checkpoint
-    )
-    if not isinstance(state_dict, dict):
-        raise ValueError(
-            f"Unsupported filter checkpoint format at {checkpoint_path}: expected a state_dict-like object."
-        )
-    logger.info(f"Loaded explicit filter checkpoint from {checkpoint_path}")
-    return model_config, state_dict
 
 
 def _save_models(algo, filter_model_refs, args, logger) -> None:
@@ -546,7 +535,10 @@ def run_rllib_shared_memory(
         # First, read from ring buffer and accumulate in storage buffer
         ring_batches = _read_filter_batch()  # This also adds batches to storage buffer
 
-        logger.debug(f"run_algorithm: Read {len(ring_batches)} batches from ring buffer.")
+        if ring_batches is not None and len(ring_batches) > 0:
+            logger.debug(f"run_algorithm: Read {len(ring_batches)} batches from ring buffer.")
+        else:
+            logger.debug("run_algorithm: No batches available from ring buffer.")
         
         # Try to sample from storage buffer first
         batches = None
@@ -585,15 +577,16 @@ def run_rllib_shared_memory(
         logger.debug("run_algorithm: Starting training loop in _train_filter_model().")
         
         for batch in batches:
-            # Split batch into state, action, next_state
+            # Split batch into state, action, next_state(output)
             state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
             action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
+            next_state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["next_state"]
             
             states = torch.from_numpy(batch[:, :state_dim]).float()
             actions = torch.from_numpy(batch[:, state_dim:state_dim + action_dim]).float()
             # next_state is the segment immediately following action_filtered (ignore appended action_nominal)
             next_state_start = state_dim + action_dim
-            next_state_end = next_state_start + state_dim
+            next_state_end = next_state_start + next_state_dim
             next_states = torch.from_numpy(batch[:, next_state_start:next_state_end]).float()
             
             # Forward pass
@@ -982,6 +975,7 @@ def run_rllib_shared_memory(
         filter_dims = filter_ep_shm_properties_for_dims.get("filter_dims", None) if filter_ep_shm_properties_for_dims else None
         filter_state_dim = filter_dims.get("state", None)
         filter_action_dim = filter_dims.get("action", None)
+        filter_output_dim = filter_dims.get("next_state", None)
         # if isinstance(config.observation_space, spaces.Discrete):
         #     filter_state_dim = config.observation_space.n.size
         # elif isinstance(config.observation_space, spaces.Tuple):
@@ -999,60 +993,38 @@ def run_rllib_shared_memory(
         # else:
         #     raise NotImplementedError(f"Action space type not supported or not provided.")
 
-        if filter_state_dim is None or filter_action_dim is None:
-            raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
-        #
-        filter_num_hidden = config.env_config.get("filter_num_hidden", 2)
-        filter_hidden_exp = config.env_config.get("filter_hidden_exp", 7)
-        filter_dropout = config.env_config.get("filter_dropout", 0.0)
-        filter_output_dim = filter_state_dim
-        explicit_filter_checkpoint_path = (
-            config.env_config.get("filter_checkpoint_path")
-            or getattr(args, "filter_checkpoint_path", None)
-        )
-        explicit_filter_state_dict = None
-
-        if explicit_filter_checkpoint_path is not None:
-            model_cfg, explicit_filter_state_dict = _load_filter_checkpoint_from_path(
-                explicit_filter_checkpoint_path, logger
+        if filter_state_dim is None or filter_action_dim is None or filter_output_dim is None:
+            raise ValueError(
+                "Filter state/action/output dimensions not set. "
+                "Please check filter_ep_shm_properties.filter_dims."
             )
-            if model_cfg is not None:
-                if "state_dim" in model_cfg and int(model_cfg["state_dim"]) != int(filter_state_dim):
-                    raise ValueError(
-                        "Explicit filter checkpoint has incompatible state_dim: "
-                        f"{model_cfg['state_dim']} (checkpoint) vs {filter_state_dim} (runtime)."
-                    )
-                if "action_dim" in model_cfg and int(model_cfg["action_dim"]) != int(filter_action_dim):
-                    raise ValueError(
-                        "Explicit filter checkpoint has incompatible action_dim: "
-                        f"{model_cfg['action_dim']} (checkpoint) vs {filter_action_dim} (runtime)."
-                    )
-                if "output_dim" in model_cfg:
-                    filter_output_dim = int(model_cfg["output_dim"])
-                    if filter_output_dim != int(filter_state_dim):
-                        raise ValueError(
-                            "Explicit filter checkpoint output_dim must match runtime filter state dimension. "
-                            f"Got output_dim={filter_output_dim}, state_dim={filter_state_dim}."
-                        )
-                if "num_hidden" in model_cfg:
-                    filter_num_hidden = int(model_cfg["num_hidden"])
-                if "hidden_exp" in model_cfg:
-                    filter_hidden_exp = int(model_cfg["hidden_exp"])
-                if "dropout" in model_cfg:
-                    filter_dropout = float(model_cfg["dropout"])
-                logger.info(
-                    "Using filter architecture from checkpoint model_config: "
-                    "num_hidden=%s, hidden_exp=%s, dropout=%s",
-                    filter_num_hidden,
-                    filter_hidden_exp,
-                    filter_dropout,
-                )
-            else:
-                logger.info(
-                    "No model_config found in explicit filter checkpoint. "
-                    "Using configured filter architecture values."
-                )
-
+        #
+        runtime_filter_spec = config.env_config.get("filter_spec", None)
+        filter_num_hidden = (
+            int(runtime_filter_spec["filter_num_hidden"])
+            if isinstance(runtime_filter_spec, dict) and "filter_num_hidden" in runtime_filter_spec
+            else int(config.env_config.get("filter_num_hidden", 2))
+        )
+        filter_hidden_exp = (
+            int(runtime_filter_spec["filter_hidden_exp"])
+            if isinstance(runtime_filter_spec, dict) and "filter_hidden_exp" in runtime_filter_spec
+            else int(config.env_config.get("filter_hidden_exp", 7))
+        )
+        filter_dropout = (
+            float(runtime_filter_spec["filter_dropout"])
+            if isinstance(runtime_filter_spec, dict) and "filter_dropout" in runtime_filter_spec
+            else float(config.env_config.get("filter_dropout", 0.0))
+        )
+        if (
+            isinstance(runtime_filter_spec, dict)
+            and "filter_output_dim" in runtime_filter_spec
+            and int(runtime_filter_spec["filter_output_dim"]) != int(filter_output_dim)
+        ):
+            raise ValueError(
+                "Inconsistent filter output dimension between filter_spec and filter_dims. "
+                f"filter_spec={runtime_filter_spec['filter_output_dim']}, "
+                f"filter_dims.next_state={filter_output_dim}."
+            )
         logger.debug(
             f"run_algorithm: Initializing filter model with state_dim={filter_state_dim}, "
             f"action_dim={filter_action_dim}, output_dim={filter_output_dim}, "
@@ -1094,40 +1066,25 @@ def run_rllib_shared_memory(
         config.env_config["filter_num_hidden"] = int(filter_num_hidden)
         config.env_config["filter_hidden_exp"] = int(filter_hidden_exp)
         config.env_config["filter_dropout"] = float(filter_dropout)
-        args.filter_spec = {
+        config.env_config["filter_output_dim"] = int(filter_output_dim)
+        resolved_filter_spec = {
             "filter_state_dim": int(filter_state_dim),
             "filter_action_dim": int(filter_action_dim),
+            "filter_output_dim": int(filter_output_dim),
             "filter_num_hidden": int(filter_num_hidden),
             "filter_hidden_exp": int(filter_hidden_exp),
             "filter_dropout": float(filter_dropout),
         }
+        config.env_config["filter_spec"] = dict(resolved_filter_spec)
+        args.filter_spec = dict(resolved_filter_spec)
 
-        # Load filter model if model_mode=load and compatible checkpoint exists
+        # Load filter model if requested and compatible checkpoint exists
         filter_loaded = False
-        if explicit_filter_state_dict is not None:
-            try:
-                filter_model.load_state_dict(explicit_filter_state_dict)
-                filter_loaded = True
-                logger.info(
-                    "Initialized filter model weights from explicit checkpoint %s",
-                    explicit_filter_checkpoint_path,
-                )
-            except RuntimeError as e:
-                raise ValueError(
-                    f"Could not load explicit filter checkpoint at {explicit_filter_checkpoint_path}: {e}"
-                ) from e
-        else:
-            try:
-                filter_loaded = _load_filter_model(filter_model, args, logger)
-            except ValueError as e:
-                logger.error(str(e))
-                raise
-
-        if getattr(args, "model_mode", "create") == "load" and (rllib_module_loaded != filter_loaded):
-            logger.warning(
-                f"Partial load: RLlib module={'loaded' if rllib_module_loaded else 'created'}, "
-                f"filter={'loaded' if filter_loaded else 'created'}."
-            )
+        try:
+            filter_loaded = _load_filter_model(filter_model, args, logger)
+        except ValueError as e:
+            logger.error(str(e))
+            raise
 
         # Convert filter model to ONNX/ORT
         filter_ort_raw = _get_filter_onnx_model(filter_model, logger=logger, outdir="filter_model.onnx")
@@ -1200,8 +1157,15 @@ def run_rllib_shared_memory(
         if filter_ep_shm_properties is not None:
             state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["state"]
             action_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"]
+            next_state_dim = filter_ep_shm_properties["STATE_ACTION_DIMS"]["next_state"]
             filter_storage_sample_dim = sum(filter_ep_shm_properties["filter_dims"].values())
-            logger.debug(f"run_algorithm: Filter storage sample_dim={filter_storage_sample_dim} (state={state_dim}, action={action_dim})")
+            logger.debug(
+                "run_algorithm: Filter storage sample_dim=%s (state=%s, action=%s, next_state=%s)",
+                filter_storage_sample_dim,
+                state_dim,
+                action_dim,
+                next_state_dim,
+            )
 
             # ORT-free SafetyFilter instance used only for compute_h() during Critical classification.
             barrier_only_safety_filter = SafetyFilter(
@@ -1218,6 +1182,7 @@ def run_rllib_shared_memory(
             sample_dim=filter_storage_sample_dim,
             state_dim=state_dim if filter_ep_shm_properties is not None else None,
             action_dim=action_dim if filter_ep_shm_properties is not None else None,
+            next_state_dim=next_state_dim if filter_ep_shm_properties is not None else None,
             critical_fraction=filter_storage_critical_fraction,
             critical_capacity_fraction=filter_storage_critical_capacity_fraction,
             h_critical_threshold=filter_storage_h_critical_threshold,
@@ -1234,6 +1199,7 @@ def run_rllib_shared_memory(
             'filter_policy_shm_name': filter_policy_shm_name,
             'state_dim': filter_state_dim,
             'action_dim': filter_action_dim,
+            'output_dim': filter_output_dim,
             'storage_buffer': filter_storage_buffer,
             'storage_training_batch_size': filter_storage_training_batch_size,
         }

@@ -710,14 +710,14 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         │       └ same as rollout[0]                           │
         └──────────────────────────────────────────────────────┘
         """
-        self.logger.debug("EnvRunner: In _read_batch().")
+        # self.logger.debug("EnvRunner: In _read_batch().")
 
         # wait until the buffer is unlocked to read indices, then read and lock (locking happens in get_indices)
         while True:
             if self.f_buf[5] == 0:  # actor episode buffer lock flag
                 write_idx, read_idx = get_indices(self.ep_arr, self.f_buf, lock_index=5)
-                self.logger.debug(f"EnvRunner(_read_batch): Started reading buffer. "
-                                  f"Identified write_idx, read_idx: {write_idx}, {read_idx}.")
+                # self.logger.debug(f"EnvRunner(_read_batch): Started reading buffer. "
+                #                   f"Identified write_idx, read_idx: {write_idx}, {read_idx}.")
                 break
             else:
                 time.sleep(0.0001)

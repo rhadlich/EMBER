@@ -2,6 +2,14 @@ import argparse
 from typing import Optional
 import importlib
 
+# Directory containing .h5 files used for predictor input normalization (mean/std).
+# Replace this placeholder with your HDF5 data directory.
+DEFAULT_SAMPLE_DATA_DIR = '/Users/rodrigohadlich/Documents/Lab Documents/Methanol/Training Dataset/New Training/digital_twin_processed_data/hdf5_data/test'
+
+# Directory containing .h5 files used for safety-filter action normalization (min/max).
+# Replace this placeholder with your safety-filter HDF5 data directory.
+DEFAULT_FILTER_SAMPLE_DATA_DIR = '/Users/rodrigohadlich/Documents/Lab Documents/Methanol/Training Dataset/New Training/safety_filter_processed_data/hdf5_data/test'
+
 
 def get_full_parser():
     parser = custom_args()
@@ -401,12 +409,24 @@ def custom_args(
         "If not set, defaults are used based on algo and env_type.",
     )
     parser.add_argument(
-        "--model-mode",
+        "--rllib-load-dir",
         type=str,
-        choices=["create", "load"],
-        default="create",
-        help="'create': Always create new models from scratch. "
-        "'load': Load existing models if found (error on spec mismatch, warn and create new if missing).",
+        default=None,
+        help=(
+            "Directory to load RLlib checkpoints/spec from. If provided, the script "
+            "must successfully load the RLlib model from this directory or it will fail. "
+            "Accepts absolute or project-relative paths."
+        ),
+    )
+    parser.add_argument(
+        "--filter-load-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to load safety filter checkpoints/spec from. If provided, the "
+            "script must successfully load the filter model from this directory or it "
+            "will fail. Accepts absolute or project-relative paths."
+        ),
     )
     parser.add_argument(
         "--predictor-checkpoint",
@@ -419,14 +439,24 @@ def custom_args(
         ),
     )
     parser.add_argument(
-        "--filter-checkpoint",
+        "--sample-data-dir",
         type=str,
-        default=None,
+        default=DEFAULT_SAMPLE_DATA_DIR,
         help=(
-            "Safety filter checkpoint (.pth/.pt). If provided, this file is used as "
-            "the starting filter model and its model_config (when present) overrides "
-            "filter architecture args."
+            "Directory containing HDF5 (.h5) files whose normalization/feature_mean and "
+            "normalization/feature_std are used by the engine predictor. "
+            f"Default: {DEFAULT_SAMPLE_DATA_DIR!r}"
         ),
     )
-
+    parser.add_argument(
+        "--filter-sample-data-dir",
+        type=str,
+        default=DEFAULT_FILTER_SAMPLE_DATA_DIR,
+        help=(
+            "Directory containing safety-filter HDF5 (.h5) files whose "
+            "normalization/action_min and normalization/action_max are used "
+            "to normalize actions before SafetyFilter inference. "
+            f"Default: {DEFAULT_FILTER_SAMPLE_DATA_DIR!r}"
+        ),
+    )
     return parser
