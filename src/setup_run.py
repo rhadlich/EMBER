@@ -20,7 +20,12 @@ import sys
 from pathlib import Path
 
 from gymnasium import spaces
-from core.environments.engine_env import EngineEnvDiscrete, EngineEnvContinuous, reward_fn
+from core.environments import (
+    ENGINE_CONTINUOUS_ADAPTER_ID,
+    get_env_adapter,
+    reward_fn,
+)
+from core.environments.engine_env import EngineEnvContinuous
 from core.environments.throughput_env import ThroughputEngineEnvContinuous
 
 from env_runner import SharedMemoryEnvRunner
@@ -78,6 +83,15 @@ parser.add_argument(
     help=(
         "Execution profile. 'realtime' keeps the shared-memory/minion pipeline. "
         "'throughput' uses standard RLlib sampling for intra-node cluster speed."
+    ),
+)
+parser.add_argument(
+    "--env-adapter",
+    type=str,
+    default=ENGINE_CONTINUOUS_ADAPTER_ID,
+    help=(
+        "Environment adapter id for realtime profile. "
+        f"Default: {ENGINE_CONTINUOUS_ADAPTER_ID!r}."
     ),
 )
 
@@ -385,41 +399,24 @@ if __name__ == "__main__":
         _run_throughput_profile(args, logger)
         sys.exit(0)
 
-    # make environment to have access to observation and action spaces
-    if args.env_type.lower() == 'continuous':
-        env = EngineEnvContinuous(
-            reward=reward_fn,
-            predictor_weights_path=args.predictor_checkpoint_path,
-            sample_data_dir=args.sample_data_dir,
+    if args.env_type.lower() != "continuous":
+        raise NotImplementedError(
+            "Realtime profile now supports only env_type=continuous."
         )
-    elif args.env_type.lower() == 'discrete':
-        env = EngineEnvDiscrete(
-            reward=reward_fn,
-            predictor_weights_path=args.predictor_checkpoint_path,
-            sample_data_dir=args.sample_data_dir,
-        )
-    else:
-        raise NotImplementedError(f"Environment type not supported or not provided.")
+
+    env_adapter = get_env_adapter(args.env_adapter)
+    env_adapter_kwargs = {
+        "predictor_checkpoint_path": args.predictor_checkpoint_path,
+        "sample_data_dir": args.sample_data_dir,
+    }
+    # Make environment to probe spaces and adapter-derived feature specs.
+    env = env_adapter.build_env(reward_fn=reward_fn, env_kwargs=env_adapter_kwargs)
     obs_space = env.observation_space
     action_space = env.action_space
 
-    if isinstance(obs_space, spaces.Discrete):
-        imep_space = env.imep_env_limits
-        mprr_space = env.mprr_env_limits
-
-        # patch up the dimensions issue when running a discrete observation space
-        flat_dim = len(imep_space)
-        obs_space_onehot = spaces.Box(
-                low=0.0, high=1.0, shape=(flat_dim,), dtype=np.float32
-            )
-        obs_is_discrete = True
-    elif isinstance(obs_space, spaces.Box):
-        obs_space_onehot = None
-        imep_space = env.imep_env_limits
-        mprr_space = env.mprr_env_limits
-        obs_is_discrete = False
-    else:
+    if not isinstance(obs_space, spaces.Box):
         raise NotImplementedError(f"Unsupported observation space {obs_space}")
+    obs_is_discrete = False
 
     adapter = ActionAdapter(action_space)
 
@@ -434,25 +431,7 @@ if __name__ == "__main__":
         _algo_cfg_mod = None
 
     action_dim = _get_buffer_action_dim(action_space, adapter)
-    # Runtime observations stored in shared memory are the following:
-    state_features = [
-        'IMEP setpoint, k',
-        'IMEP setpoint, k-1',
-        'IMEP actual, k-1',
-        'Injection duration before IVC (ID1), k',
-        'Injection duration before IVC (ID1), k-1',
-        'Start of injection after IVC (SOI2), k-1',
-        'Injection duration after IVC (ID2), k-1',
-        'Pressure intake @ IVC, k-1',
-        # 'Temperature intake, k-1',
-        'CA50, k-1',
-        'CA10 to CA90, k-1',
-        'Net heat release, k-1',
-        'Pressure max, k-1',
-        'MPRR, k-1',
-        'Moving average IMEP (20 cycles), k-1',
-        'Skewness of moving averate IMEP (20 cycles), k-1',
-    ]
+    state_features = env_adapter.get_actor_state_features()
     state_dim = len(state_features)
 
     if _algo_cfg_mod is not None and hasattr(_algo_cfg_mod, "get_actor_episode_buffer_spec"):
@@ -488,25 +467,8 @@ if __name__ == "__main__":
     filter_ep_shm_properties = None
     filter_spec = None
     if enable_safety_filter:
-        filter_state_features = [
-            'IMEP actual, k-1',
-            'Injection duration before IVC (ID1), k',
-            'Injection duration before IVC (ID1), k-1',
-            'Start of injection after IVC (SOI2), k-1',
-            'Injection duration after IVC (ID2), k-1',
-            'Pressure intake @ IVC, k-1',
-            # 'Temperature intake, k-1',
-            'CA50, k-1',
-            'CA10 to CA90, k-1',
-            'Net heat release, k-1',
-            'Pressure max, k-1',
-            'MPRR, k-1',
-            'Moving average IMEP (20 cycles), k-1',
-            'Skewness of moving averate IMEP (20 cycles), k-1',
-        ]
-        filter_output_features = [
-            'achieved_mprr',
-        ]
+        filter_state_features = env_adapter.get_filter_state_features()
+        filter_output_features = env_adapter.get_filter_output_features()
         filter_state_dim = len(filter_state_features)
         filter_output_dim = len(filter_output_features)
         filter_dims = {
@@ -566,10 +528,9 @@ if __name__ == "__main__":
         "policy_shm_name": args.policy_shm_name,
         "flag_shm_name": args.flag_shm_name,
         "ep_shm_properties": ep_shm_properties,
-        "imep_space": imep_space,
-        "mprr_space": mprr_space,
         "obs_is_discrete": obs_is_discrete,
-        "env_type": args.env_type.lower(),
+        "env_adapter_id": args.env_adapter,
+        "env_adapter_kwargs": dict(env_adapter_kwargs),
         "cpu_core_env_runner": args.cpu_core_env_runner,
         "cpu_core_minion": args.cpu_core_minion,
         "enable_zmq": args.enable_zmq,
@@ -610,7 +571,7 @@ if __name__ == "__main__":
             enable_env_runner_and_connector_v2=True,  # turn connector-v2 on
         )
         .environment(
-            observation_space=obs_space_onehot or obs_space,
+            observation_space=obs_space,
             action_space=action_space,
             normalize_actions=(True if adapter.mode == "continuous" else False),
             clip_actions=(True if adapter.mode == "continuous" else False),
@@ -638,7 +599,7 @@ if __name__ == "__main__":
     env_type = getattr(args, "env_type", "continuous")
     args.rllib_module_name = getattr(args, "rllib_module_name", None) or f"{args.algo}_{env_type}_rllib_module"
     args.filter_model_name = getattr(args, "filter_model_name", None) or f"{args.algo}_{env_type}_filter"
-    obs_space_final = obs_space_onehot or obs_space
+    obs_space_final = obs_space
     obs_shape = list(obs_space_final.shape) if hasattr(obs_space_final, "shape") else [getattr(obs_space_final, "n", None)]
     action_shape = list(action_space.shape) if hasattr(action_space, "shape") else [int(sum(adapter.nvec))] if adapter.mode in ("discrete1", "multidiscrete") else None
 

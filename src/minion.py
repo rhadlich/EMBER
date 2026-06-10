@@ -14,8 +14,7 @@ import random
 
 from ray.rllib.utils.numpy import softmax
 import gymnasium as gym
-from core.environments.engine_env import reward_fn, EngineEnvDiscrete, EngineEnvContinuous
-from core.environments.target_curve_generator import IMEPTargetCurveGenerator
+from core.environments import ENGINE_CONTINUOUS_ADAPTER_ID, get_env_adapter, reward_fn
 
 from utils.utils import (
     ActionAdapter,
@@ -23,7 +22,7 @@ from utils.utils import (
     build_rollout_row,
     get_rollout_field_slices,
 )
-from utils.shared_memory_utils import get_indices, set_indices, flatten_obs_onehot
+from utils.shared_memory_utils import get_indices, set_indices
 
 from ray.rllib.env import INPUT_ENV_SPACES
 from ray.rllib.core import DEFAULT_MODULE_ID
@@ -211,39 +210,23 @@ class Minion:
 
         self.logger.debug("Minion: Initialized actor ORT session")
 
-        # initialize environment
-        env_type = self.config.env_config['env_type']
-        predictor_checkpoint_path = self.config.env_config.get("predictor_checkpoint_path")
-        sample_data_dir = self.config.env_config.get("sample_data_dir")
-        if env_type == 'continuous':
-            self.env = EngineEnvContinuous(
-                reward=reward_fn,
-                predictor_weights_path=predictor_checkpoint_path,
-                sample_data_dir=sample_data_dir,
+        # initialize environment through adapter (continuous-only realtime path)
+        env_adapter_id = self.config.env_config.get(
+            "env_adapter_id", ENGINE_CONTINUOUS_ADAPTER_ID
+        )
+        env_adapter_kwargs = self.config.env_config.get("env_adapter_kwargs", {})
+        self.env_adapter = get_env_adapter(env_adapter_id)
+        self.env = self.env_adapter.build_env(
+            reward_fn=reward_fn,
+            env_kwargs=dict(env_adapter_kwargs),
+        )
+        if not isinstance(self.env.observation_space, gym.spaces.Box):
+            raise NotImplementedError(
+                f"Unsupported observation space for realtime adapter path: "
+                f"{self.env.observation_space}"
             )
-        elif env_type == 'discrete':
-            self.env = EngineEnvDiscrete(
-                reward=reward_fn,
-                predictor_weights_path=predictor_checkpoint_path,
-                sample_data_dir=sample_data_dir,
-            )
-        else:
-            raise NotImplementedError(f"Environment type not supported or not provided.")
-
-        if isinstance(self.env.observation_space, gym.spaces.Discrete):
-            self.obs_is_discrete = True
-
-            # extract action and observation spaces dimensions
-            # self.sizes = [sp.n for sp in self.env.action_space]
-            # self.cuts = np.cumsum(self.sizes)[:-1]
-            self.len_imep = len(self.env.imep_space)
-            self.len_mprr = len(self.env.mprr_space)
-        elif isinstance(self.env.observation_space, gym.spaces.Box):
-            self.obs_is_discrete = False
-        else:
-            raise NotImplementedError(f'Unknown observation_space {self.env.observation_space}')
-
-        self.logger.debug(f"Minion: obs_is_discrete={self.obs_is_discrete}")
+        self.obs_is_discrete = False
+        self.logger.debug("Minion: obs_is_discrete=False (continuous-only path)")
 
         # Seed the Gymnasium environment's internal RNG once so that all future
         # resets without an explicit seed follow a deterministic trajectory.
@@ -253,30 +236,15 @@ class Minion:
             except Exception as e:
                 self.logger.debug(f"Minion: Failed to seed environment with env_seed={self._env_seed}: {e}")
 
-        # Target curve generator: produces smooth, realistic IMEP target
-        # profiles instead of random step changes from env.reset().
-        target_seed = int(self._env_seed) if self._env_seed is not None else None
-        if hasattr(self.env, 'imep_sample_lims'):
-            imep_lo, imep_hi = self.env.imep_sample_lims
-        else:
-            imep_lo, imep_hi = float(self.env.imep_sample_lims[0]), float(self.env.imep_sample_lims[-1])
-        self.target_gen = IMEPTargetCurveGenerator(
-            low=imep_lo,
-            high=imep_hi,
-            seed=target_seed,
-            min_hold_len=15,
-            max_hold_len=60,
-            min_transition_len=20,
-            max_transition_len=90,
+        self.adapter_state = self.env_adapter.init_runtime_state(
+            env=self.env,
+            env_seed=(int(self._env_seed) if self._env_seed is not None else None),
         )
-
-        self.logger.debug("Minion: Past IMEP target curve generator initialization")
+        self.history_features = self.adapter_state.history
+        self.logger.debug("Minion: initialized adapter runtime state")
 
         # get random reference observation to check ort outputs and make sure weights change
-        if self.obs_is_discrete:
-            obs_shape = self.len_imep
-        else:
-            obs_shape = self.episode_shm_properties["STATE_ACTION_DIMS"]["state"]
+        obs_shape = self.episode_shm_properties["STATE_ACTION_DIMS"]["state"]
         self.ref_obs = np.random.randn(32, obs_shape).astype(np.float32)
         self.old_policy_output = None
 
@@ -386,15 +354,6 @@ class Minion:
         self.ema_beta = np.exp(-np.log(2) / H)
         self.current_var_ema = 1.0
         self.current_reward_scale = 1.0
-
-        # Initialize history features to store observations from previous steps
-        self.history_features = {
-            "previous desired imep": 0.0,
-            "previous SOI2": -140.0,
-            "previous ID2": 0.6,
-            "previous ID1": 0.6,
-            "current ID1": 0.6,
-        }
 
         self.logger.debug("Minion: Done with __init__().")
 
@@ -766,229 +725,55 @@ class Minion:
         return self._write_fragment(data, is_initial_state=is_initial_state, buffer_type='filter')
     
     def _get_obs_from_env_to_actor(self, obs: dict[str, float]) -> np.ndarray:
-        """
-        Helper function to format observation for model inference.
-
-        obs from EngineEnv is a dictionary with the following keys:
-        - desired_imep
-        - current_imep
-        - current_mprr
-        - current_CA50
-        - current_CA10_CA90
-        - current_net_heat_release
-        - current_pressure_max
-        - current_imep_moving_average
-        - current_skewness_moving_average
-        - current_Pint
-
-        Observation should be assembled according to the state_features list in setup_run.py. Currently:
-        'IMEP setpoint, k',
-        'IMEP setpoint, k-1',
-        'IMEP actual, k-1',
-        'Injection duration before IVC (ID1), k',
-        'Injection duration before IVC (ID1), k-1',
-        'Start of injection after IVC (SOI2), k-1',
-        'Injection duration after IVC (ID2), k-1',
-        'Pressure intake @ IVC, k-1',
-        'CA50, k-1',
-        'CA10 to CA90, k-1',
-        'Net heat release, k-1',
-        'Pressure max, k-1',
-        'MPRR, k-1',
-        'Moving average IMEP (20 cycles), k-1',
-        'Skewness of moving averate IMEP (20 cycles), k-1',
-        """
-
-        if self.obs_is_discrete:
-            # one-hot encode observation
-            obs_for_actor = np.array([flatten_obs_onehot(obs, self.env.imep_space, self.env.mprr_space)],
-                                        np.float32)
-        else:
-            obs_for_actor = np.array([
-                obs["desired_imep"],
-                self.history_features["previous desired imep"],
-                obs["achieved_imep"],
-                self.history_features["current ID1"],
-                self.history_features["previous ID1"],
-                self.history_features["previous SOI2"],
-                self.history_features["previous ID2"],
-                obs["achieved_Pint"],
-                obs["achieved_CA50"],
-                obs["achieved_CA10_CA90"],
-                obs["achieved_net_heat_release"],
-                obs["achieved_pressure_max"],
-                obs["achieved_mprr"],
-                obs["achieved_imep_moving_average"],
-                obs["achieved_skewness_moving_average"],
-                ], dtype=np.float32)
-
-        if obs_for_actor.ndim == 1:
-            obs_for_actor = np.expand_dims(obs_for_actor, axis=0)
-
-        return obs_for_actor
+        """Format raw env observation into actor-model input."""
+        obs_for_actor = self.env_adapter.obs_to_actor(
+            obs=obs,
+            runtime_state=self.adapter_state,
+        )
+        return np.expand_dims(obs_for_actor, axis=0)
 
     def _get_obs_from_env_to_filter_input(self, obs: dict[str, float]) -> np.ndarray:
-        """
-        Helper function to format observation for filter model inference.
-
-        obs from EngineEnv is a dictionary with the following keys:
-        - desired_imep
-        - current_imep
-        - current_mprr
-        - current_CA50
-        - current_CA10_CA90
-        - current_net_heat_release
-        - current_pressure_max
-        - current_imep_moving_average
-        - current_skewness_moving_average
-        - current_Pint
-
-        Observation should be assembled according to the filter_state_features list in setup_run.py. Currently:
-        'IMEP actual, k-1',
-        'Injection duration before IVC (ID1), k',
-        'Injection duration before IVC (ID1), k-1',
-        'Start of injection after IVC (SOI2), k-1',
-        'Injection duration after IVC (ID2), k-1',
-        'Pressure intake @ IVC, k-1',
-        'CA50, k-1',
-        'CA10 to CA90, k-1',
-        'Net heat release, k-1',
-        'Pressure max, k-1',
-        'MPRR, k-1',
-        'Moving average IMEP (20 cycles), k-1',
-        'Skewness of moving averate IMEP (20 cycles), k-1',
-        """
-        if self.obs_is_discrete:
-            # already in values, so just return
-            obs_for_filter_input = np.array([obs], np.float32)
-        else:
-            obs_for_filter_input = np.array([
-                obs["achieved_imep"],
-                self.history_features["current ID1"],
-                self.history_features["previous ID1"],
-                self.history_features["previous SOI2"],
-                self.history_features["previous ID2"],
-                obs["achieved_Pint"],
-                obs["achieved_CA50"],
-                obs["achieved_CA10_CA90"],
-                obs["achieved_net_heat_release"],
-                obs["achieved_pressure_max"],
-                obs["achieved_mprr"],
-                obs["achieved_imep_moving_average"],
-                obs["achieved_skewness_moving_average"],
-                ], dtype=np.float32)
-
-        return obs_for_filter_input
+        """Format raw env observation into filter-model input."""
+        return self.env_adapter.obs_to_filter_input(
+            obs=obs,
+            runtime_state=self.adapter_state,
+        )
     
     def _get_obs_from_env_to_filter_output(self, obs: dict[str, float]) -> np.ndarray:
-        """
-        Helper function to format observation for filter model inference.
-
-        obs from EngineEnv is a dictionary with the following keys:
-        - desired_imep
-        - achieved_imep
-        - achieved_mprr
-        - achieved_CA50
-        - achieved_CA10_CA90
-        - achieved_net_heat_release
-        - achieved_pressure_max
-        - achieved_imep_moving_average
-        - achieved_skewness_moving_average
-        - achieved_Pint
-
-        Observation should be assembled according to the filter_output_features list in setup_run.py. Currently:
-        'MPRR, k-1',
-        """
-        obs_for_filter_output = np.array([
-            obs["achieved_mprr"],
-            ], dtype=np.float32)
-
-        return obs_for_filter_output
+        """Format env observation into filter-training output."""
+        return self.env_adapter.obs_to_filter_output(obs=obs)
     
     def _get_action_from_actor_to_filter(self, action: np.ndarray) -> np.ndarray:
-        """
-        Helper function to format action for filter.
-        """
-        
-        if self.obs_is_discrete:
-            # outputs in indices, so need to convert to values
-            action_for_filter = self.env.action_ind_to_vals(action)
-        else:
-            # Actor network outputs are in range [-1, 1], need to convert to environment range.
-            # Important to note that the filter also expects [-1, 1] range, but the the actor
-            # is normalized based on the environment range and the filter is normalized based
-            # on the range of data used to train the filter.
-            #
-            # Use ActionAdapter to convert to environment range.
-            #
-            # Current action order is: [ID1, SOI2, ID2]
-            action_for_filter = action.astype(np.float32, copy=True)
-            action_for_filter = self.action_adapter.get_action_in_env_range(action_for_filter)
-
-        return action_for_filter
+        """Format actor sampled action into filter action domain."""
+        return self.env_adapter.action_actor_to_filter(
+            action=action,
+            action_adapter=self.action_adapter,
+        )
     
     def _get_action_from_filter_to_env(self, obs: dict[str, float], action: np.ndarray) -> np.ndarray:
-        """
-        Helper function to format action for environment. Directly takes the output of the
-        safety filter (numpy array of values) and converts it to the format expected by the 
-        environment.
-
-        Conversion from actor to filter range is done in the _get_action_from_actor_to_filter.
-        
-        Here need to build the array of input features for the envronment, which includes
-        actions and state features. Current list is:
-            "CA50_prev",
-            "P_int_IVC_prev",
-            "Q_net_prev",
-            "P_max_prev",
-            "mprr_prev",
-            "CA10_90_prev",
-            "IMEP_ma",
-            "skewness",
-            "SOI2",
-            "ID1_prev",
-            "ID2",
-            "ID1_prev_prev",
-            "ID2_prev",
-            "SOI2_prev",
-        """
-        if self.action_adapter.mode == "continuous":
-            action_for_env = np.array([
-                obs["achieved_CA50"],
-                obs["achieved_Pint"],
-                obs["achieved_net_heat_release"],
-                obs["achieved_pressure_max"],
-                obs["achieved_mprr"],
-                obs["achieved_CA10_CA90"],
-                obs["achieved_imep_moving_average"],
-                obs["achieved_skewness_moving_average"],
-                action[1],
-                self.history_features["current ID1"],
-                action[2],
-                self.history_features["previous ID1"],
-                self.history_features["previous ID2"],
-                self.history_features["previous SOI2"],
-            ], dtype=np.float32).reshape(-1)
-        else:
-            action_for_env = action.astype(np.float32, copy=True)
-        return action_for_env
+        """Format filter action output into environment-step action."""
+        return self.env_adapter.action_filter_to_env(
+            obs=obs,
+            action=action,
+            runtime_state=self.adapter_state,
+        )
 
     def _update_history_features(self, action: np.ndarray, obs: dict[str, float]) -> None:
-        """
-        Helper function to update history features.
-        """
-        self.history_features["previous desired imep"] = obs["desired_imep"]
-        self.history_features["previous ID1"] = self.history_features["current ID1"]
-        self.history_features["current ID1"] = action[0]
-        self.history_features["previous SOI2"] = action[1]
-        self.history_features["previous ID2"] = action[2]
+        """Update adapter-controlled history features."""
+        self.env_adapter.update_history(
+            action_in_env_range=action,
+            obs=obs,
+            runtime_state=self.adapter_state,
+        )
     
     def _update_target(self, obs: dict[str, float], target: float) -> None:
-        """
-        Helper function to update target in all relevant places.
-        """
-        self.env._desired_imep = target
-        obs["desired_imep"] = target
+        """Update target in env internals and current observation."""
+        self.env_adapter.set_target(
+            env=self.env,
+            obs=obs,
+            target=target,
+            runtime_state=self.adapter_state,
+        )
 
     def collect_rollout(
             self,
@@ -1002,7 +787,7 @@ class Minion:
 
         if initial_obs is None:
             obs, info = self.env.reset()
-            target = self.target_gen.current()
+            target = self.env_adapter.target_current(self.adapter_state)
             self._update_target(obs, target)
         else:
             obs = initial_obs
@@ -1210,12 +995,12 @@ class Minion:
         reward_vecs.append(reward_vec)
         dist_inputs_list.append(np.asarray(net_out, dtype=np.float32).reshape(-1))
 
-        msg = {
-            "topic": gui_topic,
-            "current imep": float(info["current imep"]),
-            "mprr": float(info["mprr"]),
-            "target": float(obs["desired_imep"]),
-        }
+        msg = self.env_adapter.build_gui_message(
+            topic=gui_topic,
+            obs=obs,
+            info=info,
+            runtime_state=self.adapter_state,
+        )
         if self.pub is not None:
             try:
                 self.pub.send_json(msg)
@@ -1224,7 +1009,7 @@ class Minion:
 
         self._update_history_features(self.action_adapter.get_action_in_env_range(action), obs)
 
-        target = self.target_gen.next()
+        target = self.env_adapter.target_next(self.adapter_state)
         self._update_target(obs, target)
 
         return obs, action, reward, reward_vec, logp, net_out, dist_inputs, info
@@ -1238,7 +1023,7 @@ class Minion:
         # Write initial state for actor buffer (filter does not need initial state)
         if self.last_obs is None:
             obs, info = self.env.reset()
-            target = self.target_gen.current()
+            target = self.env_adapter.target_current(self.adapter_state)
             self._update_target(obs, target)
             self._write_fragment(self._get_obs_from_env_to_actor(obs).reshape(-1), is_initial_state=True, buffer_type='actor')
         else:

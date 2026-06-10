@@ -52,7 +52,6 @@ import ray
 from utils.shared_memory_utils import (
     get_indices,
     set_indices,
-    flatten_obs_onehot
 )
 from utils.utils import ActionAdapter, get_rollout_field_slices
 
@@ -193,8 +192,8 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         except Exception as e:
             self.logger.debug(f"EnvRunner: forward_inference probe failed: {e}")
 
-        # check if observation and action spaces are discrete
-        self.obs_is_discrete = self.config.env_config["obs_is_discrete"]
+        # realtime adapter path is continuous-only
+        self.obs_is_discrete = False
         self.action_adapter = ActionAdapter(self.config.action_space, action_dist_cls=self.action_dist_cls)
         self.act_is_discrete = (self.action_adapter.mode != "continuous")
 
@@ -212,10 +211,6 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
         # Can't get shm references in init because the run method only creates the shm blocks once init is done
         self.policy_shm = False
         self.flag_shm = False
-
-        # get dimensions of observation space
-        self.imep_space = self.config.env_config["imep_space"]
-        self.mprr_space = self.config.env_config["mprr_space"]
 
         # Block some things from the EnvRunner execution in driver process.
         self._local_worker_bool = (self.worker_index == 0 and self.config.num_env_runners > 0)
@@ -771,8 +766,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
             # add initial state
             batch.add_env_reset(
-                flatten_obs_onehot(_decode_obs(initial_state), self.imep_space, self.mprr_space) if self.obs_is_discrete
-                else initial_state,
+                initial_state,
             )
 
             # add one rollout at a time (i.e. one row in payload)
@@ -790,11 +784,7 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                     action=rollout[self.rollout_field_slices["action"]],
                     reward=np.squeeze(rollout[self.rollout_field_slices["reward"]]),
                     # observation !AFTER! taking "action"
-                    observation=(
-                        flatten_obs_onehot(_decode_obs(rollout[self.rollout_field_slices["next_obs"]]),
-                                           self.imep_space, self.mprr_space) if self.obs_is_discrete
-                        else rollout[self.rollout_field_slices["next_obs"]]
-                    ),
+                    observation=rollout[self.rollout_field_slices["next_obs"]],
                     terminated=bool(terminateds[j]),
                     truncated=bool(truncateds[j]),
                     extra_model_outputs=extra_model_outputs,
