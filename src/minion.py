@@ -18,6 +18,7 @@ from core.environments import ENGINE_CONTINUOUS_ADAPTER_ID, get_env_adapter, rew
 
 from utils.utils import (
     ActionAdapter,
+    EpisodeLogger,
     TimingRecorder,
     build_rollout_row,
     get_rollout_field_slices,
@@ -139,10 +140,24 @@ class Minion:
             # Explicitly disabled, skip setting priority
             self.logger.debug("Real-time priority explicitly disabled in config")
 
+        # read logging feature flags from env_config
+        enable_timing_log = env_cfg.get("enable_timing_log", True)
+        enable_episode_log = env_cfg.get("enable_episode_log", False)
+
         # initialize timing instrumentation (must be early, before any methods that use it)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = f"minion_timing_{timestamp_str}.csv"
-        self.timing_recorder = TimingRecorder(csv_path=csv_path, logger=self.logger)
+        self.timing_recorder = TimingRecorder(csv_path=csv_path, logger=self.logger, enabled=enable_timing_log)
+
+        # initialize episode logger if requested
+        if enable_episode_log:
+            episode_log_path = f"minion_episode_log_{timestamp_str}.csv"
+            self.episode_logger: Optional[EpisodeLogger] = EpisodeLogger(csv_path=episode_log_path, logger=self.logger)
+        else:
+            self.episode_logger = None
+
+        # sequence counter incremented once per train_and_eval_sequence call
+        self.sequence_count = 0
 
         # add attributes to object
         self.policy_shm_name = self.config.env_config['policy_shm_name']
@@ -690,17 +705,6 @@ class Minion:
             write_idx = next_w
             slot_off = shm_properties["HEADER_SIZE"] + write_idx * shm_properties["SLOT_SIZE"]
 
-            # Extract state for next slot's initial state
-            if buffer_type == 'actor':
-                next_obs_slice = self.actor_rollout_field_slices["next_obs"]
-                state = data[next_obs_slice]
-
-
-            if buffer_type == 'actor':
-                # add initial state to next slot
-                initial_state_off = slot_off + shm_properties["HEADER_SLOT_SIZE"]
-                ep_arr[initial_state_off: initial_state_off + len(state)] = state
-
             # reset the fill counter
             ep_arr[slot_off] = 0
 
@@ -731,6 +735,10 @@ class Minion:
             runtime_state=self.adapter_state,
         )
         return np.expand_dims(obs_for_actor, axis=0)
+
+    def _actor_obs_vector(self, obs: dict[str, float]) -> np.ndarray:
+        """Flat actor observation vector for actor SHM initial_state writes."""
+        return self._get_obs_from_env_to_actor(obs).reshape(-1)
 
     def _get_obs_from_env_to_filter_input(self, obs: dict[str, float]) -> np.ndarray:
         """Format raw env observation into filter-model input."""
@@ -866,11 +874,11 @@ class Minion:
                 action_from_actor = np.clip(
                     action_from_actor + noise, -1.0, 1.0
                 ).astype(np.float32)
-                self.logger.debug(
-                    f"Minion: Phase 2 exploration ({self.noise_decay_schedule}), "
-                    f"std={current_std:.4f}, "
-                    f"action_noisy={action_from_actor}"
-                )
+                # self.logger.debug(
+                #     f"Minion: Phase 2 exploration ({self.noise_decay_schedule}), "
+                #     f"std={current_std:.4f}, "
+                #     f"action_noisy={action_from_actor}"
+                # )
         
         try:
             # Keep a copy of the nominal action (pre-filter) for filter-training data.
@@ -879,7 +887,7 @@ class Minion:
             self.logger.debug(f"Minion: Failed to get action from actor to filter: {e}")
             raise RuntimeError(f"Failed to get action from actor to filter: {e}")
         
-        self.logger.debug(f"Minion: action_from_actor_for_filter_nominal: {action_from_actor_for_filter_nominal}")
+        # self.logger.debug(f"Minion: action_from_actor_for_filter_nominal: {action_from_actor_for_filter_nominal}")
 
         # Apply safety filter to action (or use nominal when filter disabled)
         if hasattr(self, 'safety_filter') and self.safety_filter is not None:
@@ -890,7 +898,7 @@ class Minion:
                     action_from_actor_for_filter_nominal,  # numpy array: (action_dim,)
                     self.model_error   # float scalar
                 )
-                self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
+                # self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
             except Exception as e:
                 self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
                 action_filtered = action_from_actor_for_filter_nominal
@@ -918,7 +926,7 @@ class Minion:
             self.logger.debug(f"Minion: Failed to step environment: {e}")
             raise RuntimeError(f"Failed to step environment: {e}")
         
-        self.logger.debug(f"Minion: Observation: {new_obs}")
+        # self.logger.debug(f"Minion: Observation: {new_obs}")
         
         # Collect filter training data (current_state, action, next_state, nominal_action) and write 
         # to filter buffer.
@@ -982,6 +990,9 @@ class Minion:
         sigmas: list,
         reward_vecs: list,
         dist_inputs_list: list,
+        phase: str = "train",
+        step_in_sequence: int = 0,
+        sequence_idx: int = 0,
     ):
         obs, action, reward, reward_vec, _, _, logp, net_out, dist_inputs, info = (
             self.collect_rollout(initial_obs=obs, deterministic=deterministic)
@@ -1006,11 +1017,41 @@ class Minion:
                 self.pub.send_json(msg)
             except Exception as e:
                 self.logger.debug(f"Minion (_collect_and_process_rollout): {e}")
-
+        
         self._update_history_features(self.action_adapter.get_action_in_env_range(action), obs)
-
         target = self.env_adapter.target_next(self.adapter_state)
         self._update_target(obs, target)
+
+        if self.episode_logger is not None:
+            row: dict = {
+                "timestamp": round(time.time(), 3),
+                "sequence_idx": sequence_idx,
+                "rollout_count": self.rollout_count,
+                "step_in_sequence": step_in_sequence,
+                "phase": phase,
+                "reward_raw": float(reward),
+                "reward_adjusted": float(adjusted_reward),
+            }
+            # observation: actor-model input vector before history/target update,
+            # named by adapter feature names
+            actor_obs = self._get_obs_from_env_to_actor(obs).reshape(-1)
+            feature_names = self.env_adapter.get_actor_state_features()
+            for feat_name, val in zip(feature_names, actor_obs):
+                col = "obs_" + feat_name.replace(" ", "_").replace(",", "").replace("(", "").replace(")", "").replace("-", "_")
+                row[col] = float(val)
+            # actions:
+            # - action_*: env-space action (what adapter/history/environment expect)
+            # - action_policy_*: raw policy output space (useful for diagnosing transforms)
+            action_policy_arr = np.asarray(action).reshape(-1)
+            action_env_arr = np.asarray(
+                self.action_adapter.get_action_in_env_range(action)
+            ).reshape(-1)
+            for i, val in enumerate(action_env_arr):
+                row[f"action_{i}"] = float(val)
+                row[f"action_env_{i}"] = float(val)
+            for i, val in enumerate(action_policy_arr):
+                row[f"action_policy_{i}"] = float(val)
+            self.episode_logger.log_step(row)
 
         return obs, action, reward, reward_vec, logp, net_out, dist_inputs, info
 
@@ -1020,14 +1061,21 @@ class Minion:
             eval_rollouts: int = 1,
     ):
 
-        # Write initial state for actor buffer (filter does not need initial state)
         if self.last_obs is None:
             obs, info = self.env.reset()
             target = self.env_adapter.target_current(self.adapter_state)
             self._update_target(obs, target)
-            self._write_fragment(self._get_obs_from_env_to_actor(obs).reshape(-1), is_initial_state=True, buffer_type='actor')
         else:
             obs = self.last_obs
+
+        batch_size = self.episode_shm_properties["BATCH_SIZE"]
+        total_rollouts = int(train_batches * batch_size)
+
+        self._write_fragment(
+            self._actor_obs_vector(obs),
+            is_initial_state=True,
+            buffer_type="actor",
+        )
 
         rewards_raw = []
         rewards_adjusted = []
@@ -1035,7 +1083,14 @@ class Minion:
         reward_vecs = []
         dist_inputs_list = []
 
-        for i in range(int(train_batches * self.episode_shm_properties["BATCH_SIZE"])):
+        for i in range(total_rollouts):
+            if i > 0 and i % batch_size == 0:
+                self._write_fragment(
+                    self._actor_obs_vector(obs),
+                    is_initial_state=True,
+                    buffer_type="actor",
+                )
+
             obs, action, reward, reward_vec, logp, net_out, dist_inputs, info = (
                 self._collect_and_process_rollout(
                     obs,
@@ -1045,6 +1100,9 @@ class Minion:
                     sigmas=sigmas,
                     reward_vecs=reward_vecs,
                     dist_inputs_list=dist_inputs_list,
+                    phase="train",
+                    step_in_sequence=i,
+                    sequence_idx=self.sequence_count,
                 )
             )
             # Collect data to send to the learner according to the selected
@@ -1079,6 +1137,15 @@ class Minion:
         # Compute performance metrics
         try:
             train_rollouts_df = self._compute_performance_metrics(rewards_raw, rewards_adjusted, sigmas, np.vstack(reward_vecs), np.vstack(dist_inputs_list))
+            # Log exploration noise together with other train metrics.
+            # During warmup, actions are sampled from U[-1, 1], whose std is 1/sqrt(3).
+            if self.rollout_count < self.initial_steps:
+                current_exploration_noise = float(np.sqrt(1.0 / 3.0))
+            elif self.initial_std > 0.0:
+                current_exploration_noise = float(self._get_current_exploration_std())
+            else:
+                current_exploration_noise = 0.0
+            train_rollouts_df["exploration_noise"] = current_exploration_noise
         except Exception as e:
             self.logger.debug(f"Minion: Failed to compute performance metrics for train rollouts: {e}")
             raise RuntimeError(f"Failed to compute performance metrics for train rollouts: {e}")
@@ -1099,6 +1166,9 @@ class Minion:
                     sigmas=sigmas_eval,
                     reward_vecs=reward_vecs_eval,
                     dist_inputs_list=dist_inputs_list_eval,
+                    phase="eval",
+                    step_in_sequence=i,
+                    sequence_idx=self.sequence_count,
                 )
         # Compute performance metrics for evaluation
         try:
@@ -1109,9 +1179,15 @@ class Minion:
 
         # Update reward scale
         self._update_reward_scale(rewards_raw)
-        
+
         # Save timing data after train_and_eval_sequence completes
         self.timing_recorder.save_timing_data()
+
+        # Flush episode log rows collected this sequence
+        if self.episode_logger is not None:
+            self.episode_logger.flush()
+
+        self.sequence_count += 1
 
         # set last observation
         self.last_obs = copy.deepcopy(obs)
@@ -1298,6 +1374,13 @@ def main(policy_shm_name: str,
                 actor.logger.debug("Minion: Saved total_eval_rollouts_df to minion_eval_rollouts.csv")
         except Exception as e:
             actor.logger.debug(f"Minion: Failed to save rollout CSVs on exit: {e}")
+
+        # Flush any remaining episode log rows before exit
+        try:
+            if getattr(actor, "episode_logger", None) is not None:
+                actor.episode_logger.close()
+        except Exception as e:
+            actor.logger.debug(f"Minion: Failed to flush episode log on exit: {e}")
 
         # Save any remaining timing data before exit
         try:

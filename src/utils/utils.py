@@ -16,9 +16,9 @@ from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
 from ray.rllib.models.distributions import Distribution
 
 import logging
+import time
 import utils.logging_setup as logging_setup
 import csv
-import time
 from datetime import datetime
 from typing import Optional
 
@@ -274,7 +274,18 @@ class ActionAdapter:
                                               f"expected {2 * self.act_dim} or {self.act_dim} for action_dim={self.act_dim}")
             dist_inputs = np.concatenate([mu, log_sigma], axis=-1).astype(np.float32)
             if deterministic:
-                act = self.normalize_action(torch.from_numpy(mu)).numpy().astype(np.float32)
+                # For squashed-Gaussian policies (SAC), deterministic evaluation must
+                # still apply the squashing/affine transform from mu -> env action.
+                # Using raw mu here can push actions outside env limits.
+                if self.action_dist_cls == TorchSquashedGaussian:
+                    mu_t = torch.from_numpy(mu)
+                    low_t = torch.from_numpy(self.low)
+                    high_t = torch.from_numpy(self.high)
+                    act_t = torch.tanh(mu_t)
+                    act_t = ((act_t + 1.0) / 2.0) * (high_t - low_t) + low_t
+                    act = act_t.numpy().astype(np.float32)
+                else:
+                    act = self.normalize_action(torch.from_numpy(mu)).numpy().astype(np.float32)
                 logp = None
             else:
                 # use RLlib's built-in class to perform sampling
@@ -341,14 +352,16 @@ class TimingRecorder:
     Can be used across multiple processes.
     """
     
-    def __init__(self, csv_path: Optional[str] = None, logger: Optional[logging.Logger] = None):
+    def __init__(self, csv_path: Optional[str] = None, logger: Optional[logging.Logger] = None, enabled: bool = True):
         """
         Initialize the timing recorder.
         
         Args:
             csv_path: Path to the CSV file. If None, generates a timestamped filename.
             logger: Logger instance. If None, creates a default logger.
+            enabled: When False, record_timing and save_timing_data are no-ops.
         """
+        self.enabled = enabled
         self.timing_data = []  # in-memory storage for timing records
         self.sequence_number = 0  # counter for sequence numbers
         
@@ -365,7 +378,10 @@ class TimingRecorder:
         else:
             self.logger = logger
         
-        self.logger.debug(f"TimingRecorder: Timing data will be saved to {self.timing_csv_path}")
+        if self.enabled:
+            self.logger.debug(f"TimingRecorder: Timing data will be saved to {self.timing_csv_path}")
+        else:
+            self.logger.debug("TimingRecorder: Timing logging is disabled.")
     
     def record_timing(self, process_name: str, duration_ms: float, deterministic: Optional[bool] = None):
         """
@@ -377,6 +393,8 @@ class TimingRecorder:
             duration_ms: Duration in milliseconds
             deterministic: Optional boolean flag indicating if the process was deterministic
         """
+        if not self.enabled:
+            return
         self.sequence_number += 1
         record = {
             'timestamp': round(time.time(), 3),  # Round to 3 decimal places (millisecond precision)
@@ -392,7 +410,7 @@ class TimingRecorder:
         Save accumulated timing data to CSV file incrementally.
         This should be called at appropriate points (not during nested operations).
         """
-        if not self.timing_data:
+        if not self.enabled or not self.timing_data:
             return
         
         # Write header if this is the first time
@@ -413,3 +431,55 @@ class TimingRecorder:
             self.timing_data = []
         except Exception as e:
             self.logger.warning(f"TimingRecorder: Failed to save timing data: {e}")
+
+
+class EpisodeLogger:
+    """
+    Records per-step episode data to a CSV file incrementally.
+    The CSV header is derived from the first row written (lazy initialization).
+    """
+
+    def __init__(self, csv_path: str, logger: Optional[logging.Logger] = None):
+        """
+        Args:
+            csv_path: Destination CSV file path.
+            logger: Logger instance. If None, a default logger is created.
+        """
+        self.csv_path = csv_path
+        self._rows: list[dict] = []
+        self._initialized = False
+
+        if logger is None:
+            self.logger = logging.getLogger("MyRLApp.EpisodeLogger")
+        else:
+            self.logger = logger
+
+        self.logger.debug(f"EpisodeLogger: Episode data will be saved to {self.csv_path}")
+
+    def log_step(self, row: dict) -> None:
+        """Append a single step's data to the in-memory buffer."""
+        self._rows.append(row)
+
+    def flush(self) -> None:
+        """Write all buffered rows to the CSV file. Header is written on the first call."""
+        if not self._rows:
+            return
+
+        fieldnames = list(self._rows[0].keys())
+        write_header = not self._initialized
+
+        try:
+            with open(self.csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                    self._initialized = True
+                for row in self._rows:
+                    writer.writerow(row)
+            self._rows = []
+        except Exception as e:
+            self.logger.warning(f"EpisodeLogger: Failed to flush episode data: {e}")
+
+    def close(self) -> None:
+        """Flush any remaining buffered rows."""
+        self.flush()
