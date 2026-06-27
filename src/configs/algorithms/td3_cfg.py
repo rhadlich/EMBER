@@ -74,7 +74,7 @@ def add_cli_args(parser):
         help="Std of Gaussian noise added during exploration (converged value).",
     )
     parser.add_argument(
-        "--initial-steps", type=int, default=0,
+        "--initial-steps", type=int, default=10000,
         help="Number of rollouts using pure uniform-random actions.",
     )
     parser.add_argument(
@@ -118,23 +118,23 @@ def update_config(cfg, args):
                 "custom_model_config": {},
             },
             train_batch_size_per_learner=256,
-            gamma=0.95,
+            gamma=0.1,
             n_step=1,
             grad_clip=10.0,
             actor_lr=2e-5,
             critic_lr=2e-5,
             tau=5e-3,
-            num_steps_sampled_before_learning_starts=1000,
+            num_steps_sampled_before_learning_starts=10000,
             replay_buffer_config={
                 "type": "EpisodeReplayBuffer",
-                "capacity": int(1e6),
+                "capacity": int(5e4),
             },
             # TD3-specific
             target_policy_noise=getattr(args, "target_policy_noise", 0.2),
             target_noise_clip=getattr(args, "target_noise_clip", 0.5),
             policy_delay=getattr(args, "policy_delay", 2),
             exploration_noise=getattr(args, "exploration_noise", 0.1),
-            initial_steps=getattr(args, "initial_steps", 0),
+            initial_steps=getattr(args, "initial_steps", 10000),
             initial_std=getattr(args, "initial_std", 0.5),
             noise_decay_k=getattr(args, "noise_decay_k", 1e-5),
             noise_decay_schedule=getattr(args, "noise_decay_schedule", "linear"),
@@ -530,6 +530,26 @@ class TD3TorchLearner(SACTorchLearner):
             },
             key=module_id,
             window=1,
+        )
+        # Additional TD3 actor diagnostics for CSV analysis in run_algorithm.
+        self.metrics.log_value(
+            key=(module_id, "last_actor_loss"),
+            value=actor_loss,
+            window=1,
+        )
+        self.metrics.log_value(
+            key=(module_id, "mean_actor_loss"),
+            value=actor_loss,
+            reduce="mean",
+            clear_on_reduce=True,
+        )
+        self.metrics.log_value(
+            key=(module_id, "actor_update_fraction"),
+            value=torch.tensor(
+                1.0 if do_policy_update else 0.0, device=q_selected.device
+            ),
+            reduce="mean",
+            clear_on_reduce=True,
         )
 
         # Store individual losses for compute_gradients.

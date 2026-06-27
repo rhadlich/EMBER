@@ -58,7 +58,7 @@ def update_config(cfg, args):
             # Generic algorithm hyperparams
             train_batch_size_per_learner=256,
             # training_intensity=256.0,
-            gamma=0.95,
+            gamma=0.1,
             n_step=1,
             grad_clip=10.0,
 
@@ -71,7 +71,7 @@ def update_config(cfg, args):
             tau=5e-3,
             replay_buffer_config={
                 "type": "EpisodeReplayBuffer",
-                "capacity": int(1e4),
+                "capacity": int(5e4),
             },
             # learner_class=SACTorchLearnerWithRBS,
         )

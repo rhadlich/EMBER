@@ -4,7 +4,7 @@ import importlib
 
 # Directory containing .h5 files used for predictor input normalization (mean/std).
 # Replace this placeholder with your HDF5 data directory.
-DEFAULT_SAMPLE_DATA_DIR = '/Users/rodrigohadlich/Documents/Lab Documents/Methanol/Training Dataset/New Training/digital_twin_processed_data/hdf5_data/test'
+DEFAULT_SAMPLE_DATA_DIR = '/Users/rodrigohadlich/Documents/Lab Documents/Methanol/Training Dataset/Training v1/digital_twin_processed_data/hdf5_data/test'
 
 # Directory containing .h5 files used for safety-filter action normalization (min/max).
 # Replace this placeholder with your safety-filter HDF5 data directory.
@@ -132,6 +132,42 @@ def custom_args(
         type=float,
         default=None,
         help="Replay ratio target (train/sampled timesteps) in throughput profile.",
+    )
+    parser.add_argument(
+        "--throughput-target-min-hold-len",
+        type=int,
+        default=None,
+        help=(
+            "Minimum flat-hold steps for the IMEP target curve in throughput profile. "
+            "Default: 15 (fast-cycling for throughput training)."
+        ),
+    )
+    parser.add_argument(
+        "--throughput-target-max-hold-len",
+        type=int,
+        default=None,
+        help=(
+            "Maximum flat-hold steps for the IMEP target curve in throughput profile. "
+            "Default: 60 (fast-cycling for throughput training)."
+        ),
+    )
+    parser.add_argument(
+        "--throughput-target-min-transition-len",
+        type=int,
+        default=None,
+        help=(
+            "Minimum transition steps for the IMEP target curve in throughput profile. "
+            "Default: 20."
+        ),
+    )
+    parser.add_argument(
+        "--throughput-target-max-transition-len",
+        type=int,
+        default=None,
+        help=(
+            "Maximum transition steps for the IMEP target curve in throughput profile. "
+            "Default: 90."
+        ),
     )
     parser.add_argument(
         "--num-agents",

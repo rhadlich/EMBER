@@ -245,12 +245,11 @@ class EngineEnvContinuous(gym.Env):
             "filtered action": filtered_action_vals,
             "nominal action": nominal_action_vals
             }
-        print('reward_inputs: ', reward_inputs)
 
         # calculate reward
         reward_vec = self.reward(reward_inputs)
-        reward = (np.sum(reward_vec) + 15.0) * 1.0
-        print('reward: ', reward)
+        reward = (np.sum(reward_vec) + 0.0) * 0.1
+
         # clip observation values to make sure it is within the expected space  
         self._current_imep = float(np.clip(self._current_imep, self.imep_env_limits[0], self.imep_env_limits[1]))
         self._current_mprr = float(np.clip(self._current_mprr, self.mprr_env_limits[0], self.mprr_env_limits[1]))

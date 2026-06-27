@@ -1297,6 +1297,8 @@ def run_rllib_shared_memory(
             if 'learners' in results.keys():
                 env_runners_df = pd.DataFrame([remove_nested_dicts(results['env_runners'])])
                 learners_df = pd.DataFrame([remove_nested_dicts(results['learners']['default_policy'])])
+                if "policy_loss" in learners_df.columns and "last_actor_loss" not in learners_df.columns:
+                    learners_df["last_actor_loss"] = learners_df["policy_loss"]
                 try:
                     env_runners_df_stored = pd.concat([env_runners_df_stored, env_runners_df], ignore_index=True)
                     learners_df_stored = pd.concat([learners_df_stored, learners_df], ignore_index=True)

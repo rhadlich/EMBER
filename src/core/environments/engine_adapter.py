@@ -84,10 +84,10 @@ class EngineContinuousAdapter(EnvAdapter):
             low=float(imep_lo),
             high=float(imep_hi),
             seed=target_seed,
-            min_hold_len=800,
-            max_hold_len=1000,
-            min_transition_len=5,
-            max_transition_len=10,
+            min_hold_len=40,
+            max_hold_len=100,
+            min_transition_len=60,
+            max_transition_len=150,
         )
         return EngineRuntimeState(
             history={
