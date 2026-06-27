@@ -1,110 +1,159 @@
+"""Non-realtime Gymnasium environment for high-throughput RLlib training.
+
+Wraps any registered EnvAdapter so that the throughput profile shares the
+same observation/action semantics as the realtime pipeline without the
+shared-memory / ONNX / minion infrastructure.
+"""
+from __future__ import annotations
+
 import numpy as np
 import gymnasium as gym
 
-from core.environments.engine_env import (
-    EngineEnvContinuous,
-    reward_fn,
-)
+from core.environments.engine_adapter import ENGINE_CONTINUOUS_ADAPTER_ID
+from core.environments.engine_env import reward_fn as _default_reward_fn
+from core.environments.env_adapter import AdapterRuntimeState
 from core.environments.target_curve_generator import IMEPTargetCurveGenerator
 
 
 class ThroughputEngineEnvContinuous(gym.Env):
     """Non-realtime RLlib environment for high-throughput training.
 
-    This env keeps the same action/observation spaces used by the realtime profile,
-    but removes the minion/shared-memory/ONNX pipeline by stepping the simulator
-    directly inside RLlib workers.
+    Delegates all observation mapping, action mapping, history tracking, and
+    target-curve management to the configured EnvAdapter, keeping the
+    throughput profile in sync with realtime semantics automatically.
+
+    Config keys (passed via RLlib env_config dict):
+        env_adapter (str): Adapter ID from the adapter registry.
+            Default: ENGINE_CONTINUOUS_ADAPTER_ID.
+        max_episode_steps (int): Episode truncation length. Default: 32.
+        predictor_checkpoint_path (str | None): Passed to adapter.build_env.
+        sample_data_dir (str | None): Passed to adapter.build_env.
+        env_seed (int | None): Base RNG seed for the target curve generator.
+        target_min_hold_len (int): Minimum flat-hold steps. Default: 15.
+        target_max_hold_len (int): Maximum flat-hold steps. Default: 60.
+        target_min_transition_len (int): Minimum transition steps. Default: 20.
+        target_max_transition_len (int): Maximum transition steps. Default: 90.
     """
 
     metadata = {"render_modes": []}
 
     def __init__(self, config=None):
         super().__init__()
+        # Lazy import of get_env_adapter avoids a circular import when
+        # core/environments/__init__.py also exports ThroughputEngineEnvContinuous.
+        from core.environments import get_env_adapter  # noqa: PLC0415
+
         config = config or {}
         self._episode_step = 0
         self._max_episode_steps = int(config.get("max_episode_steps", 32))
-        predictor_checkpoint_path = config.get("predictor_checkpoint_path")
-        sample_data_dir = config.get("sample_data_dir")
 
-        self._env = EngineEnvContinuous(
-            reward=reward_fn,
-            predictor_weights_path=predictor_checkpoint_path,
-            sample_data_dir=sample_data_dir,
+        adapter_id = config.get("env_adapter", ENGINE_CONTINUOUS_ADAPTER_ID)
+        self._adapter = get_env_adapter(adapter_id)
+        self._env = self._adapter.build_env(
+            reward_fn=_default_reward_fn, env_kwargs=config
         )
+
+        # Spaces are taken directly from the adapter-built env.  The declared
+        # observation_space dimension matches obs_to_actor() output dimension
+        # by construction of the EnvAdapter contract.
         self.action_space = self._env.action_space
         self.observation_space = self._env.observation_space
 
-        # Match minion reset semantics.
-        self._last_action = np.array(
-            [self._env.soi_lims[0], self._env.inj_d_lims[0]],
-            dtype=np.float32,
-        )
-        self._current_target = None
+        self._env_seed = config.get("env_seed")
+        self._runtime_state: AdapterRuntimeState | None = None
+        self._current_raw_obs: dict = {}
 
-        seed = config.get("env_seed")
-        seed = int(seed) if seed is not None else None
-        self._target_gen = IMEPTargetCurveGenerator(
-            low=float(self._env.imep_lims[0]),
-            high=float(self._env.imep_lims[1]),
-            seed=seed,
-            min_hold_len=15,
-            max_hold_len=60,
-            min_transition_len=20,
-            max_transition_len=90,
+        # Target curve timing — fast-cycling defaults accelerate throughput
+        # training; override via env_config to match realtime distribution.
+        self._target_min_hold_len = int(config.get("target_min_hold_len", 15))
+        self._target_max_hold_len = int(config.get("target_max_hold_len", 60))
+        self._target_min_transition_len = int(
+            config.get("target_min_transition_len", 20)
+        )
+        self._target_max_transition_len = int(
+            config.get("target_max_transition_len", 90)
         )
 
     def reset(self, *, seed=None, options=None):
-        obs_scalar, info = self._env.reset(seed=seed, options=options)
+        super().reset(seed=seed)
         self._episode_step = 0
-        self._current_target = float(self._target_gen.current())
-        self._env._desired_imep = self._current_target
-        self._last_action = np.array(
-            [self._env.soi_lims[0], self._env.inj_d_lims[0]],
-            dtype=np.float32,
+
+        raw_obs, info = self._env.reset(seed=seed, options=options)
+        self._current_raw_obs = raw_obs
+
+        effective_seed = seed if seed is not None else self._env_seed
+        seed_int = int(effective_seed) if effective_seed is not None else None
+
+        self._runtime_state = self._adapter.init_runtime_state(
+            env=self._env,
+            env_seed=effective_seed,
         )
 
-        # Same 5D observation layout used in minion:
-        # [soi_prev, inj_d_prev, target_prev, imep_current, target_current]
-        obs = np.array(
-            [
-                self._last_action[0],
-                self._last_action[1],
-                self._current_target,
-                float(info["current imep"]),
-                self._current_target,
-            ],
-            dtype=np.float32,
+        # Replace the adapter's target generator with throughput-specific
+        # timing parameters, preserving the IMEP bounds from the adapter's
+        # own generator.  Adapters whose generator does not use low/high
+        # bounds (e.g. probe envs with constant targets) are left unchanged.
+        original_gen = self._runtime_state.target_gen
+        if isinstance(original_gen, IMEPTargetCurveGenerator):
+            self._runtime_state.target_gen = IMEPTargetCurveGenerator(
+                low=original_gen.low,
+                high=original_gen.high,
+                seed=seed_int,
+                min_hold_len=self._target_min_hold_len,
+                max_hold_len=self._target_max_hold_len,
+                min_transition_len=self._target_min_transition_len,
+                max_transition_len=self._target_max_transition_len,
+            )
+
+        target = self._adapter.target_current(self._runtime_state)
+        self._adapter.set_target(
+            env=self._env,
+            obs=raw_obs,
+            target=target,
+            runtime_state=self._runtime_state,
         )
-        return obs, info
+
+        actor_obs = self._adapter.obs_to_actor(
+            obs=raw_obs,
+            runtime_state=self._runtime_state,
+        )
+        return actor_obs, info
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-        action = np.clip(action, self.action_space.low, self.action_space.high)
         self._episode_step += 1
 
-        prev_target = float(self._current_target)
-        self._current_target = float(self._target_gen.next())
-        self._env._desired_imep = self._current_target
+        env_action = self._adapter.action_filter_to_env(
+            obs=self._current_raw_obs,
+            action=action,
+            runtime_state=self._runtime_state,
+        )
 
-        # Reuse simulator/reward path without realtime safety-filter plumbing.
-        env_action = np.array([550.0, action[0], action[1]], dtype=np.float32)
-        _, reward, _, _, _, info = self._env.step(
+        raw_obs, reward, _, _, _, info = self._env.step(
             filtered_action_vals=env_action,
             nominal_action_vals=env_action,
         )
+        self._current_raw_obs = raw_obs
 
-        self._last_action = action
-        obs = np.array(
-            [
-                self._last_action[0],
-                self._last_action[1],
-                prev_target,
-                float(info["current imep"]),
-                self._current_target,
-            ],
-            dtype=np.float32,
+        self._adapter.update_history(
+            action_in_env_range=env_action,
+            obs=raw_obs,
+            runtime_state=self._runtime_state,
+        )
+
+        target = self._adapter.target_next(self._runtime_state)
+        self._adapter.set_target(
+            env=self._env,
+            obs=raw_obs,
+            target=target,
+            runtime_state=self._runtime_state,
+        )
+
+        actor_obs = self._adapter.obs_to_actor(
+            obs=raw_obs,
+            runtime_state=self._runtime_state,
         )
 
         terminated = False
         truncated = self._episode_step >= self._max_episode_steps
-        return obs, float(reward), terminated, truncated, info
+        return actor_obs, float(reward), terminated, truncated, info

@@ -133,6 +133,12 @@ def run_rllib_throughput(
             }
 
         algo = config.build()
+
+        rllib_load_dir = getattr(args, "rllib_load_dir", None)
+        if rllib_load_dir is not None:
+            algo.restore(rllib_load_dir)
+            logger.info("Restored from checkpoint: %s", rllib_load_dir)
+
         try:
             max_iters = int(stop.get(TRAINING_ITERATION, args.stop_iters or 200))
             for train_iter in range(max_iters):

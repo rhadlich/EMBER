@@ -13,6 +13,7 @@ metrics (e.g., `env_runners/episode_return_mean`) and filter MSE sequences.
 """
 from __future__ import annotations
 
+import argparse
 import numpy as np
 import os
 import subprocess
@@ -25,7 +26,6 @@ from core.environments import (
     get_env_adapter,
     reward_fn,
 )
-from core.environments.engine_env import EngineEnvContinuous
 from core.environments.throughput_env import ThroughputEngineEnvContinuous
 
 from env_runner import SharedMemoryEnvRunner
@@ -92,6 +92,24 @@ parser.add_argument(
     help=(
         "Environment adapter id for realtime profile. "
         f"Default: {ENGINE_CONTINUOUS_ADAPTER_ID!r}."
+    ),
+)
+parser.add_argument(
+    "--log-episodes",
+    action="store_true",
+    default=False,
+    help=(
+        "Enable per-step episode logging to minion_episode_log_<timestamp>.csv. "
+        "Disabled by default."
+    ),
+)
+parser.add_argument(
+    "--log-timing",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Enable or disable minion timing logging to minion_timing_<timestamp>.csv. "
+        "Use --no-log-timing to disable. Enabled by default."
     ),
 )
 
@@ -202,11 +220,13 @@ def _run_throughput_profile(args, logger) -> None:
         args.num_gpus_per_learner = None
 
     predictor_checkpoint_path = getattr(args, "predictor_checkpoint_path", None)
-    env = EngineEnvContinuous(
-        reward=reward_fn,
-        predictor_weights_path=predictor_checkpoint_path,
-        sample_data_dir=getattr(args, "sample_data_dir", None),
-    )
+    env_adapter_id = getattr(args, "env_adapter", ENGINE_CONTINUOUS_ADAPTER_ID)
+    env_adapter = get_env_adapter(env_adapter_id)
+    env_adapter_kwargs = {
+        "predictor_checkpoint_path": predictor_checkpoint_path,
+        "sample_data_dir": getattr(args, "sample_data_dir", None),
+    }
+    env = env_adapter.build_env(reward_fn=reward_fn, env_kwargs=env_adapter_kwargs)
     obs_space = env.observation_space
     action_space = env.action_space
     adapter = ActionAdapter(action_space)
@@ -228,6 +248,7 @@ def _run_throughput_profile(args, logger) -> None:
 
     env_config = {
         "env_type": args.env_type.lower(),
+        "env_adapter": env_adapter_id,
         "max_episode_steps": int(getattr(args, "throughput_max_episode_steps", 32)),
     }
     if predictor_checkpoint_path is not None:
@@ -237,6 +258,18 @@ def _run_throughput_profile(args, logger) -> None:
         base_seed = int(args.seed)
         env_config["global_seed"] = base_seed
         env_config["env_seed"] = base_seed + 1
+
+    # Thread any explicit target-curve overrides into env_config so that
+    # ThroughputEngineEnvContinuous can forward them to IMEPTargetCurveGenerator.
+    for _tc_key in (
+        "target_min_hold_len",
+        "target_max_hold_len",
+        "target_min_transition_len",
+        "target_max_transition_len",
+    ):
+        _tc_val = getattr(args, f"throughput_{_tc_key}", None)
+        if _tc_val is not None:
+            env_config[_tc_key] = int(_tc_val)
 
     base_config = (
         get_trainable_cls(args.algo)
@@ -536,6 +569,8 @@ if __name__ == "__main__":
         "enable_zmq": args.enable_zmq,
         "realtime_priority": 80,  # Default real-time priority for minion
         "enable_safety_filter": enable_safety_filter,
+        "enable_episode_log": args.log_episodes,
+        "enable_timing_log": args.log_timing,
     }
     if args.predictor_checkpoint_path is not None:
         env_config["predictor_checkpoint_path"] = args.predictor_checkpoint_path
