@@ -11,7 +11,7 @@ import gymnasium as gym
 
 from core.environments.engine_adapter import ENGINE_CONTINUOUS_ADAPTER_ID
 from core.environments.engine_env import reward_fn as _default_reward_fn
-from core.environments.env_adapter import AdapterRuntimeState
+from core.environments.env_adapter import AdapterRuntimeState, EnvAdapter
 from core.environments.target_curve_generator import IMEPTargetCurveGenerator
 
 
@@ -37,6 +37,18 @@ class ThroughputEngineEnvContinuous(gym.Env):
 
     metadata = {"render_modes": []}
 
+    def _validate_actor_obs(self, actor_obs: np.ndarray) -> None:
+        if not np.all(np.isfinite(actor_obs)):
+            raise ValueError(f"Non-finite actor observation values: {actor_obs}")
+        norm_low = float(self._adapter.ACTOR_NORM_LOW)
+        norm_high = float(self._adapter.ACTOR_NORM_HIGH)
+        tol = 1e-4
+        if np.any(actor_obs < norm_low - tol) or np.any(actor_obs > norm_high + tol):
+            raise ValueError(
+                "Actor observation outside normalized bounds "
+                f"[{norm_low}, {norm_high}]: {actor_obs}"
+            )
+
     def __init__(self, config=None):
         super().__init__()
         # Lazy import of get_env_adapter avoids a circular import when
@@ -53,11 +65,12 @@ class ThroughputEngineEnvContinuous(gym.Env):
             reward_fn=_default_reward_fn, env_kwargs=config
         )
 
-        # Spaces are taken directly from the adapter-built env.  The declared
-        # observation_space dimension matches obs_to_actor() output dimension
-        # by construction of the EnvAdapter contract.
-        self.action_space = self._env.action_space
-        self.observation_space = self._env.observation_space
+        # Spaces exposed to RLlib use normalized actor obs/actions; physical
+        # bounds remain on the underlying env for filter/predictor stepping.
+        self.action_space = self._adapter.get_normalized_action_space(env=self._env)
+        self.observation_space = self._adapter.get_normalized_actor_observation_space(
+            env=self._env
+        )
 
         self._env_seed = config.get("env_seed")
         self._runtime_state: AdapterRuntimeState | None = None
@@ -117,15 +130,21 @@ class ThroughputEngineEnvContinuous(gym.Env):
             obs=raw_obs,
             runtime_state=self._runtime_state,
         )
+        self._validate_actor_obs(actor_obs)
         return actor_obs, info
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         self._episode_step += 1
 
+        physical_action = EnvAdapter.denormalize_action(
+            action,
+            action_low=self._env.action_space.low,
+            action_high=self._env.action_space.high,
+        )
         env_action = self._adapter.action_filter_to_env(
             obs=self._current_raw_obs,
-            action=action,
+            action=physical_action,
             runtime_state=self._runtime_state,
         )
 
@@ -153,6 +172,7 @@ class ThroughputEngineEnvContinuous(gym.Env):
             obs=raw_obs,
             runtime_state=self._runtime_state,
         )
+        self._validate_actor_obs(actor_obs)
 
         terminated = False
         truncated = self._episode_step >= self._max_episode_steps

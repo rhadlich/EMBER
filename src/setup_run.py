@@ -227,9 +227,10 @@ def _run_throughput_profile(args, logger) -> None:
         "sample_data_dir": getattr(args, "sample_data_dir", None),
     }
     env = env_adapter.build_env(reward_fn=reward_fn, env_kwargs=env_adapter_kwargs)
-    obs_space = env.observation_space
-    action_space = env.action_space
-    adapter = ActionAdapter(action_space)
+    env_action_space = env.action_space
+    policy_obs_space = env_adapter.get_normalized_actor_observation_space(env=env)
+    policy_action_space = env_adapter.get_normalized_action_space(env=env)
+    adapter = ActionAdapter(env_action_space)
 
     import importlib
 
@@ -250,6 +251,8 @@ def _run_throughput_profile(args, logger) -> None:
         "env_type": args.env_type.lower(),
         "env_adapter": env_adapter_id,
         "max_episode_steps": int(getattr(args, "throughput_max_episode_steps", 32)),
+        "env_action_low": env_action_space.low.astype(np.float32).tolist(),
+        "env_action_high": env_action_space.high.astype(np.float32).tolist(),
     }
     if predictor_checkpoint_path is not None:
         env_config["predictor_checkpoint_path"] = predictor_checkpoint_path
@@ -281,9 +284,9 @@ def _run_throughput_profile(args, logger) -> None:
         .environment(
             env=env_name,
             env_config=env_config,
-            observation_space=obs_space,
-            action_space=action_space,
-            normalize_actions=(True if adapter.mode == "continuous" else False),
+            observation_space=policy_obs_space,
+            action_space=policy_action_space,
+            normalize_actions=False,
             clip_actions=(True if adapter.mode == "continuous" else False),
             clip_rewards=False,
         )
@@ -444,14 +447,15 @@ if __name__ == "__main__":
     }
     # Make environment to probe spaces and adapter-derived feature specs.
     env = env_adapter.build_env(reward_fn=reward_fn, env_kwargs=env_adapter_kwargs)
-    obs_space = env.observation_space
-    action_space = env.action_space
+    env_action_space = env.action_space
+    policy_obs_space = env_adapter.get_normalized_actor_observation_space(env=env)
+    policy_action_space = env_adapter.get_normalized_action_space(env=env)
 
-    if not isinstance(obs_space, spaces.Box):
-        raise NotImplementedError(f"Unsupported observation space {obs_space}")
+    if not isinstance(policy_obs_space, spaces.Box):
+        raise NotImplementedError(f"Unsupported observation space {policy_obs_space}")
     obs_is_discrete = False
 
-    adapter = ActionAdapter(action_space)
+    adapter = ActionAdapter(env_action_space)
 
     # Import the algo config module early so that custom algorithms (e.g. TD3)
     # can register themselves with ray.tune before get_trainable_cls() is called.
@@ -463,14 +467,14 @@ if __name__ == "__main__":
     except ModuleNotFoundError:
         _algo_cfg_mod = None
 
-    action_dim = _get_buffer_action_dim(action_space, adapter)
+    action_dim = _get_buffer_action_dim(env_action_space, adapter)
     state_features = env_adapter.get_actor_state_features()
     state_dim = len(state_features)
 
     if _algo_cfg_mod is not None and hasattr(_algo_cfg_mod, "get_actor_episode_buffer_spec"):
         ep_shm_properties = _algo_cfg_mod.get_actor_episode_buffer_spec(
             state_dim=state_dim,
-            action_space=action_space,
+            action_space=env_action_space,
             action_adapter=adapter,
             batch_size=8,
             num_slots=32,
@@ -564,6 +568,8 @@ if __name__ == "__main__":
         "obs_is_discrete": obs_is_discrete,
         "env_adapter_id": args.env_adapter,
         "env_adapter_kwargs": dict(env_adapter_kwargs),
+        "env_action_low": env_action_space.low.astype(np.float32).tolist(),
+        "env_action_high": env_action_space.high.astype(np.float32).tolist(),
         "cpu_core_env_runner": args.cpu_core_env_runner,
         "cpu_core_minion": args.cpu_core_minion,
         "enable_zmq": args.enable_zmq,
@@ -606,9 +612,9 @@ if __name__ == "__main__":
             enable_env_runner_and_connector_v2=True,  # turn connector-v2 on
         )
         .environment(
-            observation_space=obs_space,
-            action_space=action_space,
-            normalize_actions=(True if adapter.mode == "continuous" else False),
+            observation_space=policy_obs_space,
+            action_space=policy_action_space,
+            normalize_actions=False,
             clip_actions=(True if adapter.mode == "continuous" else False),
             clip_rewards=False,
             env_config=env_config,
@@ -634,9 +640,9 @@ if __name__ == "__main__":
     env_type = getattr(args, "env_type", "continuous")
     args.rllib_module_name = getattr(args, "rllib_module_name", None) or f"{args.algo}_{env_type}_rllib_module"
     args.filter_model_name = getattr(args, "filter_model_name", None) or f"{args.algo}_{env_type}_filter"
-    obs_space_final = obs_space
+    obs_space_final = policy_obs_space
     obs_shape = list(obs_space_final.shape) if hasattr(obs_space_final, "shape") else [getattr(obs_space_final, "n", None)]
-    action_shape = list(action_space.shape) if hasattr(action_space, "shape") else [int(sum(adapter.nvec))] if adapter.mode in ("discrete1", "multidiscrete") else None
+    action_shape = list(policy_action_space.shape) if hasattr(policy_action_space, "shape") else [int(sum(adapter.nvec))] if adapter.mode in ("discrete1", "multidiscrete") else None
 
     args.rllib_module_spec = {
         "algo": args.algo,

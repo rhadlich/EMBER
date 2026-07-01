@@ -3,7 +3,10 @@ import torch
 from ray.rllib.utils.numpy import softmax
 from gymnasium import spaces
 
-from typing import Union, Type
+from typing import Union, Type, Optional
+
+POLICY_ACTION_NORM_LOW = -1.0
+POLICY_ACTION_NORM_HIGH = 1.0
 
 from ray.rllib.models.torch.torch_distributions import (
     TorchCategorical,
@@ -20,7 +23,6 @@ import time
 import utils.logging_setup as logging_setup
 import csv
 from datetime import datetime
-from typing import Optional
 
 
 # class DistributionHandler:
@@ -122,12 +124,11 @@ class ActionAdapter:
         # --- continuous -------------------------------------------------------
         elif isinstance(action_space, spaces.Box):
             self.mode = "continuous"
-            self.low = action_space.low.astype(np.float32)
-            self.high = action_space.high.astype(np.float32)
-            self.scale = (self.high - self.low) / 2.0
-            self.center = (self.high + self.low) / 2.0
+            self.env_low = action_space.low.astype(np.float32)
+            self.env_high = action_space.high.astype(np.float32)
+            self.policy_low = np.full_like(self.env_low, POLICY_ACTION_NORM_LOW)
+            self.policy_high = np.full_like(self.env_high, POLICY_ACTION_NORM_HIGH)
             self.act_dim = action_space.shape[0]
-            print('ACTION SPACE LIMITS: ', self.low, self.high)
         else:
             raise NotImplementedError(f"Unsupported space {action_space}")
 
@@ -160,46 +161,42 @@ class ActionAdapter:
             return TorchSquashedGaussian(
                 loc=mu,
                 scale=std,
-                low=torch.from_numpy(self.low),
-                high=torch.from_numpy(self.high),
+                low=torch.from_numpy(self.policy_low),
+                high=torch.from_numpy(self.policy_high),
             )
         else:
             raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """
-        Normalize the action to match what the learner expects according to the action distribution class.
+        Normalize the action to the policy range expected by the learner ([-1, 1]).
         """
+        if self.mode == "continuous":
+            return torch.clamp(action, min=-1.0, max=1.0)
         if self.action_dist_cls == TorchDiagGaussian:
-            # TODO: Check if this is correct.
             return torch.clamp(action, min=-1.0, max=1.0)
-        elif self.action_dist_cls == TorchSquashedGaussian:
-            # squashed gaussian already squashes to the env range
-            return action
-        elif self.action_dist_cls == TorchDeterministic:
-            # deterministic policy (TD3): tanh output is already in [-1, 1]
-            return torch.clamp(action, min=-1.0, max=1.0)
-        else:
-            raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
+        raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
 
     def get_action_in_env_range(self, action: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
         """
-        Get the action to be in the environment range if it is not already. These are the
-        action_dist_classes that each algorithm uses in RLlib so it's necessary to implement
-        exactly as such. When adding a new algorithm, the action distribution class should be
-        checked and implemented accordingly.
+        Map policy-space actions in [-1, 1] to physical environment bounds.
         """
         if isinstance(action, torch.Tensor):
-            action = action.numpy().astype(np.float32)
+            action = action.detach().cpu().numpy().astype(np.float32)
 
-        if self.action_dist_cls == TorchDiagGaussian:
-            return ((action + 1.0) / 2) * (self.high - self.low) + self.low
-        elif self.action_dist_cls == TorchSquashedGaussian:
-            return action
-        elif self.action_dist_cls == TorchDeterministic:
-            return np.clip(((action + 1.0) / 2) * (self.high - self.low) + self.low, self.low, self.high)
-        else:
-            raise NotImplementedError(f"Unsupported action_dist_cls {self.action_dist_cls}")
+        if self.mode == "continuous":
+            # Lazy import avoids circular import via core.environments.__init__.
+            from core.environments.env_adapter import EnvAdapter
+
+            return EnvAdapter.denormalize_action(
+                action,
+                action_low=self.env_low,
+                action_high=self.env_high,
+            )
+
+        raise NotImplementedError(
+            f"get_action_in_env_range not implemented for mode {self.mode}"
+        )
 
     # ---------- forward pass → env action + log-prob --------------------------
     def sample_from_policy(
@@ -274,16 +271,8 @@ class ActionAdapter:
                                               f"expected {2 * self.act_dim} or {self.act_dim} for action_dim={self.act_dim}")
             dist_inputs = np.concatenate([mu, log_sigma], axis=-1).astype(np.float32)
             if deterministic:
-                # For squashed-Gaussian policies (SAC), deterministic evaluation must
-                # still apply the squashing/affine transform from mu -> env action.
-                # Using raw mu here can push actions outside env limits.
                 if self.action_dist_cls == TorchSquashedGaussian:
-                    mu_t = torch.from_numpy(mu)
-                    low_t = torch.from_numpy(self.low)
-                    high_t = torch.from_numpy(self.high)
-                    act_t = torch.tanh(mu_t)
-                    act_t = ((act_t + 1.0) / 2.0) * (high_t - low_t) + low_t
-                    act = act_t.numpy().astype(np.float32)
+                    act = torch.tanh(torch.from_numpy(mu)).numpy().astype(np.float32)
                 else:
                     act = self.normalize_action(torch.from_numpy(mu)).numpy().astype(np.float32)
                 logp = None
@@ -298,9 +287,9 @@ class ActionAdapter:
                            std=log_st.exp(),
                         )
 
-                        # get action and logp normalized to the range expected by the learner
-                        act_t = self.normalize_action(dist.sample())
-                        logp_t = dist.logp(act_t)  # calculate log probability
+                        # sample and logp in policy space [-1, 1]
+                        act_t = dist.sample()
+                        logp_t = dist.logp(act_t)
                     act = act_t.numpy()
                     logp = logp_t.numpy()
                 except Exception as e:

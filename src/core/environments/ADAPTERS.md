@@ -26,6 +26,8 @@ Each adapter owns:
 - Action mapping from actor/filter domains to `env.step(...)`.
 - Target/setpoint lifecycle and runtime history updates.
 - GUI telemetry payload mapping.
+- Actor observation normalization bounds and mapping.
+- Actor action normalization bounds and policy-to-physical mapping.
 
 The realtime transport and rollout plumbing remain generic in `minion.py` and
 `env_runner.py`.  The throughput environment wrapper (`throughput_env.py`)
@@ -54,3 +56,27 @@ delegates to the adapter in the same way.
 - Adapters whose target generator is not `IMEPTargetCurveGenerator` (e.g.
   probe envs with constant targets) are not affected by the throughput
   target-curve timing parameters.
+
+## Actor Observation Normalization
+
+- Actor-side observations are normalized inside each adapter via `obs_to_actor`.
+- Each adapter defines ordered raw actor bounds with `get_actor_obs_bounds`.
+- Bounds order must exactly match `get_actor_state_features` and `obs_to_actor`.
+- Both realtime and throughput profiles consume the same normalized actor vectors.
+
+## Actor Action Normalization
+
+- RLlib, the policy network, and the actor replay buffer use actions in `[-1, 1]`.
+- Physical action bounds come from the underlying `env.action_space`.
+- `EnvAdapter.get_normalized_action_space()` declares the policy action space for RLlib.
+- `ActionAdapter.get_action_in_env_range()` converts policy actions to physical units
+  at the filter boundary (`action_actor_to_filter`).
+- Filter and environment stepping never receive normalized actor actions.
+- Filter **states** (`obs_to_filter_input`) remain raw physical features with their
+  own safety-filter normalization during ONNX inference.
+
+### Breaking change
+
+Prior RLlib module checkpoints are incompatible with this action representation.
+Retrain from scratch after upgrading; replay-buffer actions are now in `[-1, 1]`
+rather than physical units.

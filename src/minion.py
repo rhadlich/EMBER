@@ -734,6 +734,17 @@ class Minion:
             obs=obs,
             runtime_state=self.adapter_state,
         )
+        if not np.all(np.isfinite(obs_for_actor)):
+            raise ValueError(f"Actor observation has non-finite values: {obs_for_actor}")
+
+        norm_low = float(self.env_adapter.ACTOR_NORM_LOW)
+        norm_high = float(self.env_adapter.ACTOR_NORM_HIGH)
+        tol = 1e-4
+        if np.any(obs_for_actor < norm_low - tol) or np.any(obs_for_actor > norm_high + tol):
+            raise ValueError(
+                "Actor observation is outside normalized bounds "
+                f"[{norm_low}, {norm_high}]: {obs_for_actor}"
+            )
         return np.expand_dims(obs_for_actor, axis=0)
 
     def _actor_obs_vector(self, obs: dict[str, float]) -> np.ndarray:

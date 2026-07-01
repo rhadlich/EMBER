@@ -91,6 +91,12 @@ class Probe2Adapter(EnvAdapter):
     def get_actor_state_features(self) -> list[str]:
         return ["Probe constant observation"]
 
+    def get_actor_obs_bounds(self, *, env: gym.Env) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            np.array([env.observation_space.low[0]], dtype=np.float32),
+            np.array([env.observation_space.high[0]], dtype=np.float32),
+        )
+
     def get_filter_state_features(self) -> list[str]:
         return ["Probe constant observation"]
 
@@ -103,8 +109,13 @@ class Probe2Adapter(EnvAdapter):
         env: gym.Env,
         env_seed: int | None,
     ) -> Probe2RuntimeState:
+        actor_obs_low, actor_obs_high = self.get_actor_obs_bounds(env=env)
         return Probe2RuntimeState(
-            history={"last_action": 0.0},
+            history={
+                "last_action": 0.0,
+                "actor_obs_low": actor_obs_low,
+                "actor_obs_high": actor_obs_high,
+            },
             target_gen=_ConstantTargetGenerator(1.0),
         )
 
@@ -130,7 +141,13 @@ class Probe2Adapter(EnvAdapter):
         obs: dict[str, float],
         runtime_state: AdapterRuntimeState,
     ) -> np.ndarray:
-        return np.array([obs["probe_obs"]], dtype=np.float32)
+        history = runtime_state.history
+        actor_obs_raw = np.array([obs["probe_obs"]], dtype=np.float32)
+        return self.normalize_actor_obs(
+            obs_vec=actor_obs_raw,
+            obs_low=history["actor_obs_low"],
+            obs_high=history["actor_obs_high"],
+        )
 
     def obs_to_filter_input(
         self,

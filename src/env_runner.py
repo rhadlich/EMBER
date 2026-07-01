@@ -194,7 +194,16 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
 
         # realtime adapter path is continuous-only
         self.obs_is_discrete = False
-        self.action_adapter = ActionAdapter(self.config.action_space, action_dist_cls=self.action_dist_cls)
+        env_config = self.config.env_config
+        physical_action_space = gym.spaces.Box(
+            low=np.asarray(env_config["env_action_low"], dtype=np.float32),
+            high=np.asarray(env_config["env_action_high"], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.action_adapter = ActionAdapter(
+            physical_action_space,
+            action_dist_cls=self.action_dist_cls,
+        )
         self.act_is_discrete = (self.action_adapter.mode != "continuous")
 
         self.metrics = MetricsLogger()
@@ -378,9 +387,6 @@ class SharedMemoryEnvRunner(EnvRunner, Checkpointable):
                 actions = torch.as_tensor(np.array(eps.actions))  # shape [T, action_dim]
 
                 with torch.no_grad():
-                    self.low_t = torch.as_tensor(self.config.action_space.low, dtype=torch.float32)
-                    self.high_t = torch.as_tensor(self.config.action_space.high, dtype=torch.float32)
-
                     # Reconstruct the old‐policy log‐probs
                     mu, log_sig = dist_inputs.chunk(2, dim=-1)
                     beh_dist = self.action_adapter.get_action_dist(

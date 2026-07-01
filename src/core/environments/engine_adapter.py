@@ -52,6 +52,34 @@ class EngineContinuousAdapter(EnvAdapter):
             # 'Skewness of moving averate IMEP (20 cycles), k-1',
         ]
 
+    def get_actor_obs_bounds(self, *, env: gym.Env) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            np.array(
+                [
+                    env.imep_env_limits[0],
+                    env.imep_env_limits[0],
+                    env.imep_env_limits[0],
+                    env.ID1_lims[0],
+                    env.ID1_lims[0],
+                    env.SOI2_lims[0],
+                    env.ID2_lims[0],
+                ],
+                dtype=np.float32,
+            ),
+            np.array(
+                [
+                    env.imep_env_limits[1],
+                    env.imep_env_limits[1],
+                    env.imep_env_limits[1],
+                    env.ID1_lims[1],
+                    env.ID1_lims[1],
+                    env.SOI2_lims[1],
+                    env.ID2_lims[1],
+                ],
+                dtype=np.float32,
+            ),
+        )
+
     def get_filter_state_features(self) -> list[str]:
         return [
             "IMEP actual, k-1",
@@ -80,6 +108,7 @@ class EngineContinuousAdapter(EnvAdapter):
     ) -> EngineRuntimeState:
         target_seed = int(env_seed) if env_seed is not None else None
         imep_lo, imep_hi = env.imep_sample_lims
+        actor_obs_low, actor_obs_high = self.get_actor_obs_bounds(env=env)
         target_gen = IMEPTargetCurveGenerator(
             low=float(imep_lo),
             high=float(imep_hi),
@@ -96,6 +125,8 @@ class EngineContinuousAdapter(EnvAdapter):
                 "previous ID2": 0.6,
                 "previous ID1": 0.6,
                 "current ID1": 0.6,
+                "actor_obs_low": actor_obs_low,
+                "actor_obs_high": actor_obs_high,
             },
             target_gen=target_gen,
         )
@@ -124,7 +155,7 @@ class EngineContinuousAdapter(EnvAdapter):
         runtime_state: AdapterRuntimeState,
     ) -> np.ndarray:
         history = runtime_state.history
-        return np.array(
+        actor_obs_raw = np.array(
             [
                 obs["desired_imep"],
                 history["previous desired imep"],
@@ -135,6 +166,11 @@ class EngineContinuousAdapter(EnvAdapter):
                 history["previous ID2"],
             ],
             dtype=np.float32,
+        )
+        return self.normalize_actor_obs(
+            obs_vec=actor_obs_raw,
+            obs_low=history["actor_obs_low"],
+            obs_high=history["actor_obs_high"],
         )
 
     def obs_to_filter_input(
