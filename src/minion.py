@@ -409,6 +409,12 @@ class Minion:
         self.benchmark_burn_in = int(
             env_cfg.get("benchmark_burn_in", DEFAULT_BURN_IN)
         )
+        self.benchmark_warmup_steps = int(
+            env_cfg.get("benchmark_warmup_steps", 30)
+        )
+        self.benchmark_add_predictor_noise = bool(
+            env_cfg.get("benchmark_add_predictor_noise", True)
+        )
         profile_seeds_cfg = env_cfg.get(
             "benchmark_profile_seeds", list(DEFAULT_PROFILE_SEEDS)
         )
@@ -1339,6 +1345,22 @@ class Minion:
         end = header_offset + _len_ort[0]
         return bytes(self.p_buf[header_offset:end])
 
+    def _write_benchmark_traces_npz(
+        self,
+        path: Path,
+        profile_traces: dict[str, list[dict[str, float]]],
+    ) -> None:
+        trace_arrays = {}
+        for profile_id, records in profile_traces.items():
+            if not records:
+                continue
+            for metric_name in records[0].keys():
+                key = f"{profile_id}/{metric_name}"
+                trace_arrays[key] = np.asarray(
+                    [row[metric_name] for row in records], dtype=np.float64
+                )
+        np.savez(path, **trace_arrays)
+
     def _save_benchmark_best(
         self,
         *,
@@ -1352,17 +1374,7 @@ class Minion:
         meta_path = self.benchmark_output_dir / "best_metadata.json"
 
         actor_path.write_bytes(self._read_actor_ort_bytes())
-
-        trace_arrays = {}
-        for profile_id, records in profile_traces.items():
-            if not records:
-                continue
-            for metric_name in records[0].keys():
-                key = f"{profile_id}/{metric_name}"
-                trace_arrays[key] = np.asarray(
-                    [row[metric_name] for row in records], dtype=np.float64
-                )
-        np.savez(traces_path, **trace_arrays)
+        self._write_benchmark_traces_npz(traces_path, profile_traces)
 
         meta_path.write_text(
             json.dumps(
@@ -1406,14 +1418,21 @@ class Minion:
                     env_seed=profile_seed,
                 )
                 self._update_target(obs, float(targets[0]))
+                if hasattr(self.env_adapter, "sync_history_from_obs"):
+                    self.env_adapter.sync_history_from_obs(
+                        obs=obs,
+                        runtime_state=self.adapter_state,
+                        env=self.env,
+                    )
 
                 step_records: list[dict[str, float]] = []
+                cumulative_injection = 0.0
                 for step_idx in range(len(targets)):
                     target = float(targets[step_idx])
                     self._update_target(obs, target)
 
                     (
-                        new_obs,
+                        obs,
                         action,
                         _reward,
                         _reward_vec,
@@ -1423,28 +1442,37 @@ class Minion:
                         _net_out,
                         _dist_inputs,
                         _info,
-                        env_action,
+                        _env_action,
                     ) = self.collect_rollout(
                         initial_obs=obs,
                         deterministic=True,
                         skip_filter_buffer=True,
                         skip_rollout_increment=True,
-                        add_predictor_noise=False,
+                        add_predictor_noise=self.benchmark_add_predictor_noise,
                         include_env_action=True,
                     )
 
+                    physical_action = self.action_adapter.get_action_in_env_range(
+                        action
+                    )
+                    self._update_history_features(physical_action, obs)
+
+                    if step_idx < self.benchmark_warmup_steps:
+                        continue
+
+                    injection_duration = float(physical_action[0]) + float(
+                        physical_action[2]
+                    )
+                    cumulative_injection += injection_duration
                     step_records.append(
                         record_step_metrics(
                             target=target,
-                            obs=new_obs,
-                            env_action=env_action,
+                            obs=obs,
+                            physical_action=physical_action,
+                            policy_action=action,
+                            cumulative_injection=cumulative_injection,
                         )
                     )
-                    self._update_history_features(
-                        self.action_adapter.get_action_in_env_range(action),
-                        obs,
-                    )
-                    obs = new_obs
 
                 profile_traces[profile_id] = step_records
                 profile_aggregates[profile_id] = aggregate_profile_metrics(

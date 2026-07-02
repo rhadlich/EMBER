@@ -131,6 +131,24 @@ class EngineContinuousAdapter(EnvAdapter):
             target_gen=target_gen,
         )
 
+    def sync_history_from_obs(
+        self,
+        *,
+        obs: dict[str, float],
+        runtime_state: AdapterRuntimeState,
+        env: gym.Env,
+    ) -> None:
+        """Align adapter lag features with the current observation after a reset."""
+        history = runtime_state.history
+        id1_mid = 0.5 * (env.ID1_lims[0] + env.ID1_lims[1])
+        soi2_mid = 0.5 * (env.SOI2_lims[0] + env.SOI2_lims[1])
+        id2_mid = 0.5 * (env.ID2_lims[0] + env.ID2_lims[1])
+        history["previous desired imep"] = float(obs["achieved_imep"])
+        history["previous ID1"] = float(id1_mid)
+        history["current ID1"] = float(id1_mid)
+        history["previous SOI2"] = float(soi2_mid)
+        history["previous ID2"] = float(id2_mid)
+
     def target_current(self, runtime_state: AdapterRuntimeState) -> float:
         return float(runtime_state.target_gen.current())
 

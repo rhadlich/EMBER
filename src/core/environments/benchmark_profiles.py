@@ -129,18 +129,22 @@ def record_step_metrics(
     *,
     target: float,
     obs: dict[str, float],
-    env_action: np.ndarray,
+    physical_action: np.ndarray,
+    policy_action: np.ndarray | None = None,
+    cumulative_injection: float | None = None,
 ) -> dict[str, float]:
     """Compute reward-agnostic per-step benchmark metrics."""
     achieved_imep = float(obs["achieved_imep"])
     mprr = float(obs["achieved_mprr"])
-    id1 = float(env_action[0])
-    id2 = float(env_action[2])
+    physical_action = np.asarray(physical_action, dtype=np.float64).reshape(-1)
+    id1 = float(physical_action[0])
+    soi2 = float(physical_action[1])
+    id2 = float(physical_action[2])
     injection_duration = id1 + id2
     load_error = abs(achieved_imep - target)
     mprr_excess = max(0.0, mprr - DEFAULT_MPRR_LIMIT)
 
-    return {
+    row: dict[str, float] = {
         "target": target,
         "achieved_imep": achieved_imep,
         "load_error": load_error,
@@ -148,10 +152,48 @@ def record_step_metrics(
         "mprr_excess": mprr_excess,
         "mprr_within_limit": float(mprr <= DEFAULT_MPRR_LIMIT),
         "ca50": float(obs["achieved_CA50"]),
-        "id1": id1,
-        "id2": id2,
+        "env_id1": id1,
+        "env_soi2": soi2,
+        "env_id2": id2,
         "injection_duration": injection_duration,
     }
+    if cumulative_injection is not None:
+        row["cumulative_injection"] = float(cumulative_injection)
+    if policy_action is not None:
+        policy_action = np.asarray(policy_action, dtype=np.float64).reshape(-1)
+        for idx, value in enumerate(policy_action):
+            row[f"policy_action_{idx}"] = float(value)
+    return row
+
+
+def load_traces_from_npz(path: Path | str) -> dict[str, dict[str, np.ndarray]]:
+    """Load benchmark trace arrays grouped by profile id."""
+    path = Path(path)
+    profiles: dict[str, dict[str, np.ndarray]] = {}
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            if "/" not in key:
+                continue
+            profile_id, metric_name = key.split("/", 1)
+            profiles.setdefault(profile_id, {})[metric_name] = np.asarray(
+                data[key], dtype=np.float64
+            )
+    return profiles
+
+
+def traces_to_step_records(
+    profile_traces: dict[str, dict[str, np.ndarray]],
+    profile_id: str,
+) -> list[dict[str, float]]:
+    """Reconstruct per-step dict records from npz trace arrays."""
+    metrics = profile_traces[profile_id]
+    if not metrics:
+        return []
+    n_steps = len(next(iter(metrics.values())))
+    return [
+        {name: float(values[step_idx]) for name, values in metrics.items()}
+        for step_idx in range(n_steps)
+    ]
 
 
 def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:

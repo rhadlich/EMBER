@@ -41,10 +41,15 @@ class Predictor:
 
         self._imep_history = deque(maxlen=20)
         self._imep_history.extend([0] * 20)
-       
 
         # miscellaneous
         self.ones = np.ones([1, 7200, 3])
+
+    def reset_transient_state(self) -> None:
+        """Reset cycle-history features used for moving-average IMEP outputs."""
+        self._imep_history.clear()
+        self._imep_history.extend([0] * 20)
+       
     
     def _extract_normalization_values(self, sample_data_path: str):
         with h5.File(sample_data_path, "r") as fin:

@@ -217,6 +217,8 @@ class EngineEnvContinuous(gym.Env):
 
         info = {"current imep": self._current_imep, "mprr": self._current_mprr}
 
+        self.predictor.reset_transient_state()
+
         return observation, info
 
     def step(self,

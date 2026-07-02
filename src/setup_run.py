@@ -581,6 +581,8 @@ if __name__ == "__main__":
         "benchmark_output_dir": "benchmark_eval",
         "benchmark_profiles_path": "benchmark_profiles/representative_profiles.npz",
         "benchmark_every_n_sequences": 500,
+        "benchmark_warmup_steps": 30,
+        "benchmark_add_predictor_noise": True,
     }
     if args.predictor_checkpoint_path is not None:
         env_config["predictor_checkpoint_path"] = args.predictor_checkpoint_path
