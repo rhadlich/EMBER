@@ -36,7 +36,7 @@ CHECKPOINT_NAME = None
 # Data settings:
 # DATA_ROOT_DIR is expected to contain split subfolders such as train/validation/test.
 DATA_ROOT_DIR = Path(
-    "/Users/rodrigohadlich/Documents/Lab Documents/Methanol/Training Dataset/New Training/digital_twin_processed_data/hdf5_data"
+    '/Users/rodrigohadlich/Documents/Lab Documents/Thesis Material/Methanol DL Modeling/New Dataset (v2)/Feature Rich/Dataset/hdf5_data'
 )
 # Split used as explained/evaluated dataset.
 ANALYSIS_SUBSET = "validation"  # e.g. "train", "validation", "test"
@@ -70,7 +70,7 @@ RUN_PERMUTATION_IMPORTANCE = False
 RUN_MULTI_OUTPUT_SHAP = True
 
 # Runtime behavior
-DEVICE = "auto"  # auto, cpu, mps, cuda
+DEVICE = "cpu"  # auto, cpu, mps, cuda
 BATCH_SIZE = 256
 SHAP_BACKGROUND_SIZE = 200
 SHAP_EVAL_SIZE = 400
@@ -92,7 +92,7 @@ SHOW_PLOTS = True
 SAVE_PLOTS = True
 
 # SHAP caching controls (to avoid recomputing expensive SHAP values).
-LOAD_SHAP_FROM_CACHE = True
+LOAD_SHAP_FROM_CACHE = False
 SAVE_SHAP_TO_CACHE = True
 SHAP_CACHE_DIR = OUTPUT_DIR / "shap_cache"
 
