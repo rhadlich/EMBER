@@ -11,10 +11,23 @@ import os
 import torch
 import copy
 import random
+import json
+from pathlib import Path
 
 from ray.rllib.utils.numpy import softmax
 import gymnasium as gym
 from core.environments import ENGINE_CONTINUOUS_ADAPTER_ID, get_env_adapter, reward_fn
+from core.environments.benchmark_profiles import (
+    DEFAULT_BURN_IN,
+    DEFAULT_PROFILE_LENGTH,
+    DEFAULT_PROFILE_SEEDS,
+    aggregate_profile_metrics,
+    aggregate_run_metrics,
+    composite_score,
+    load_or_create_profiles,
+    record_step_metrics,
+)
+from core.environments.engine_env import EngineEnvContinuous
 
 from utils.utils import (
     ActionAdapter,
@@ -369,6 +382,54 @@ class Minion:
         self.ema_beta = np.exp(-np.log(2) / H)
         self.current_var_ema = 1.0
         self.current_reward_scale = 1.0
+
+        env_adapter_id = self.config.env_config.get(
+            "env_adapter_id", ENGINE_CONTINUOUS_ADAPTER_ID
+        )
+        self.enable_benchmark_eval = bool(
+            env_cfg.get("enable_benchmark_eval", True)
+            and env_adapter_id == ENGINE_CONTINUOUS_ADAPTER_ID
+            and isinstance(self.env, EngineEnvContinuous)
+        )
+        self.benchmark_every_n_sequences = max(
+            1, int(env_cfg.get("benchmark_every_n_sequences", 1))
+        )
+        self.benchmark_output_dir = Path(
+            env_cfg.get("benchmark_output_dir", "benchmark_eval")
+        )
+        self.benchmark_profiles_path = Path(
+            env_cfg.get(
+                "benchmark_profiles_path",
+                "benchmark_profiles/representative_profiles.npz",
+            )
+        )
+        self.benchmark_profile_length = int(
+            env_cfg.get("benchmark_profile_length", DEFAULT_PROFILE_LENGTH)
+        )
+        self.benchmark_burn_in = int(
+            env_cfg.get("benchmark_burn_in", DEFAULT_BURN_IN)
+        )
+        profile_seeds_cfg = env_cfg.get(
+            "benchmark_profile_seeds", list(DEFAULT_PROFILE_SEEDS)
+        )
+        self.benchmark_profile_seeds = tuple(int(s) for s in profile_seeds_cfg)
+        self.benchmark_best_score = float("inf")
+        self.benchmark_profiles = None
+
+        if self.enable_benchmark_eval:
+            self.benchmark_profiles = load_or_create_profiles(
+                self.benchmark_profiles_path,
+                env=self.env,
+                profile_seeds=self.benchmark_profile_seeds,
+                profile_length=self.benchmark_profile_length,
+            )
+            self.benchmark_output_dir.mkdir(parents=True, exist_ok=True)
+            self.logger.info(
+                "Minion: benchmark eval enabled (%d profiles, length=%d, dir=%s)",
+                len(self.benchmark_profiles.profile_ids),
+                self.benchmark_profile_length,
+                self.benchmark_output_dir,
+            )
 
         self.logger.debug("Minion: Done with __init__().")
 
@@ -798,6 +859,11 @@ class Minion:
             self,
             initial_obs: Optional[dict[str, float]] = None,
             deterministic: Optional[bool] = False,
+            *,
+            skip_filter_buffer: bool = False,
+            skip_rollout_increment: bool = False,
+            add_predictor_noise: bool = True,
+            include_env_action: bool = False,
     ) -> Union[dict, list]:
         """
         function to collect a single rollout
@@ -929,7 +995,11 @@ class Minion:
         try:
         # Time environment step
             tic_env = time.time()
-            new_obs, reward, reward_vec, terminated, truncated, info = self.env.step(action_for_env_filtered, nominal_action_for_env)
+            new_obs, reward, reward_vec, terminated, truncated, info = self.env.step(
+                action_for_env_filtered,
+                nominal_action_for_env,
+                add_predictor_noise=add_predictor_noise,
+            )
             toc_env = time.time()
             duration_env_ms = (toc_env - tic_env) * 1000.0
             self.timing_recorder.record_timing('env_step', duration_env_ms)
@@ -943,7 +1013,11 @@ class Minion:
         # to filter buffer.
         # This is done here to make sure all sampled data is written to filter buffer, independent of whether
         # sampling is deterministic or not.
-        if hasattr(self, 'filter_ep_arr') and self.filter_ep_arr is not None:
+        if (
+            not skip_filter_buffer
+            and hasattr(self, 'filter_ep_arr')
+            and self.filter_ep_arr is not None
+        ):
             try:
                 current_state_filter = obs_for_filter_model.reshape(-1)
                 next_state_filter = self._get_obs_from_env_to_filter_output(new_obs).reshape(-1)
@@ -980,7 +1054,8 @@ class Minion:
                 self.logger.debug(f"Minion: Failed to write filter training data: {e}")
 
         # Increment rollout count
-        self.rollout_count += 1
+        if not skip_rollout_increment:
+            self.rollout_count += 1
 
         # Finish timing the rollout and return the results
         toc_collect = time.time()
@@ -988,7 +1063,21 @@ class Minion:
         self.timing_recorder.record_timing('collect_rollout', duration_collect_ms, deterministic=deterministic)
         # Save timing data after collect_rollouts completes
         self.timing_recorder.save_timing_data()
-        return [new_obs, action_from_actor, reward, reward_vec, terminated, truncated, logp, net_out, dist_inputs, info]
+        result = [
+            new_obs,
+            action_from_actor,
+            reward,
+            reward_vec,
+            terminated,
+            truncated,
+            logp,
+            net_out,
+            dist_inputs,
+            info,
+        ]
+        if include_env_action:
+            result.append(np.asarray(action_for_env_filtered, dtype=np.float32).copy())
+        return result
 
     def _collect_and_process_rollout(
         self,
@@ -1204,6 +1293,192 @@ class Minion:
         self.last_obs = copy.deepcopy(obs)
 
         return train_rollouts_df, eval_rollouts_df
+
+    def _get_env_physics_state(self) -> dict:
+        """Snapshot predictor-backed engine state for benchmark restore."""
+        env = self.env
+        state = {
+            "_current_imep": env._current_imep,
+            "_current_mprr": env._current_mprr,
+            "_desired_imep": env._desired_imep,
+            "_current_CA50": env._current_CA50,
+            "_current_CA10_CA90": env._current_CA10_CA90,
+            "_current_net_heat_release": env._current_net_heat_release,
+            "_current_pressure_max": env._current_pressure_max,
+            "_current_imep_moving_average": env._current_imep_moving_average,
+            "_current_skewness_moving_average": env._current_skewness_moving_average,
+            "_current_Pint": env._current_Pint,
+        }
+        if hasattr(env, "np_random") and env.np_random is not None:
+            state["_np_random_bit_generator"] = env.np_random.bit_generator.state
+        return state
+
+    def _set_env_physics_state(self, state: dict) -> None:
+        env = self.env
+        rng_state = state.pop("_np_random_bit_generator", None)
+        for key, value in state.items():
+            setattr(env, key, value)
+        if rng_state is not None and hasattr(env, "np_random") and env.np_random is not None:
+            env.np_random.bit_generator.state = rng_state
+
+    def _snapshot_training_state(self) -> dict:
+        return {
+            "adapter_state": copy.deepcopy(self.adapter_state),
+            "last_obs": copy.deepcopy(self.last_obs),
+            "env_physics": self._get_env_physics_state(),
+        }
+
+    def _restore_training_state(self, snapshot: dict) -> None:
+        self.adapter_state = snapshot["adapter_state"]
+        self.last_obs = snapshot["last_obs"]
+        self._set_env_physics_state(copy.deepcopy(snapshot["env_physics"]))
+
+    def _read_actor_ort_bytes(self) -> bytes:
+        _len_ort = struct.unpack_from("<I", self.p_buf, 0)
+        header_offset = 4
+        end = header_offset + _len_ort[0]
+        return bytes(self.p_buf[header_offset:end])
+
+    def _save_benchmark_best(
+        self,
+        *,
+        score: float,
+        profile_traces: dict[str, list[dict[str, float]]],
+        run_aggregates: dict[str, float],
+        sequence_idx: int,
+    ) -> None:
+        actor_path = self.benchmark_output_dir / "best_actor.onnx"
+        traces_path = self.benchmark_output_dir / "best_traces.npz"
+        meta_path = self.benchmark_output_dir / "best_metadata.json"
+
+        actor_path.write_bytes(self._read_actor_ort_bytes())
+
+        trace_arrays = {}
+        for profile_id, records in profile_traces.items():
+            if not records:
+                continue
+            for metric_name in records[0].keys():
+                key = f"{profile_id}/{metric_name}"
+                trace_arrays[key] = np.asarray(
+                    [row[metric_name] for row in records], dtype=np.float64
+                )
+        np.savez(traces_path, **trace_arrays)
+
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "sequence_idx": sequence_idx,
+                    "rollout_count": self.rollout_count,
+                    "benchmark_score": score,
+                    "run_aggregates": run_aggregates,
+                    "profile_ids": list(profile_traces.keys()),
+                },
+                indent=2,
+            )
+        )
+        self.logger.info(
+            "Minion: new benchmark best (score=%.6f) saved to %s",
+            score,
+            self.benchmark_output_dir,
+        )
+
+    def run_benchmark_eval(self, sequence_idx: int) -> Optional[pd.DataFrame]:
+        """Evaluate the current actor on fixed representative load profiles."""
+        if not self.enable_benchmark_eval or self.benchmark_profiles is None:
+            return None
+
+        snapshot = self._snapshot_training_state()
+        profile_traces: dict[str, list[dict[str, float]]] = {}
+        profile_aggregates: dict[str, dict[str, float]] = {}
+
+        try:
+            for profile_idx, profile_id in enumerate(
+                self.benchmark_profiles.profile_ids
+            ):
+                targets = self.benchmark_profiles.profiles[profile_id]
+                profile_seed = self.benchmark_profile_seeds[
+                    min(profile_idx, len(self.benchmark_profile_seeds) - 1)
+                ]
+
+                obs, _info = self.env.reset(seed=profile_seed)
+                self.adapter_state = self.env_adapter.init_runtime_state(
+                    env=self.env,
+                    env_seed=profile_seed,
+                )
+                self._update_target(obs, float(targets[0]))
+
+                step_records: list[dict[str, float]] = []
+                for step_idx in range(len(targets)):
+                    target = float(targets[step_idx])
+                    self._update_target(obs, target)
+
+                    (
+                        new_obs,
+                        action,
+                        _reward,
+                        _reward_vec,
+                        _terminated,
+                        _truncated,
+                        _logp,
+                        _net_out,
+                        _dist_inputs,
+                        _info,
+                        env_action,
+                    ) = self.collect_rollout(
+                        initial_obs=obs,
+                        deterministic=True,
+                        skip_filter_buffer=True,
+                        skip_rollout_increment=True,
+                        add_predictor_noise=False,
+                        include_env_action=True,
+                    )
+
+                    step_records.append(
+                        record_step_metrics(
+                            target=target,
+                            obs=new_obs,
+                            env_action=env_action,
+                        )
+                    )
+                    self._update_history_features(
+                        self.action_adapter.get_action_in_env_range(action),
+                        obs,
+                    )
+                    obs = new_obs
+
+                profile_traces[profile_id] = step_records
+                profile_aggregates[profile_id] = aggregate_profile_metrics(
+                    step_records,
+                    burn_in=self.benchmark_burn_in,
+                )
+        finally:
+            self._restore_training_state(snapshot)
+
+        run_aggregates = aggregate_run_metrics(profile_aggregates)
+        score = composite_score(run_aggregates)
+
+        row = {
+            "sequence_idx": sequence_idx,
+            "rollout_count": self.rollout_count,
+            "benchmark_score": score,
+            "is_new_best": float(score < self.benchmark_best_score),
+        }
+        for key, value in run_aggregates.items():
+            row[f"run_{key}"] = value
+        for profile_id, metrics in profile_aggregates.items():
+            for key, value in metrics.items():
+                row[f"{profile_id}_{key}"] = value
+
+        if score < self.benchmark_best_score:
+            self.benchmark_best_score = score
+            self._save_benchmark_best(
+                score=score,
+                profile_traces=profile_traces,
+                run_aggregates=run_aggregates,
+                sequence_idx=sequence_idx,
+            )
+
+        return pd.DataFrame([row])
     
     def _scale_reward(self, reward: float) -> float:
         """
@@ -1303,6 +1578,7 @@ def main(policy_shm_name: str,
     # cumulative performance metrics over the full run
     total_train_rollouts_df = None
     total_eval_rollouts_df = None
+    total_benchmark_history_df = None
 
     try:
         while True:
@@ -1348,6 +1624,30 @@ def main(policy_shm_name: str,
 
             actor.logger.debug(f"Minion: Train and eval sequence completed.")
 
+            if actor.enable_benchmark_eval and (
+                actor.sequence_count % actor.benchmark_every_n_sequences == 0
+            ):
+                try:
+                    benchmark_df = actor.run_benchmark_eval(
+                        sequence_idx=actor.sequence_count - 1,
+                    )
+                    if benchmark_df is not None:
+                        try:
+                            total_benchmark_history_df = pd.concat(
+                                [total_benchmark_history_df, benchmark_df]
+                            )
+                        except Exception:
+                            total_benchmark_history_df = benchmark_df
+                except Exception as e:
+                    actor.logger.debug(
+                        f"Minion: Failed benchmark eval at sequence "
+                        f"{actor.sequence_count - 1}: {e}"
+                    )
+                    raise RuntimeError(
+                        f"Failed benchmark eval at sequence "
+                        f"{actor.sequence_count - 1}: {e}"
+                    ) from e
+
             # set minion rollout flag to true to enable the algo.train() calls
             actor.f_buf[4] = 1  # minion data collection flag is now at index 4
 
@@ -1383,6 +1683,15 @@ def main(policy_shm_name: str,
             if total_eval_rollouts_df is not None:
                 total_eval_rollouts_df.to_csv("minion_eval_rollouts.csv", index=False)
                 actor.logger.debug("Minion: Saved total_eval_rollouts_df to minion_eval_rollouts.csv")
+            if total_benchmark_history_df is not None:
+                benchmark_history_path = (
+                    actor.benchmark_output_dir / "benchmark_history.csv"
+                )
+                total_benchmark_history_df.to_csv(benchmark_history_path, index=False)
+                actor.logger.debug(
+                    "Minion: Saved benchmark history to %s",
+                    benchmark_history_path,
+                )
         except Exception as e:
             actor.logger.debug(f"Minion: Failed to save rollout CSVs on exit: {e}")
 

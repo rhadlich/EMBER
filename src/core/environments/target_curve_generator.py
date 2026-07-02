@@ -142,3 +142,57 @@ class IMEPTargetCurveGenerator:
             alpha = w * t + (1.0 - w) * quad
 
         return start + (end - start) * alpha
+
+
+class FixedTargetSequence:
+    """Replay a pre-generated IMEP target profile step-by-step."""
+
+    def __init__(self, targets: np.ndarray | list[float]) -> None:
+        self._targets = np.asarray(targets, dtype=np.float64)
+        self._index = 0
+
+    def next(self) -> float:
+        """Return the next target and advance."""
+        if self._index >= len(self._targets):
+            raise IndexError("Fixed target sequence exhausted")
+        value = float(self._targets[self._index])
+        self._index += 1
+        return value
+
+    def current(self) -> float:
+        """Return the current target without advancing."""
+        if self._index >= len(self._targets):
+            raise IndexError("Fixed target sequence exhausted")
+        return float(self._targets[self._index])
+
+    def reset(self, seed: int | None = None) -> None:
+        """Rewind to the start of the profile."""
+        del seed  # fixed sequence; seed kept for API compatibility
+        self._index = 0
+
+
+def generate_profile(
+    length: int,
+    *,
+    seed: int,
+    low: float = 1.6,
+    high: float = 4.1,
+    min_hold_len: int = 15,
+    max_hold_len: int = 60,
+    min_transition_len: int = 20,
+    max_transition_len: int = 90,
+) -> np.ndarray:
+    """Materialize ``length`` consecutive targets from a seeded generator."""
+    if length <= 0:
+        raise ValueError(f"Profile length must be positive, got {length}")
+
+    generator = IMEPTargetCurveGenerator(
+        low=low,
+        high=high,
+        seed=seed,
+        min_hold_len=min_hold_len,
+        max_hold_len=max_hold_len,
+        min_transition_len=min_transition_len,
+        max_transition_len=max_transition_len,
+    )
+    return np.asarray([generator.next() for _ in range(length)], dtype=np.float64)

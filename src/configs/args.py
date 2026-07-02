@@ -429,6 +429,16 @@ def custom_args(
         help="Disable the safety filter: no filter model load/train/save, and actor action is used as-is (no filter correction). Default: filter enabled.",
     )
 
+    parser.add_argument(
+        "--enable-benchmark-eval",
+        type=str_to_bool,
+        default=True,
+        help=(
+            "Run fixed-profile benchmark evaluation in the minion after each "
+            "train/eval sequence (realtime engine path only). Default: True."
+        ),
+    )
+
     # Model save/load options.
     parser.add_argument(
         "--rllib-module-name",

@@ -222,11 +222,18 @@ class EngineEnvContinuous(gym.Env):
     def step(self,
             filtered_action_vals: Union[list, np.ndarray] = None,
             nominal_action_vals: Union[list, np.ndarray] = None,
+            *,
+            add_predictor_noise: bool = True,
+            noise_in_percent: float = 3.0,
              ):
 
         # send action values to torch model and get new state
+        predictor_noise = noise_in_percent if add_predictor_noise else None
         pressure, cad, output = (
-            self.predictor.model_predict(filtered_action_vals, noise_in_percent=3))
+            self.predictor.model_predict(
+                filtered_action_vals,
+                noise_in_percent=predictor_noise,
+            ))
 
         self._current_imep = float(output["imep"])
         self._current_mprr = float(output["mprr"])

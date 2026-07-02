@@ -577,6 +577,10 @@ if __name__ == "__main__":
         "enable_safety_filter": enable_safety_filter,
         "enable_episode_log": args.log_episodes,
         "enable_timing_log": args.log_timing,
+        "enable_benchmark_eval": args.enable_benchmark_eval,
+        "benchmark_output_dir": "benchmark_eval",
+        "benchmark_profiles_path": "benchmark_profiles/representative_profiles.npz",
+        "benchmark_every_n_sequences": 500,
     }
     if args.predictor_checkpoint_path is not None:
         env_config["predictor_checkpoint_path"] = args.predictor_checkpoint_path
