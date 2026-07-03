@@ -95,6 +95,10 @@ def select_checkpoint(model_dir: Path, checkpoint_name: str | None) -> Path:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         return checkpoint_path
 
+    canonical = model_dir / "filter.pt"
+    if canonical.exists():
+        return canonical
+
     matches = sorted(
         model_dir.glob("model_weights_filter*.pth"),
         key=lambda p: p.stat().st_mtime,

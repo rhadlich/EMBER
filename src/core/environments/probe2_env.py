@@ -165,6 +165,7 @@ class Probe2Adapter(EnvAdapter):
         *,
         action: np.ndarray,
         action_adapter: Any,
+        runtime_state: AdapterRuntimeState,
     ) -> np.ndarray:
         action_for_filter = action.astype(np.float32, copy=True)
         return action_adapter.get_action_in_env_range(action_for_filter)

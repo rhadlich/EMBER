@@ -28,7 +28,7 @@ from core.training.trainer import resolve_device
 # Interactive configuration
 # =========================
 # Model/checkpoint settings (same style as visualize_predictions.py).
-MODEL_DIR = Path("/Users/rodrigohadlich/EMBER/src/core/digital_twin/models")
+MODEL_DIR = Path('/Users/rodrigohadlich/Documents/Lab Documents/Thesis Material/Methanol DL Modeling/Dataset v3/Feature Rich/Model')
 # Set to a filename inside MODEL_DIR, e.g. "model_weights_engine_new.pth".
 # Leave as None to auto-pick latest model_weights*.pth.
 CHECKPOINT_NAME = None
@@ -36,7 +36,7 @@ CHECKPOINT_NAME = None
 # Data settings:
 # DATA_ROOT_DIR is expected to contain split subfolders such as train/validation/test.
 DATA_ROOT_DIR = Path(
-    '/Users/rodrigohadlich/Documents/Lab Documents/Thesis Material/Methanol DL Modeling/New Dataset (v2)/Feature Rich/Dataset/hdf5_data'
+    '/Users/rodrigohadlich/Documents/Lab Documents/Thesis Material/Methanol DL Modeling/Dataset v3/Feature Rich/Dataset/hdf5_data'
 )
 # Split used as explained/evaluated dataset.
 ANALYSIS_SUBSET = "validation"  # e.g. "train", "validation", "test"
@@ -63,9 +63,9 @@ EXPLANATION_TARGET_LABEL_MAP: dict[str, str] = {
 
 # Which analyses to run.
 RUN_INTEGRATED_GRADIENTS = False
-RUN_IG_TRACE = True
+RUN_IG_TRACE = False
 RUN_ALE = False
-RUN_SHAP = False
+RUN_SHAP = True
 RUN_PERMUTATION_IMPORTANCE = False
 RUN_MULTI_OUTPUT_SHAP = True
 
@@ -99,7 +99,7 @@ SHAP_CACHE_DIR = OUTPUT_DIR / "shap_cache"
 # Optional map from raw HDF5 feature name -> display label used in plots.
 # Example: {"imep_prev": "IMEP (prev cycle)"}
 FEATURE_LABEL_MAP: dict[str, str] = {
-    "ID1_prev_prev": r"$ID1_{k-1}$",
+    "ID1_prev": r"$ID1_{k-1}$",
     "ID2_prev": r"$ID2_{k-1}$",
     "SOI2_prev": r"$SOI2_{k-1}$",
     "Q_net_prev": r"$Q_{net, k-1}$",
@@ -109,7 +109,7 @@ FEATURE_LABEL_MAP: dict[str, str] = {
     "CA10_90_prev": r"$CA10-90_{k-1}$",
     "P_int_IVC_prev": r"$P_{int, k-1}$",
     "mprr_prev": r"$MPRR_{k-1}$",
-    "ID1_prev": r"$ID1_{k}$",
+    "ID1": r"$ID1_{k}$",
     "ID2": r"$ID2_{k}$",
     "SOI2": r"$SOI2_{k}$",
     "skewness": "Skewness",

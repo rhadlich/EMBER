@@ -46,6 +46,15 @@ class EnvAdapter(ABC):
     def get_filter_output_features(self) -> list[str]:
         """Ordered filter-output feature names used to build filter schema."""
 
+    def get_filter_action_features(self, *, env: gym.Env) -> list[str]:
+        """Ordered filter-action feature names used for filter action schema."""
+        if not isinstance(env.action_space, gym.spaces.Box):
+            raise NotImplementedError(
+                f"Filter action features not implemented for action space {env.action_space}"
+            )
+        action_dim = int(np.prod(env.action_space.shape))
+        return [f"action_{idx}" for idx in range(action_dim)]
+
     @abstractmethod
     def init_runtime_state(
         self,
@@ -102,8 +111,9 @@ class EnvAdapter(ABC):
         *,
         action: np.ndarray,
         action_adapter: Any,
+        runtime_state: AdapterRuntimeState,
     ) -> np.ndarray:
-        """Map sampled actor action into filter action domain."""
+        """Map sampled actor action into the effective filter/plant action domain."""
 
     @abstractmethod
     def action_filter_to_env(

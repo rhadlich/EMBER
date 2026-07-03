@@ -2,15 +2,12 @@ import torch
 import torch.nn as nn
 import numpy as np
 import onnxruntime as ort
-import h5py as h5
 from pathlib import Path
 from typing import Callable, Optional, Tuple, List, Union
 import random
 import logging
 import utils.logging_setup as logging_setup
-from core.safety.datasets import list_h5_files
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from core.safety.normalization import SafetyFilterNormalization
 
 class StatePredictor(nn.Module):
     def __init__(
@@ -24,6 +21,9 @@ class StatePredictor(nn.Module):
     ):
         """
         Initialize StatePredictor.
+
+        The idea of the current build is that the state features will be a descriptive state of the engine,
+        and the output will be the variables that directly affect the barrier function, in this case, the MPRR.
 
         This will calculate y_next = f(x) + G(x) * u
         where:
@@ -78,6 +78,7 @@ class SafetyFilter:
     def __init__(self, 
                  state_dim: int, 
                  action_dim: int,
+                 output_dim: int,
                  ort_session: Optional[ort.InferenceSession] = None,
                  input_names: Optional[List[str]] = None,
                  output_names: Optional[List[str]] = None,
@@ -92,11 +93,12 @@ class SafetyFilter:
         Args:
             state_dim: Dimension of state space
             action_dim: Dimension of action space
+            output_dim: Dimension of output space
             ort_session: ONNXruntime inference session (optional; required for inference)
             input_names: Names of input tensors for ONNX model (required if ort_session is provided)
             output_names: Names of output tensors for ONNX model (required if ort_session is provided)
             sample_data_dir: Directory or file path to safety HDF5 data used to
-                extract normalization/action_min and normalization/action_max.
+                extract normalization stats for state and action inputs.
         """
         self.logger = logging.getLogger("MyRLApp.safety_filter")
         self.logger.info(f"SafetyFilter initialized with state_dim={state_dim}, action_dim={action_dim}")
@@ -107,74 +109,49 @@ class SafetyFilter:
         
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.output_dim = output_dim
         self.ort_session = ort_session
         self.input_names = list(input_names) if input_names is not None else []
         self.output_names = list(output_names) if output_names is not None else []
-        self.action_min: Optional[np.ndarray] = None
-        self.action_max: Optional[np.ndarray] = None
-        self.action_range: Optional[np.ndarray] = None
+        self.normalizer: Optional[SafetyFilterNormalization] = None
         if sample_data_dir is not None:
-            self._init_action_normalization(sample_data_dir)
+            self._init_normalization(sample_data_dir)
         else:
             self.logger.info(
-                "SafetyFilter action normalization disabled (no sample_data_dir provided)."
+                "SafetyFilter normalization disabled (no sample_data_dir provided)."
             )
 
-        # define constants for barrier function (using numpy)
-        self.a = np.zeros(state_dim, dtype=np.float32)
-        self.a[-1] = 1.0
         self.eps = 1e-8  # to avoid division by zero
 
-    def _resolve_sample_hdf5_path(self, sample_data_dir: Union[str, Path]) -> str:
-        path = Path(sample_data_dir).expanduser()
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        if path.is_file():
-            return str(path)
-        if path.is_dir():
-            return list_h5_files(str(path))[0]
-        raise FileNotFoundError(
-            f"SafetyFilter sample data path not found (expected directory or .h5 file): {path}"
+    def _extract_barrier_features_from_state(self, state: np.ndarray) -> np.ndarray:
+        """
+        Extract features of the state that directly affect the barrier function.
+
+        For example, if the filter considers the MPRR, extract the state feature of the MPRR.
+        """
+        state = np.asarray(state, dtype=np.float32).reshape(-1)
+        return state[-self.output_dim :].copy()
+
+    def _init_normalization(self, sample_data_dir: Union[str, Path]) -> None:
+        self.normalizer = SafetyFilterNormalization.from_sample_data_dir(
+            sample_data_dir,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
         )
-
-    def _extract_action_normalization_values(self, sample_data_path: str) -> Tuple[np.ndarray, np.ndarray]:
-        with h5.File(sample_data_path, "r") as fin:
-            action_min = fin["normalization/action_min"][...].reshape(-1)
-            action_max = fin["normalization/action_max"][...].reshape(-1)
-        return action_min, action_max
-
-    def _init_action_normalization(self, sample_data_dir: Union[str, Path]) -> None:
-        sample_data_path = self._resolve_sample_hdf5_path(sample_data_dir)
-        action_min, action_max = self._extract_action_normalization_values(sample_data_path)
-        if action_min.size != self.action_dim or action_max.size != self.action_dim:
-            raise ValueError(
-                "SafetyFilter action normalization shape mismatch: "
-                f"expected action_dim={self.action_dim}, "
-                f"got action_min={action_min.shape}, action_max={action_max.shape} "
-                f"from {sample_data_path}"
-            )
-        action_range = action_max - action_min
-        if np.any(action_range == 0):
-            raise ValueError(
-                "SafetyFilter found zeros in (action_max - action_min); cannot normalize safely."
-            )
-        self.action_min = action_min.astype(np.float32, copy=True)
-        self.action_max = action_max.astype(np.float32, copy=True)
-        self.action_range = action_range.astype(np.float32, copy=True)
         self.logger.info(
-            "SafetyFilter action normalization loaded from %s",
-            sample_data_path,
+            "SafetyFilter normalization loaded from %s",
+            self.normalizer.sample_data_path,
         )
 
     def _normalize_action(self, action: np.ndarray) -> np.ndarray:
-        if self.action_min is None or self.action_range is None:
+        if self.normalizer is None:
             return action
-        return 2.0 * (action - self.action_min) / self.action_range - 1.0
+        return self.normalizer.normalize_action(action)
 
     def _denormalize_action(self, action_norm: np.ndarray) -> np.ndarray:
-        if self.action_min is None or self.action_range is None:
+        if self.normalizer is None:
             return action_norm
-        return 0.5 * (action_norm + 1.0) * self.action_range + self.action_min
+        return self.normalizer.denormalize_action(action_norm)
 
     def _ort_session_run(self, x: np.ndarray, u: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -186,9 +163,9 @@ class SafetyFilter:
             
         Returns:
             Tuple of (x_next, f_x, G_x) as numpy arrays
-            - x_next: (state_dim,) - predicted next state
-            - f_x: (state_dim,) - drift term
-            - G_x: (state_dim, action_dim) - control matrix
+            - x_next: (output_dim,) - predicted next output
+            - f_x: (output_dim,) - drift term
+            - G_x: (output_dim, action_dim) - control matrix
         """
         if self.ort_session is None:
             raise RuntimeError(
@@ -219,16 +196,16 @@ class SafetyFilter:
         )
         
         # ONNX model outputs: [x_next, f_x, G_x_flat]
-        # G_x_flat needs to be reshaped to (1, state_dim, action_dim)
-        x_next = outputs[0]  # (1, state_dim)
-        f_x = outputs[1]     # (1, state_dim)
-        G_x_flat = outputs[2]  # (1, state_dim * action_dim)
-        G_x = G_x_flat.reshape(1, self.state_dim, self.action_dim)
+        # G_x_flat needs to be reshaped to (1, output_dim, action_dim)
+        x_next = outputs[0]  # (1, output_dim)
+        f_x = outputs[1]     # (1,  output_dim)
+        G_x_flat = outputs[2]  # (1, output_dim * action_dim)
+        G_x = G_x_flat.reshape(1, self.output_dim, self.action_dim)
         
         # Remove batch dimension for single-sample case
-        x_next = x_next[0]  # (state_dim,)
-        f_x = f_x[0]        # (state_dim,)
-        G_x = G_x[0]        # (state_dim, action_dim)
+        x_next = x_next[0]  # (output_dim,)
+        f_x = f_x[0]        # ( ,)
+        G_x = G_x[0]        # (output_dim, action_dim)
         
         return x_next, f_x, G_x
 
@@ -242,7 +219,11 @@ class SafetyFilter:
         Returns:
             Scalar value of barrier function
         """
-        return float(10.0 - np.dot(x, self.a))
+        barrier_features = self._extract_barrier_features_from_state(x)
+        barrier_features = np.asarray(barrier_features, dtype=np.float32).reshape(-1)
+        if barrier_features.size != self.output_dim:
+            raise ValueError(f"Output dimension mismatch: expected {self.output_dim}, got {barrier_features.size}")
+        return float(10.0 - np.sum(barrier_features))
     
     def _compute_alpha(self, x: np.ndarray) -> float:
         """
@@ -303,26 +284,33 @@ class SafetyFilter:
         kn_dtype = kn.dtype
         
         # Ensure float32 dtype
-        x = x.astype(np.float32)
+        x_raw = x.astype(np.float32)
         kn = kn.astype(np.float32)
         kn_for_model = self._normalize_action(kn)
-        
-        # Predict state and get f_x, G_x using ORT
-        _, f_x, G_x = self._ort_session_run(x, kn_for_model)
-        # Outputs are already (state_dim,) and (state_dim, action_dim) after _ort_session_run
+
+        if self.normalizer is not None:
+            x_for_model = self.normalizer.normalize_state(x_raw)
+        else:
+            x_for_model = x_raw
+
+        # Predict output and get f_x, G_x using ORT (normalized state/action in, physical f_x out)
+        _, f_x, G_x = self._ort_session_run(x_for_model, kn_for_model)
+        # Outputs are already (output_dim,) and (output_dim, action_dim) after _ort_session_run
         
         # Compute Lie derivative terms
-        lie_G = G_x.T @ self.a  # (action_dim,)
+        barrier_grad = np.ones(self.output_dim, dtype=np.float32)
+        lie_G = G_x.T @ barrier_grad  # (action_dim,)
         denom = float(np.dot(lie_G, lie_G))  # equivalent to np.linalg.norm(lie_G, ord=2)**2
 
         # In the case that the action does not affect the barrier function, return the original action
-        # This implementation is more robust than only if it equals zero.
+        # This implementation is more robust than if it equals zero.
         if denom < self.eps:
             return kn.astype(kn_dtype)
 
-        # Compute remaining terms
-        lie_F = float(np.dot(self.a, f_x - x))  # scalar
-        alpha = self._compute_alpha(x)  # scalar
+        # Compute remaining terms (CBF uses physical x_raw and physical f_x)
+        barrier_features = self._extract_barrier_features_from_state(x_raw)
+        lie_F = float(np.dot(barrier_grad, f_x - barrier_features))  # scalar
+        alpha = self._compute_alpha(x_raw)  # scalar
         rho = self._compute_rho(model_error)  # scalar
 
         

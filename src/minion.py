@@ -204,6 +204,9 @@ class Minion:
         self.enable_safety_filter = self.config.env_config.get("enable_safety_filter", True)
         self.filter_policy_shm_name = self.config.env_config.get('filter_policy_shm_name', 'filter_policy')
         self.filter_ep_shm_properties = self.config.env_config.get("filter_ep_shm_properties")
+        self.filter_action_features = list(
+            self.config.env_config.get("filter_action_features", [])
+        )
         if self.filter_ep_shm_properties is not None:
             self.filter_ep_shm_name = self.filter_ep_shm_properties['name']
         else:
@@ -321,13 +324,24 @@ class Minion:
                 filter_dims = self.filter_ep_shm_properties.get("filter_dims", None)
                 filter_state_dim = filter_dims.get("state", None)
                 filter_action_dim = filter_dims.get("action", None)
+                filter_output_dim = filter_dims.get("next_state", None)
                 filter_sample_data_dir = self.config.env_config.get("filter_sample_data_dir")
                 if filter_state_dim is None or filter_action_dim is None:
                     raise ValueError(f"Filter state or action dimension not set. Please check the observation and action spaces.")
+                if (
+                    self.filter_action_features
+                    and len(self.filter_action_features) != int(filter_action_dim)
+                ):
+                    raise ValueError(
+                        "Filter action feature count mismatch: "
+                        f"{len(self.filter_action_features)} features for "
+                        f"filter_action_dim={filter_action_dim}."
+                    )
 
                 self.safety_filter = SafetyFilter(
                     state_dim=filter_state_dim,
                     action_dim=filter_action_dim,
+                    output_dim=filter_output_dim,
                     ort_session=self.filter_ort_session,
                     input_names=self.filter_input_names,
                     output_names=self.filter_output_names,
@@ -378,7 +392,7 @@ class Minion:
         self.last_obs = None
 
         # Set EMA settings for reward scaling
-        H = 50.0  # number of steps to reach 99% of the value, or half life of the exponential decay
+        H = 5.0  # number of steps to reach 99% of the value, or half life of the exponential decay
         self.ema_beta = np.exp(-np.log(2) / H)
         self.current_var_ema = 1.0
         self.current_reward_scale = 1.0
@@ -834,6 +848,7 @@ class Minion:
         return self.env_adapter.action_actor_to_filter(
             action=action,
             action_adapter=self.action_adapter,
+            runtime_state=self.adapter_state,
         )
     
     def _get_action_from_filter_to_env(self, obs: dict[str, float], action: np.ndarray) -> np.ndarray:
@@ -966,6 +981,17 @@ class Minion:
         try:
             # Keep a copy of the nominal action (pre-filter) for filter-training data.
             action_from_actor_for_filter_nominal = self._get_action_from_actor_to_filter(action_from_actor)
+            expected_filter_action_dim = (
+                int(self.filter_ep_shm_properties["STATE_ACTION_DIMS"]["action"])
+                if self.filter_ep_shm_properties is not None
+                else action_from_actor_for_filter_nominal.shape[0]
+            )
+            if action_from_actor_for_filter_nominal.shape[0] != expected_filter_action_dim:
+                raise ValueError(
+                    "Nominal filter action dim mismatch: "
+                    f"got {action_from_actor_for_filter_nominal.shape[0]}, "
+                    f"expected {expected_filter_action_dim}."
+                )
         except Exception as e:
             self.logger.debug(f"Minion: Failed to get action from actor to filter: {e}")
             raise RuntimeError(f"Failed to get action from actor to filter: {e}")

@@ -505,21 +505,29 @@ if __name__ == "__main__":
     filter_spec = None
     if enable_safety_filter:
         filter_state_features = env_adapter.get_filter_state_features()
+        filter_action_features = env_adapter.get_filter_action_features(env=env)
         filter_output_features = env_adapter.get_filter_output_features()
         filter_state_dim = len(filter_state_features)
+        filter_action_dim = len(filter_action_features)
         filter_output_dim = len(filter_output_features)
+        if args.env_adapter == ENGINE_CONTINUOUS_ADAPTER_ID and filter_action_dim != 2:
+            raise ValueError(
+                "Engine adapter safety filter action space must be 2D (SOI2, ID2). "
+                f"Got filter_action_dim={filter_action_dim} from adapter "
+                f"{args.env_adapter!r}."
+            )
         filter_dims = {
             "state": filter_state_dim,
-            "action": action_dim,
+            "action": filter_action_dim,
             "next_state": filter_output_dim,
-            "nominal_action": action_dim,
+            "nominal_action": filter_action_dim,
         }
         filter_num_hidden = getattr(args, "filter_num_hidden", 2)
         filter_hidden_exp = getattr(args, "filter_hidden_exp", 7)
         filter_dropout = getattr(args, "filter_dropout", 0.0)
         filter_spec = {
             "filter_state_dim": int(filter_state_dim),
-            "filter_action_dim": int(action_dim),
+            "filter_action_dim": int(filter_action_dim),
             "filter_output_dim": int(filter_output_dim),
             "filter_num_hidden": int(filter_num_hidden),
             "filter_hidden_exp": int(filter_hidden_exp),
@@ -603,6 +611,7 @@ if __name__ == "__main__":
         env_config["filter_ep_shm_properties"] = filter_ep_shm_properties
         env_config["filter_policy_shm_name"] = getattr(args, "filter_policy_shm_name", "filter_policy")
         env_config["filter_spec"] = dict(filter_spec)
+        env_config["filter_action_features"] = list(filter_action_features)
         env_config["filter_num_hidden"] = filter_spec["filter_num_hidden"]
         env_config["filter_hidden_exp"] = filter_spec["filter_hidden_exp"]
         env_config["filter_dropout"] = filter_spec["filter_dropout"]

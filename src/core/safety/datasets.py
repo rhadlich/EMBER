@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from core.safety.normalization import SafetyFilterNormalization, list_h5_files
+
 
 def peek_hdf5(data_dir: str) -> tuple[int, int, int]:
     files = list_h5_files(data_dir)
@@ -29,13 +31,6 @@ def peek_hdf5(data_dir: str) -> tuple[int, int, int]:
     action_dim = int(actions_shape[1])
     output_dim = int(next_states_shape[1])
     return state_dim, action_dim, output_dim
-
-
-def list_h5_files(source: str):
-    files = sorted([os.path.join(source, x) for x in os.listdir(source) if x.endswith(".h5")])
-    if not files:
-        raise FileNotFoundError(f"No .h5 files found in {source}")
-    return files
 
 
 def _read_first_available(fin, keys: list[str], *, filename: str):
@@ -122,7 +117,10 @@ class SafetyInMemoryRowDataset(Dataset):
                 )
             if action_max.size != actions.shape[1] or action_min.size != actions.shape[1]:
                 raise ValueError(
-                    f"Action normalization shape mismatch in {filename} for action shape {actions.shape}"
+                    "Action normalization shape mismatch in "
+                    f"{filename} for action shape {actions.shape}. "
+                    "Ensure filter datasets were regenerated with the same action "
+                    "schema as runtime (e.g. 2D SOI2/ID2)."
                 )
             if feature_mean.size != states.shape[1] or feature_std.size != states.shape[1]:
                 raise ValueError(
@@ -154,20 +152,28 @@ class SafetyInMemoryRowDataset(Dataset):
             next_state_dims.append(next_states.shape[1])
 
         if len(set(state_dims)) != 1 or len(set(action_dims)) != 1 or len(set(next_state_dims)) != 1:
-            raise ValueError("Inconsistent state/action/next_state dimensions across files.")
+            raise ValueError(
+                "Inconsistent state/action/next_state dimensions across files. "
+                "Mixing legacy 3D filter-action files with new 2D files is not supported."
+            )
 
         states_all = np.concatenate(states_blocks, axis=0)
         actions_all = np.concatenate(actions_blocks, axis=0)
         next_states_all = np.concatenate(next_states_blocks, axis=0)
 
-        if np.any(ref_feature_std == 0):
-            raise ValueError("Found zeros in feature_std; cannot normalize safely.")
-        states_all = (states_all - ref_feature_mean) / ref_feature_std
-
-        action_range = ref_action_max - ref_action_min
-        if np.any(action_range == 0):
-            raise ValueError("Found zeros in (action_max - action_min); cannot normalize safely.")
-        actions_all = 2.0 * (actions_all - ref_action_min) / action_range - 1.0
+        state_dim = int(state_dims[0])
+        action_dim = int(action_dims[0])
+        next_state_dim = int(next_state_dims[0])
+        normalizer = SafetyFilterNormalization.from_arrays(
+            feature_mean=ref_feature_mean,
+            feature_std=ref_feature_std,
+            action_min=ref_action_min,
+            action_max=ref_action_max,
+            state_dim=state_dim,
+            action_dim=action_dim,
+        )
+        states_all = normalizer.normalize_state(states_all)
+        actions_all = normalizer.normalize_action(actions_all)
 
         total_rows = states_all.shape[0]
         if self.allow_uneven_distribution:
@@ -182,9 +188,9 @@ class SafetyInMemoryRowDataset(Dataset):
             total_rows if self.allow_uneven_distribution else self.size * (total_rows // self.size)
         )
         self.local_size = self.local_end - self.local_start
-        self.state_dim = int(state_dims[0])
-        self.action_dim = int(action_dims[0])
-        self.next_state_dim = int(next_state_dims[0])
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.next_state_dim = next_state_dim
 
         self.states = torch.from_numpy(
             np.array(

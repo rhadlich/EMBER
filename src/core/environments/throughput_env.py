@@ -13,6 +13,7 @@ from core.environments.engine_adapter import ENGINE_CONTINUOUS_ADAPTER_ID
 from core.environments.engine_env import reward_fn as _default_reward_fn
 from core.environments.env_adapter import AdapterRuntimeState, EnvAdapter
 from core.environments.target_curve_generator import IMEPTargetCurveGenerator
+from utils.utils import ActionAdapter
 
 
 class ThroughputEngineEnvContinuous(gym.Env):
@@ -71,6 +72,7 @@ class ThroughputEngineEnvContinuous(gym.Env):
         self.observation_space = self._adapter.get_normalized_actor_observation_space(
             env=self._env
         )
+        self._action_adapter = ActionAdapter(self._env.action_space)
 
         self._env_seed = config.get("env_seed")
         self._runtime_state: AdapterRuntimeState | None = None
@@ -142,9 +144,14 @@ class ThroughputEngineEnvContinuous(gym.Env):
             action_low=self._env.action_space.low,
             action_high=self._env.action_space.high,
         )
+        effective_action = self._adapter.action_actor_to_filter(
+            action=action,
+            action_adapter=self._action_adapter,
+            runtime_state=self._runtime_state,
+        )
         env_action = self._adapter.action_filter_to_env(
             obs=self._current_raw_obs,
-            action=physical_action,
+            action=effective_action,
             runtime_state=self._runtime_state,
         )
 
@@ -155,7 +162,7 @@ class ThroughputEngineEnvContinuous(gym.Env):
         self._current_raw_obs = raw_obs
 
         self._adapter.update_history(
-            action_in_env_range=env_action,
+            action_in_env_range=physical_action,
             obs=raw_obs,
             runtime_state=self._runtime_state,
         )

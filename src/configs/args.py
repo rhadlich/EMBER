@@ -469,9 +469,11 @@ def custom_args(
         type=str,
         default=None,
         help=(
-            "Directory to load safety filter checkpoints/spec from. If provided, the "
+            "Directory to load safety filter checkpoints from. If provided, the "
             "script must successfully load the filter model from this directory or it "
-            "will fail. Accepts absolute or project-relative paths."
+            "will fail. Accepts filter.pt + filter_spec.json from train_safety_filter, "
+            "or legacy model_weights_filter*.pth with embedded model_config. "
+            "Accepts absolute or project-relative paths."
         ),
     )
     parser.add_argument(
@@ -500,8 +502,10 @@ def custom_args(
         default=DEFAULT_FILTER_SAMPLE_DATA_DIR,
         help=(
             "Directory containing safety-filter HDF5 (.h5) files whose "
-            "normalization/action_min and normalization/action_max are used "
-            "to normalize actions before SafetyFilter inference. "
+            "normalization/feature_mean, normalization/feature_std, "
+            "normalization/action_min, and normalization/action_max are used "
+            "to normalize state and action inputs for SafetyFilter training "
+            "and ONNX inference. "
             f"Default: {DEFAULT_FILTER_SAMPLE_DATA_DIR!r}"
         ),
     )

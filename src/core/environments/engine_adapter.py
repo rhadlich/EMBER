@@ -92,13 +92,18 @@ class EngineContinuousAdapter(EnvAdapter):
             # 'CA10 to CA90, k-1',
             # 'Net heat release, k-1',
             # 'Pressure max, k-1',
-            # 'MPRR, k-1',
             # 'Moving average IMEP (20 cycles), k-1',
             # 'Skewness of moving averate IMEP (20 cycles), k-1',
+            'MPRR, k-1',    # keep it last for easier extraction in SafetyFilter
         ]
 
     def get_filter_output_features(self) -> list[str]:
         return ["achieved_mprr"]
+
+    def get_filter_action_features(self, *, env: gym.Env) -> list[str]:
+        # ID1 is not filter-adjustable in the current cycle because it has already
+        # been executed; the filter controls SOI2 and ID2 only.
+        return ["Start of injection after IVC (SOI2), k", "Injection duration after IVC (ID2), k"]
 
     def init_runtime_state(
         self,
@@ -205,6 +210,7 @@ class EngineContinuousAdapter(EnvAdapter):
                 history["previous ID1"],
                 history["previous SOI2"],
                 history["previous ID2"],
+                obs["achieved_mprr"],
             ],
             dtype=np.float32,
         )
@@ -217,9 +223,12 @@ class EngineContinuousAdapter(EnvAdapter):
         *,
         action: np.ndarray,
         action_adapter: Any,
+        runtime_state: AdapterRuntimeState,
     ) -> np.ndarray:
-        action_for_filter = action.astype(np.float32, copy=True)
-        return action_adapter.get_action_in_env_range(action_for_filter)
+        physical = action_adapter.get_action_in_env_range(action)
+        # ID1 is applied with a one-step delay and is immutable at filter time.
+        # Safety filter operates only on SOI2 and ID2.
+        return np.array([physical[1], physical[2]], dtype=np.float32)
 
     def action_filter_to_env(
         self,
@@ -228,15 +237,14 @@ class EngineContinuousAdapter(EnvAdapter):
         action: np.ndarray,
         runtime_state: AdapterRuntimeState,
     ) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape[0] != 2:
+            raise ValueError(
+                "EngineContinuousAdapter expected 2D filter action [SOI2, ID2], "
+                f"got shape {action.shape}."
+            )
         history = runtime_state.history
-        return np.array(
-            [
-                action[1],
-                history["current ID1"],
-                action[2],
-            ],
-            dtype=np.float32,
-        ).reshape(-1)
+        return np.array([history["current ID1"], action[0], action[1]], dtype=np.float32)
 
     def update_history(
         self,

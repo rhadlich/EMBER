@@ -74,6 +74,13 @@ from configs.args import custom_args
 from onnxruntime.tools import convert_onnx_models_to_ort as c2o
 from pathlib import Path
 from core.safety.safety_filter import StatePredictor, FilterStorageBuffer, SafetyFilter
+from core.safety.normalization import SafetyFilterNormalization
+from core.safety.checkpoint import (
+    load_filter_checkpoint,
+    read_filter_spec,
+    save_filter_checkpoint,
+    validate_filter_spec_adapter_dims,
+)
 from utils.shared_memory_utils import get_indices, set_indices
 
 import logging
@@ -187,37 +194,35 @@ def _load_filter_model(filter_model, args, logger) -> bool:
     filter_dir = getattr(args, "filter_load_dir", None)
     if filter_dir is None:
         return False
+
     filter_spec = getattr(args, "filter_spec", None)
     if filter_spec is None:
         raise ValueError("Filter load failed: filter_spec is not available for compatibility validation.")
-    if not os.path.isdir(filter_dir):
-        raise ValueError(
-            "Filter load failed: provided --filter-load-dir is not a directory: "
-            f"{filter_dir}"
+
+    expected_adapter_dims = {
+        "state": int(filter_spec["filter_state_dim"]),
+        "action": int(filter_spec["filter_action_dim"]),
+        "output": int(filter_spec["filter_output_dim"]),
+    }
+    try:
+        state_dict, saved_spec, weights_path = load_filter_checkpoint(
+            filter_dir,
+            expected_adapter_dims=expected_adapter_dims,
         )
-    pt_path = os.path.join(filter_dir, "filter.pt")
-    spec_path = os.path.join(filter_dir, "filter_spec.json")
-    if not os.path.isfile(pt_path) or not os.path.isfile(spec_path):
+    except (FileNotFoundError, ValueError) as e:
         raise ValueError(
             "Filter load failed from --filter-load-dir "
-            f"{filter_dir}. Required files were not found. "
-            f"Expected: {pt_path} and {spec_path}."
-        )
-    with open(spec_path, "r") as f:
-        saved_spec = json.load(f)
-    if not _spec_matches(saved_spec, filter_spec):
+            f"{filter_dir}. {e}"
+        ) from e
+
+    if saved_spec != filter_spec:
         raise ValueError(
-            f"Filter model checkpoint at {filter_dir} has incompatible spec. "
+            f"Filter model checkpoint at {filter_dir} has incompatible architecture spec. "
             f"Saved: {saved_spec}. Expected: {filter_spec}. Refusing to load."
         )
-    checkpoint = torch.load(pt_path, map_location="cpu")
-    state_dict = (
-        checkpoint.get("model_state_dict", checkpoint)
-        if isinstance(checkpoint, dict)
-        else checkpoint
-    )
+
     filter_model.load_state_dict(state_dict)
-    logger.info(f"Loaded filter model from {pt_path}")
+    logger.info(f"Loaded filter model from {weights_path}")
     return True
 
 
@@ -243,12 +248,12 @@ def _save_models(algo, filter_model_refs, args, logger) -> None:
         if fm is not None and filter_spec is not None:
             filter_dir = _filter_checkpoint_dir(filter_name)
             os.makedirs(filter_dir, exist_ok=True)
-            pt_path = os.path.join(filter_dir, "filter.pt")
-            spec_path = os.path.join(filter_dir, "filter_spec.json")
-            torch.save(fm.state_dict(), pt_path)
-            with open(spec_path, "w") as f:
-                json.dump(filter_spec, f, indent=2)
-            logger.info(f"Saved filter model to {pt_path}")
+            weights_path, spec_path = save_filter_checkpoint(
+                filter_dir,
+                state_dict=fm.state_dict(),
+                filter_spec=filter_spec,
+            )
+            logger.info(f"Saved filter model to {weights_path} and {spec_path}")
     except Exception as e:
         logger.warning(f"Failed to save filter model: {e}")
 
@@ -588,6 +593,11 @@ def run_rllib_shared_memory(
             next_state_start = state_dim + action_dim
             next_state_end = next_state_start + next_state_dim
             next_states = torch.from_numpy(batch[:, next_state_start:next_state_end]).float()
+
+            normalizer = filter_model_refs.get("normalizer")
+            if normalizer is not None:
+                states = torch.from_numpy(normalizer.normalize_state(states.numpy())).float()
+                actions = torch.from_numpy(normalizer.normalize_action(actions.numpy())).float()
             
             # Forward pass
             predicted_next_states, _, _ = model(states, actions)
@@ -973,9 +983,11 @@ def run_rllib_shared_memory(
         # Initialize filter model (StatePredictor)
         filter_ep_shm_properties_for_dims = config.env_config.get("filter_ep_shm_properties", None)
         filter_dims = filter_ep_shm_properties_for_dims.get("filter_dims", None) if filter_ep_shm_properties_for_dims else None
-        filter_state_dim = filter_dims.get("state", None)
-        filter_action_dim = filter_dims.get("action", None)
-        filter_output_dim = filter_dims.get("next_state", None)
+        filter_spec = config.env_config.get("filter_spec", None)
+        filter_action_features = config.env_config.get("filter_action_features", None)
+        filter_state_dim = filter_spec.get("filter_state_dim", None)
+        filter_action_dim = filter_spec.get("filter_action_dim", None)
+        filter_output_dim = filter_spec.get("filter_output_dim", None)
         # if isinstance(config.observation_space, spaces.Discrete):
         #     filter_state_dim = config.observation_space.n.size
         # elif isinstance(config.observation_space, spaces.Tuple):
@@ -998,23 +1010,58 @@ def run_rllib_shared_memory(
                 "Filter state/action/output dimensions not set. "
                 "Please check filter_ep_shm_properties.filter_dims."
             )
+        if filter_action_features is not None and len(filter_action_features) != int(
+            filter_action_dim
+        ):
+            raise ValueError(
+                "Filter action feature count does not match filter_action_dim: "
+                f"len(filter_action_features)={len(filter_action_features)}, "
+                f"filter_action_dim={filter_action_dim}."
+            )
         #
         runtime_filter_spec = config.env_config.get("filter_spec", None)
-        filter_num_hidden = (
-            int(runtime_filter_spec["filter_num_hidden"])
-            if isinstance(runtime_filter_spec, dict) and "filter_num_hidden" in runtime_filter_spec
-            else int(config.env_config.get("filter_num_hidden", 2))
-        )
-        filter_hidden_exp = (
-            int(runtime_filter_spec["filter_hidden_exp"])
-            if isinstance(runtime_filter_spec, dict) and "filter_hidden_exp" in runtime_filter_spec
-            else int(config.env_config.get("filter_hidden_exp", 7))
-        )
-        filter_dropout = (
-            float(runtime_filter_spec["filter_dropout"])
-            if isinstance(runtime_filter_spec, dict) and "filter_dropout" in runtime_filter_spec
-            else float(config.env_config.get("filter_dropout", 0.0))
-        )
+        filter_load_dir = getattr(args, "filter_load_dir", None)
+        if filter_load_dir is not None:
+            if not os.path.isdir(filter_load_dir):
+                raise ValueError(
+                    "Filter load failed: provided --filter-load-dir is not a directory: "
+                    f"{filter_load_dir}"
+                )
+            checkpoint_spec = read_filter_spec(filter_load_dir)
+            validate_filter_spec_adapter_dims(
+                checkpoint_spec,
+                state_dim=int(filter_state_dim),
+                action_dim=int(filter_action_dim),
+                output_dim=int(filter_output_dim),
+                checkpoint_dir=filter_load_dir,
+            )
+            filter_num_hidden = int(checkpoint_spec["filter_num_hidden"])
+            filter_hidden_exp = int(checkpoint_spec["filter_hidden_exp"])
+            filter_dropout = float(checkpoint_spec["filter_dropout"])
+            logger.info(
+                "run_algorithm: Using filter architecture from checkpoint at %s "
+                "(num_hidden=%s, hidden_exp=%s, dropout=%s)",
+                filter_load_dir,
+                filter_num_hidden,
+                filter_hidden_exp,
+                filter_dropout,
+            )
+        else:
+            filter_num_hidden = (
+                int(runtime_filter_spec["filter_num_hidden"])
+                if isinstance(runtime_filter_spec, dict) and "filter_num_hidden" in runtime_filter_spec
+                else int(config.env_config.get("filter_num_hidden", 2))
+            )
+            filter_hidden_exp = (
+                int(runtime_filter_spec["filter_hidden_exp"])
+                if isinstance(runtime_filter_spec, dict) and "filter_hidden_exp" in runtime_filter_spec
+                else int(config.env_config.get("filter_hidden_exp", 7))
+            )
+            filter_dropout = (
+                float(runtime_filter_spec["filter_dropout"])
+                if isinstance(runtime_filter_spec, dict) and "filter_dropout" in runtime_filter_spec
+                else float(config.env_config.get("filter_dropout", 0.0))
+            )
         if (
             isinstance(runtime_filter_spec, dict)
             and "filter_output_dim" in runtime_filter_spec
@@ -1030,6 +1077,21 @@ def run_rllib_shared_memory(
             f"action_dim={filter_action_dim}, output_dim={filter_output_dim}, "
             f"num_hidden={filter_num_hidden}, hidden_exp={filter_hidden_exp}, "
             f"dropout={filter_dropout}"
+        )
+
+        filter_sample_data_dir = config.env_config.get("filter_sample_data_dir")
+        if not filter_sample_data_dir:
+            raise ValueError(
+                "enable_safety_filter is True but filter_sample_data_dir is not set in env_config."
+            )
+        filter_normalizer = SafetyFilterNormalization.from_sample_data_dir(
+            filter_sample_data_dir,
+            state_dim=filter_state_dim,
+            action_dim=filter_action_dim,
+        )
+        logger.info(
+            "run_algorithm: Safety filter normalization loaded from %s",
+            filter_normalizer.sample_data_path,
         )
         #
         # Initialize filter storage buffer configuration
@@ -1171,6 +1233,7 @@ def run_rllib_shared_memory(
             barrier_only_safety_filter = SafetyFilter(
                 state_dim=state_dim,
                 action_dim=action_dim,
+                output_dim=next_state_dim,
                 ort_session=None,
                 input_names=None,
                 output_names=None,
@@ -1202,6 +1265,7 @@ def run_rllib_shared_memory(
             'output_dim': filter_output_dim,
             'storage_buffer': filter_storage_buffer,
             'storage_training_batch_size': filter_storage_training_batch_size,
+            'normalizer': filter_normalizer,
         }
 
     results = None

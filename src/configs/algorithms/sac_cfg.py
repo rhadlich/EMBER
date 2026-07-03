@@ -58,7 +58,7 @@ def update_config(cfg, args):
             # Generic algorithm hyperparams
             train_batch_size_per_learner=256,
             # training_intensity=256.0,
-            gamma=0.1,
+            gamma=0.5,
             n_step=1,
             grad_clip=10.0,
 

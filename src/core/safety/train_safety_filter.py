@@ -12,6 +12,11 @@ import torch.optim as optim
 from torch.distributed import destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from core.safety.checkpoint import (
+    model_config_to_filter_spec,
+    resolve_training_output_dir,
+    save_filter_checkpoint,
+)
 from core.safety.datasets import SafetyInMemoryRowDataset, peek_hdf5
 from core.safety.safety_filter import StatePredictor
 from core.training import distributed as dist_utils
@@ -25,6 +30,33 @@ from core.training.hpo import (
 )
 from core.training.loaders import create_dataloaders
 from core.training.trainer import Trainer, resolve_device
+
+
+def _save_training_checkpoint(
+    output_dir: Path,
+    *,
+    state_dict: dict,
+    model_config: dict,
+    random_seed: int | None,
+) -> None:
+    filter_spec = model_config_to_filter_spec(model_config)
+    weights_path, spec_path = save_filter_checkpoint(
+        output_dir,
+        state_dict=state_dict,
+        filter_spec=filter_spec,
+        random_seed=random_seed,
+    )
+    legacy_path = output_dir / "model_weights_filter_new.pth"
+    torch.save(
+        {
+            "model_state_dict": state_dict,
+            "model_config": model_config,
+            "random_seed": random_seed,
+        },
+        legacy_path,
+    )
+    print(f"Saved runtime filter checkpoint to {weights_path} and {spec_path}")
+    print(f"Saved legacy evaluation checkpoint to {legacy_path}")
 
 
 def _history_curve(history_rows, key):
@@ -210,10 +242,7 @@ def main(
         raise ValueError("--n_seeds > 1 requires an explicit --seed value.")
 
     device = resolve_device(device_name)
-    if output_path is None:
-        output_dir = Path(__file__).resolve().parent / "models"
-    else:
-        output_dir = Path(output_path)
+    output_dir = resolve_training_output_dir(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     if distributed:
         dist_utils.init_process_group(method)
@@ -513,23 +542,22 @@ def main(
             if distributed:
                 model = DDP(model, device_ids=None, output_device=None)
 
-            filename_model = output_dir / f"model_weights_filter_new.pth"
+            filename_model = output_dir / "model_weights_filter_new.pth"
             if rank == 0:
                 base_model = model.module if distributed else model
-                torch.save(
-                    {
-                        "model_state_dict": base_model.state_dict(),
-                        "model_config": {
-                            "state_dim": state_dim,
-                            "output_dim": output_dim,
-                            "action_dim": action_dim,
-                            "num_hidden": trial_num_hidden,
-                            "hidden_exp": trial_hidden_exp,
-                            "dropout": trial_dropout,
-                        },
-                        "random_seed": run_effective_seed,
-                    },
-                    filename_model,
+                model_config = {
+                    "state_dim": state_dim,
+                    "output_dim": output_dim,
+                    "action_dim": action_dim,
+                    "num_hidden": trial_num_hidden,
+                    "hidden_exp": trial_hidden_exp,
+                    "dropout": trial_dropout,
+                }
+                _save_training_checkpoint(
+                    output_dir,
+                    state_dict=base_model.state_dict(),
+                    model_config=model_config,
+                    random_seed=run_effective_seed,
                 )
 
             optimizer_lr = trial_learning_rate * world_size if distributed else trial_learning_rate
@@ -623,20 +651,19 @@ def main(
                     )
                     if not hpo_iters:
                         base_model = model.module if distributed else model
-                        torch.save(
-                            {
-                                "model_state_dict": base_model.state_dict(),
-                                "model_config": {
-                                    "state_dim": state_dim,
-                                    "output_dim": output_dim,
-                                    "action_dim": action_dim,
-                                    "num_hidden": trial_num_hidden,
-                                    "hidden_exp": trial_hidden_exp,
-                                    "dropout": trial_dropout,
-                                },
-                                "random_seed": run_effective_seed,
-                            },
-                            filename_model,
+                        model_config = {
+                            "state_dim": state_dim,
+                            "output_dim": output_dim,
+                            "action_dim": action_dim,
+                            "num_hidden": trial_num_hidden,
+                            "hidden_exp": trial_hidden_exp,
+                            "dropout": trial_dropout,
+                        }
+                        _save_training_checkpoint(
+                            output_dir,
+                            state_dict=base_model.state_dict(),
+                            model_config=model_config,
+                            random_seed=run_effective_seed,
                         )
 
                 if distributed:
@@ -687,9 +714,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output_path",
-        default=str(Path(__file__).resolve().parent / "models" / "filter.pt"),
+        default=str(Path(__file__).resolve().parent / "models"),
         type=str,
-        help="Checkpoint path",
+        help="Output directory for filter.pt, filter_spec.json, and legacy .pth checkpoints",
     )
     parser.add_argument("--total_epochs", default=20, type=int, help="Training epochs")
     parser.add_argument("--batch_size", default=256, type=int, help="Batch size")
