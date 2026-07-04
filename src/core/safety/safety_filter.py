@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple, List, Union
 import random
 import logging
-import utils.logging_setup as logging_setup
 from core.safety.normalization import SafetyFilterNormalization
 
 class StatePredictor(nn.Module):
