@@ -1,137 +1,169 @@
-# 🔥 EMBER
+# EMBER
 
-**E**ngine **M**odel-Based **B**arrier-Enhanced **R**einforcement Learning
+Engine Model-Based Barrier-Enhanced Reinforcement Learning (EMBER) is a research software repository for studying safe reinforcement-learning control of internal combustion engines with model-based safety filtering.
 
-EMBER is a research framework for **safe and adaptive control of internal combustion engines** using **reinforcement learning (RL)** with **Control Barrier Functions (CBFs)**.  
-It is designed to enable learning-based control while **provably enforcing safety constraints**, with a focus on **low-temperature combustion (LTC)** regimes.
+> [!IMPORTANT]
+> This is an initial public **research release**. It is provided for research transparency and reproducibility and is **not** intended as production software.
 
----
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXXXXX)  
+Replace the DOI placeholder after Zenodo creates the release record.
 
-## 🚀 Features
+## Research Motivation
 
-- Reinforcement learning for nonlinear engine control
-- Safety filtering (CBF-inspired) with a learned dynamics model
-- Explicit enforcement of state and input constraints
-- Modular design for models, constraints, and agents
-- Built on Ray + RLlib (custom training harness + custom RLModules)
-- Shared-memory bridge between RLlib and an external “minion” process (low-latency rollout collection)
-- Optional live telemetry to a PyQt6 GUI via ZMQ/IPC
-- Discrete + continuous engine environments backed by learned surrogate model weights
+The repository explores how reinforcement learning can be combined with model-based constraints and safety filtering for adaptive engine control under nonlinear and safety-critical conditions.
 
----
-## ⚠️ Current Limitations
+## Main Capabilities
 
-This project is under development and is not fully operational. These items will be fixed in future versions, but for now these are limitations to be aware of:
+- RL training harness built on Ray RLlib with custom modules and runners.
+- Shared-memory training/runtime pipeline (`setup_run.py`, `env_runner.py`, `minion.py`).
+- Engine-focused environment adapters and safety-filter training/evaluation code.
+- Digital twin model training and analysis utilities.
+- Optional local GUI telemetry via ZMQ + PyQt.
 
-- Only works with the two pre-built engine environments.
-- Has hardcoded values in the master.py and minion.py that are specific to the test case. This is meant to be a flexible framework when finished.
+## Repository Status
 
----
+- Development status: alpha research codebase.
+- API and repository organization may evolve.
+- Includes components that require external datasets and model artifacts not shipped with this release.
 
-## ⚙️ Getting Started
+## Repository Structure
 
-### Prerequisites
-
-- **Python**: 3.9 (see `rayenv2_mac.yml`)
-- **Conda**: recommended (miniconda/anaconda)
-- **OS notes**:
-  - The runtime uses `onnxruntime` and may leverage the **CoreML execution provider** on macOS (with CPU fallback).
-  - Some options (like real-time scheduling priority) are Linux-specific and may be ignored on macOS.
-
-### Clone the repository
-
-```bash
-git clone https://github.com/rhadlich/EMBER.git
-cd EMBER
+```text
+.
+├── pyproject.toml
+├── environment.yml
+├── environment-gui.yml
+├── docs/
+├── scripts/
+└── src/
+    ├── setup_run.py
+    ├── run_algorithm.py
+    ├── run_algorithm_throughput.py
+    ├── env_runner.py
+    ├── minion.py
+    ├── RLapp.py
+    ├── configs/
+    ├── core/
+    │   ├── environments/
+    │   ├── digital_twin/
+    │   ├── safety/
+    │   ├── training/
+    │   └── rl_modules/
+    └── utils/
 ```
 
-### Install dependencies (recommended: Conda)
+See [`docs/repository_structure.md`](docs/repository_structure.md) for details.
 
-This repo ships a pinned environment file (there is no `pyproject.toml`/`requirements.txt` at the moment).
+## Installation
+
+### Standard installation
 
 ```bash
-conda env create -f environment.yml
-conda activate rayenv2
+python -m pip install .
 ```
 
-### Install project in editable mode
-
-To make imports like `from core...` work consistently across scripts and IDE runs, install EMBER as an editable package:
+### Editable installation
 
 ```bash
 python -m pip install -e .
 ```
 
-After this, you can run modules from the project root, for example:
+### Verify imports
+
+```bash
+python -c "import core; print('Import successful')"
+```
+
+Additional installation notes: [`docs/installation.md`](docs/installation.md).
+
+## Dependencies and Environments
+
+- Packaging dependencies for `pip install` are declared in `pyproject.toml`.
+- Reproducibility-focused pinned environments are provided in:
+  - `environment.yml` (main research environment)
+  - `environment-gui.yml` (GUI extras)
+
+## Quick Start
+
+Run from repository root.
+
+### Realtime profile (default)
+
+```bash
+python src/setup_run.py --algo SAC --env-type continuous --stop-iters 10
+```
+
+### Throughput profile
+
+```bash
+python src/setup_run.py --runtime-profile throughput --algo TD3 --env-type continuous --stop-iters 10
+```
+
+### Digital twin training module help
 
 ```bash
 python -m core.digital_twin.train_digital_twin --help
 ```
 
-### Quickstart: run a local training loop
+More examples: [`docs/quickstart.md`](docs/quickstart.md).
 
-The primary entrypoint is `setup_run.py`. It configures an RLlib algorithm, spins up a custom `EnvRunner`, and schedules a “minion” worker that collects rollouts via shared memory.
+## Typical Workflows
 
-#### IMPALA (discrete env by default)
+- RL training runs: realtime or throughput profile via `src/setup_run.py`.
+- Safety model workflow: `core.safety.train_safety_filter` then `core.safety.evaluate_safety_filter`.
+- Digital twin workflow: `core.digital_twin.train_digital_twin`.
+- Post-hoc interpretability and visualization scripts for analysis.
 
-```bash
-python src/setup_run.py \
-  --algo 'IMPALA' \
-  --env-type discrete \
-  --stop-iters 10 \
-```
+## Configuration
 
-#### SAC (continuous env by default)
+Primary runtime parameters are in CLI flags and algorithm presets:
 
-```bash
-python src/setup_run.py \
-  --algo 'SAC' \
-  --env-type continuous \
-  --stop-iters 10 \
-```
+- `src/configs/args.py`
+- `src/configs/algorithms/*.py`
 
-#### APPO (continuous env by default)
+See [`docs/configuration.md`](docs/configuration.md).
 
-```bash
-python src/setup_run.py \
-  --algo 'APPO' \
-  --env-type continuous \
-  --stop-iters 10 \
-```
+## Data Expectations and Outputs
 
-### Optional: enable telemetry for the GUI
+- External HDF5 datasets are expected for digital twin and safety modules.
+- Some scripts currently contain machine-specific absolute paths and require local adjustment.
+- Trained model weights, checkpoints, and generated experiment outputs are excluded from release artifacts by design.
 
-Both the minion (“engine”) side and the trainer can publish telemetry over ZMQ when enabled:
+Details:
 
-```bash
-python src/setup_run.py \
-  --algo IMPALA \
-  --env-type discrete \
-  --enable-zmq True
-```
+- [`docs/data.md`](docs/data.md)
+- [`docs/reproducibility.md`](docs/reproducibility.md)
+- [`docs/hardware.md`](docs/hardware.md)
 
-The GUI (`app/RLapp.py`) subscribes to:
-- `ipc:///tmp/engine.ipc`
-- `ipc:///tmp/training.ipc`
+## Reproducibility Notes
 
-Note: `app/RLapp.py` is currently a research/monitoring script and may need small local path tweaks (it spawns a master process and may not point at `master.py` out of the box).
+This public release enables code inspection and installation, and supports local execution where required external datasets and artifacts are available. Full reproduction of all prior private experiments is not guaranteed from this repository alone.
 
-### Where to look (repo layout)
+## Limitations
 
-- **`src/`**: main source code directory
-  - **`src/setup_run.py`**, **`src/minion.py`**: entrypoint scripts
-  - **`src/run_algorithm.py`**, **`src/env_runner.py`**: RLlib training harness and shared-memory env runner
-  - **`src/configs/`**: CLI + algorithm presets (`src/configs/args.py`, `src/configs/algorithms/*_cfg.py`)
-  - **`src/core/environments/`**: engine environments and learned surrogate model interface (`engine_env.py`, `predictor.py`, `define_models.py`, `reward_typing.py`)
-  - **`src/core/rl_modules/`**: custom RL modules for APPO and IMPALA (`appo_rl_modules.py`, `impala_rl_modules.py`)
-  - **`src/core/safety/`**: learned dynamics + runtime safety filter (`safety_filter.py`)
-  - **`src/core/digital_twin/`**: digital twin architectures, datasets, visualization script, and model weights
-  - **`src/utils/`**: utility modules (`utils.py`, `logging_setup.py`, `ray_primitives.py`, `shared_memory_utils.py`)
-  - **`src/app/`**: GUI application (`RLapp.py`)
-- **`legacy/`**: archived pre-reorg code (see `legacy/README.md`)
+- Not production-hardened (error handling, API stability, CI, and testing are limited).
+- Several analysis scripts are configured with local absolute paths by default.
+- Some workflows depend on external datasets and model artifacts not included in the repository.
 
-### Troubleshooting
+## Citation
 
-- **Import errors (`ModuleNotFoundError: src...`)**: The scripts are now at the root level, so imports should work when running from the repo root. If you still encounter issues, ensure you're running from the repo root directory.
-- **Stale shared-memory / stuck processes**: stop the Python processes and rerun. Shared-memory segments and IPC endpoints can linger if the program is interrupted.
-- **ONNXRuntime provider issues**: if CoreML isn’t available (or fails), the code should fall back to CPU execution, but performance may differ across machines.
+Please cite EMBER using [`CITATION.cff`](CITATION.cff).
+
+## Related Publications
+
+Publication references and DOIs should be added when finalized.
+
+## License
+
+This project is released under the [MIT License](LICENSE).
+
+## Acknowledgments
+
+Developed as academic research software for engine-control and safe RL investigations.
+
+## Contact and Issue Reporting
+
+Please use GitHub issues for bug reports and questions:  
+<https://github.com/rhadlich/EMBER/issues>
+
+For private vulnerability reporting, see [`SECURITY.md`](SECURITY.md).

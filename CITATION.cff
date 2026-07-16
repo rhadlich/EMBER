@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "EMBER: Engine Model-Based Barrier-Enhanced Reinforcement Learning"
+type: software
+authors:
+  - family-names: "Ristow Hadlich"
+    given-names: "Rodrigo"
+    affiliation: "AFFILIATION_PLACEHOLDER"
+    orcid: "https://orcid.org/ORCID_PLACEHOLDER"
+version: "0.1.0"
+date-released: "YYYY-MM-DD"
+license: "MIT"
+url: "https://github.com/rhadlich/EMBER"
+repository-code: "https://github.com/rhadlich/EMBER"
+keywords:
+  - reinforcement learning
+  - safe reinforcement learning
+  - control barrier functions
+  - internal combustion engine
+  - digital twin
+  - research software
+abstract: >
+  EMBER is a research software framework for studying model-based and safety-aware
+  reinforcement-learning workflows for internal combustion engine control. The
+  repository combines training pipelines, custom RL modules, safety-filter components,
+  and digital-twin tooling for transparency and reproducibility in academic research.

@@ -1,18 +1,61 @@
-migrate_repo.py
+# OS and editor metadata
+.DS_Store
+.cursor/
+.vscode/
+.idea/
+
+# Python cache/build artifacts
+**/__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+.venv_release/
+venv/
+env/
+
+# Packaging/build outputs
+build/
+dist/
+*.egg
+
+# Local runtime outputs and logs
+*.local
+*.MacBookPro
+*.log
+env_runners_df.csv
+learners_df.csv
+minion_eval_rollouts.csv
+minion_train_rollouts.csv
+minion_timing_*.csv
+minion_episode_log_*.csv
+~$*.xlsx
+
+# Model/export/intermediate artifacts
 *.onnx
 *.ort
 *.config
-*.csv
-.DS_Store
 *.pkl
 *.pt
-*.json
-**/__pycache__/
-.cursor/
-scripts/
-visualize_predictions.py
-*.parquet
 *.pth
-*.local
-*.MacBookPro
+*.parquet
 *.npz
+
+# Generated result directories
+checkpoints/
+benchmark_eval/
+benchmark_profiles/
+src/core/**/ray_results/
+src/core/**/run_logs/
+src/core/**/visualize_predictions/
+src/core/**/xai_outputs/
+src/core/digital_twin/models/
+src/core/safety/models/

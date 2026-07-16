@@ -6,10 +6,78 @@ build-backend = "setuptools.build_meta"
 name = "ember"
 version = "0.1.0"
 description = "Engine Model-Based Barrier-Enhanced Reinforcement Learning"
+readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "Rodrigo Hadlich" }
+]
+keywords = [
+  "reinforcement-learning",
+  "safe-rl",
+  "control-barrier-functions",
+  "internal-combustion-engine",
+  "digital-twin",
+  "research-software"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<3",
+  "torch>=2.7,<3",
+  "ray[rllib]>=2.46,<3",
+  "gymnasium>=1.1,<2",
+  "onnxruntime>=1.16,<2",
+  "h5py>=3.13,<4",
+  "matplotlib>=3.9,<4",
+  "scipy>=1.13,<2",
+  "colorama>=0.4,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "twine>=5.1",
+]
+test = [
+  "pytest>=8.0",
+]
+docs = [
+  "markdown>=3.6",
+]
+notebooks = [
+  "jupyter>=1.0",
+]
+gui = [
+  "pyqt6>=6.9,<7",
+  "pyqtgraph>=0.13,<0.14",
+  "pyzmq>=26,<27",
+]
+
+[project.urls]
+Repository = "https://github.com/rhadlich/EMBER"
+Documentation = "https://github.com/rhadlich/EMBER/tree/main/docs"
+Issues = "https://github.com/rhadlich/EMBER/issues"
+Zenodo = "https://doi.org/10.5281/zenodo.XXXXXXXXXX"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = [
+  "setup_run",
+  "run_algorithm",
+  "run_algorithm_throughput",
+  "env_runner",
+  "minion",
+  "RLapp",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
