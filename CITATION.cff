@@ -5,10 +5,10 @@ type: software
 authors:
   - family-names: "Ristow Hadlich"
     given-names: "Rodrigo"
-    affiliation: "AFFILIATION_PLACEHOLDER"
-    orcid: "https://orcid.org/ORCID_PLACEHOLDER"
+    affiliation: "Stony Brook University"
+    orcid: "https://orcid.org/0000-0002-0000-7726"
 version: "0.1.0"
-date-released: "YYYY-MM-DD"
+date-released: "2026-07-16"
 license: "MIT"
 url: "https://github.com/rhadlich/EMBER"
 repository-code: "https://github.com/rhadlich/EMBER"
