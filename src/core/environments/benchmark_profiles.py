@@ -20,9 +20,9 @@ DEFAULT_CA50_STABILITY_WINDOW = 5
 # Weights for composite score (lower is better).
 DEFAULT_SCORE_WEIGHTS = {
     "load_tracking_mae": 1.0,
-    "mprr_excess_mean": 2.0,
-    "ca50_rolling_std_mean": 0.01,
-    "injection_duration_mean": 0.5,
+    "mprr_excess_mean": 0,
+    "ca50_rolling_std_mean": 0.0,
+    "injection_duration_mean": 0.0,
 }
 
 
@@ -265,3 +265,156 @@ def aggregate_run_metrics(
         key: float(np.mean([metrics[key] for metrics in profile_aggregates.values()]))
         for key in keys
     }
+
+
+# =========================
+# Interactive configuration
+# =========================
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROFILES_DIR = _PROJECT_ROOT / "benchmark_profiles"
+OUTPUT_DIR = PROFILES_DIR / "plots"
+DEFAULT_PROFILES_FILENAME = "representative_profiles.npz"
+SHOW = True
+SAVE = True
+DPI = 150
+
+
+def _is_profile_array_key(key: str) -> bool:
+    return (
+        key.startswith("profile_")
+        and key != "profile_length"
+        and key.rsplit("_", 1)[-1].isdigit()
+    )
+
+
+def _resolve_profile_store_path(path: Path) -> Path:
+    """Resolve a stored profile ``.npz`` from a file or directory path."""
+    path = Path(path)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(f"Profile path does not exist: {path}")
+
+    preferred = path / DEFAULT_PROFILES_FILENAME
+    if preferred.is_file():
+        return preferred
+
+    candidates = sorted(path.glob("*.npz"))
+    for candidate in candidates:
+        with np.load(candidate, allow_pickle=True) as data:
+            if any(_is_profile_array_key(key) for key in data.files):
+                return candidate
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    raise FileNotFoundError(
+        f"No stored benchmark profiles found in {path}. "
+        f"Expected {DEFAULT_PROFILES_FILENAME} or another .npz with profile arrays."
+    )
+
+
+def load_profiles_from_directory(path: Path | str) -> BenchmarkProfileSet:
+    """Load stored benchmark profiles from a directory or ``.npz`` file."""
+    store_path = _resolve_profile_store_path(Path(path))
+    with np.load(store_path, allow_pickle=True) as data:
+        seeds = tuple(int(s) for s in data["seeds"].tolist())
+        length = int(data["profile_length"])
+        profiles = {
+            key: np.asarray(data[key], dtype=np.float64)
+            for key in data.files
+            if _is_profile_array_key(key)
+        }
+
+    if not profiles:
+        raise ValueError(f"No profile arrays found in {store_path}")
+
+    generator_params: dict[str, Any] = {}
+    meta_path = store_path.with_suffix(".json")
+    if meta_path.is_file():
+        metadata = json.loads(meta_path.read_text())
+        params = metadata.get("generator_params")
+        if isinstance(params, dict):
+            generator_params = params
+
+    return BenchmarkProfileSet(
+        profiles=profiles,
+        seeds=seeds,
+        profile_length=length,
+        generator_params=generator_params,
+    )
+
+
+def _profile_sort_key(profile_id: str) -> tuple[int, str]:
+    suffix = profile_id.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return int(suffix), profile_id
+    return 10_000, profile_id
+
+
+def plot_stored_profiles(
+    profile_set: BenchmarkProfileSet,
+    output_dir: Path,
+    *,
+    show: bool = False,
+    save: bool = True,
+    dpi: int = 150,
+) -> Path:
+    """Plot fixed IMEP target curves from a stored profile set."""
+    import matplotlib.pyplot as plt
+
+    profile_ids = sorted(profile_set.profile_ids, key=_profile_sort_key)
+    n_cols = 1
+    n_rows = int(np.ceil(len(profile_ids) / n_cols))
+
+    output_dir = Path(output_dir)
+    if save:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(10 * n_cols, 2 * n_rows), squeeze=False
+    )
+    cmap = plt.get_cmap("tab10")
+    for idx, profile_id in enumerate(profile_ids):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row][col]
+        targets = profile_set.profiles[profile_id]
+        steps = np.arange(len(targets))
+        seed = profile_set.seeds[idx] if idx < len(profile_set.seeds) else "?"
+        ax.plot(steps, targets, color=cmap(idx % 10), linewidth=1.4)
+        ax.set_title(f"{profile_id} (seed={seed})")
+        ax.set_xlabel("Cycle")
+        ax.set_ylabel("Target IMEP")
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(len(profile_ids), n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].axis("off")
+
+    fig.tight_layout()
+    out_path = output_dir / "stored_profiles.png"
+    if save:
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+def main() -> None:
+    profile_set = load_profiles_from_directory(PROFILES_DIR)
+    out_path = plot_stored_profiles(
+        profile_set,
+        OUTPUT_DIR,
+        show=SHOW,
+        save=SAVE,
+        dpi=DPI,
+    )
+    if SAVE:
+        print(f"Saved profile plot to {out_path}")
+    elif SHOW:
+        print("Displayed profile plot (SAVE=False).")
+
+
+if __name__ == "__main__":
+    main()

@@ -8,6 +8,7 @@ import random
 import logging
 from core.safety.normalization import SafetyFilterNormalization
 
+
 class StatePredictor(nn.Module):
     def __init__(
         self,
@@ -121,6 +122,31 @@ class SafetyFilter:
             )
 
         self.eps = 1e-8  # to avoid division by zero
+        self.action_clip_min: Optional[np.ndarray] = None
+        self.action_clip_max: Optional[np.ndarray] = None
+
+    def set_action_clip_bounds(
+        self,
+        clip_min: np.ndarray,
+        clip_max: np.ndarray,
+    ) -> None:
+        """Clip denormalized filter actions to runtime physical limits (e.g. engine env)."""
+        clip_min = np.asarray(clip_min, dtype=np.float32).reshape(-1)
+        clip_max = np.asarray(clip_max, dtype=np.float32).reshape(-1)
+        if clip_min.shape[0] != self.action_dim or clip_max.shape[0] != self.action_dim:
+            raise ValueError(
+                "Action clip bounds must match action_dim="
+                f"{self.action_dim}, got min={clip_min.shape}, max={clip_max.shape}"
+            )
+        self.action_clip_min = clip_min
+        self.action_clip_max = clip_max
+
+    def _clip_physical_action(self, action: np.ndarray) -> Tuple[np.ndarray, bool]:
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self.action_clip_min is None or self.action_clip_max is None:
+            return action, False
+        clipped = np.clip(action, self.action_clip_min, self.action_clip_max)
+        return clipped, bool(np.any(clipped != action))
 
     def _extract_barrier_features_from_state(self, state: np.ndarray) -> np.ndarray:
         """
@@ -129,7 +155,7 @@ class SafetyFilter:
         For example, if the filter considers the MPRR, extract the state feature of the MPRR.
         """
         state = np.asarray(state, dtype=np.float32).reshape(-1)
-        return state[-self.output_dim :].copy()
+        return state[-3].copy()
 
     def _init_normalization(self, sample_data_dir: Union[str, Path]) -> None:
         self.normalizer = SafetyFilterNormalization.from_sample_data_dir(
@@ -224,6 +250,10 @@ class SafetyFilter:
             raise ValueError(f"Output dimension mismatch: expected {self.output_dim}, got {barrier_features.size}")
         return float(10.0 - np.sum(barrier_features))
     
+    def _barrier_gradient(self) -> np.ndarray:
+        """Gradient of h(x) w.r.t. barrier/output features (h = 10 - mprr => -1)."""
+        return -np.ones(self.output_dim, dtype=np.float32)
+
     def _compute_alpha(self, x: np.ndarray) -> float:
         """
         Compute alpha value for safety filter.
@@ -236,7 +266,8 @@ class SafetyFilter:
         Returns:
             Scalar alpha value
         """
-        return self.compute_h(x) * 0.5
+        h_val = self.compute_h(x)
+        return max(0.0, float(h_val) * 0.5)
     
     def _compute_rho(self, delta: float) -> float:
         """
@@ -296,8 +327,8 @@ class SafetyFilter:
         _, f_x, G_x = self._ort_session_run(x_for_model, kn_for_model)
         # Outputs are already (output_dim,) and (output_dim, action_dim) after _ort_session_run
         
-        # Compute Lie derivative terms
-        barrier_grad = np.ones(self.output_dim, dtype=np.float32)
+        # Compute Lie derivative terms (h = 10 - mprr => d(h)/d(mprr) = -1)
+        barrier_grad = self._barrier_gradient()
         lie_G = G_x.T @ barrier_grad  # (action_dim,)
         denom = float(np.dot(lie_G, lie_G))  # equivalent to np.linalg.norm(lie_G, ord=2)**2
 
@@ -318,12 +349,20 @@ class SafetyFilter:
         
         # Apply correction and return filtered action
         correction = max(correction_term, 0.0) * lie_G  # (action_dim,)
+        kn_norm = np.asarray(kn_for_model, dtype=np.float32).reshape(-1)
+        u_norm_unclipped = kn_norm + correction
+        if self.normalizer is not None:
+            # CBF correction is computed in normalized action space; clip before
+            # denormalizing so actions stay within the training normalization range.
+            u_norm = np.clip(u_norm_unclipped, -1.0, 1.0)
+            filtered_action = self._denormalize_action(u_norm)
+        else:
+            filtered_action = self._denormalize_action(u_norm_unclipped)
+        filtered_action, _ = self._clip_physical_action(filtered_action)
 
-        # print out intermediate values for debugging
         self.logger.debug(f"compute_filtered_action: lie_G={lie_G}, denom={denom}, lie_F={lie_F}, alpha={alpha}, rho={rho}")
         self.logger.debug(f"compute_filtered_action: correction_term={correction_term}, correction={correction}")
 
-        filtered_action = self._denormalize_action(kn_for_model + correction)
         return filtered_action.astype(kn_dtype)  # (action_dim,)
 
 

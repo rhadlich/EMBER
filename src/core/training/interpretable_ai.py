@@ -63,9 +63,9 @@ EXPLANATION_TARGET_LABEL_MAP: dict[str, str] = {
 
 # Which analyses to run.
 RUN_INTEGRATED_GRADIENTS = False
-RUN_IG_TRACE = False
+RUN_IG_TRACE = True
 RUN_ALE = False
-RUN_SHAP = True
+RUN_SHAP = False
 RUN_PERMUTATION_IMPORTANCE = False
 RUN_MULTI_OUTPUT_SHAP = True
 
@@ -80,6 +80,7 @@ RANDOM_SEED = 42
 USE_PREDICTOR_CACHE = True
 PREDICTOR_CACHE_MAX_ENTRIES = 64
 USE_IG_CACHE = False
+IG_EVAL_SIZE = 400
 IG_TRACE_STEPS = 50
 IG_TRACE_EVAL_SIZE = 2000
 IG_BATCH_CHUNK = 32
@@ -108,6 +109,7 @@ FEATURE_LABEL_MAP: dict[str, str] = {
     "CA50_prev": r"$CA50_{k-1}$",
     "CA10_90_prev": r"$CA10-90_{k-1}$",
     "P_int_IVC_prev": r"$P_{int, k-1}$",
+    "IMEP_prev": r"$IMEP_{k-1}$",
     "mprr_prev": r"$MPRR_{k-1}$",
     "ID1": r"$ID1_{k}$",
     "ID2": r"$ID2_{k}$",
@@ -117,7 +119,7 @@ FEATURE_LABEL_MAP: dict[str, str] = {
 
 # Optional CAD window for IG trace heatmap plotting.
 # Set to None to keep full range, or (cad_min_deg, cad_max_deg), e.g. (-20.0, 80.0).
-IG_TRACE_CAD_RANGE: Optional[tuple[float, float]] = (-20.0, 40.0)
+IG_TRACE_CAD_RANGE: Optional[tuple[float, float]] = (-140.0, 40.0)
 
 # Optional fallback config for old checkpoints that do not contain "model_config".
 FALLBACK_INPUT_DIM = None
@@ -342,6 +344,20 @@ def _load_split_arrays(
     x = ds.data.detach().cpu().numpy().astype(np.float32, copy=False)
     y = ds.labels.detach().cpu().numpy().astype(np.float32, copy=False)
     return x, y
+
+
+def _sample_eval_subset(
+    x_eval: np.ndarray,
+    eval_size: int,
+    *,
+    random_seed: int = RANDOM_SEED + 1,
+) -> tuple[np.ndarray, int]:
+    x_eval_arr = np.asarray(x_eval, dtype=np.float32)
+    n_eval = min(max(1, int(eval_size)), x_eval_arr.shape[0])
+    if n_eval == x_eval_arr.shape[0]:
+        return x_eval_arr, n_eval
+    eval_idx = np.random.default_rng(random_seed).choice(x_eval_arr.shape[0], n_eval, replace=False)
+    return x_eval_arr[eval_idx], n_eval
 
 
 def _normalize_explanation_targets(raw_targets: tuple[str, ...]) -> list[str]:
@@ -781,6 +797,8 @@ def run_integrated_gradients(
     device: torch.device,
     target_output_index: Optional[int] = None,
     baseline: Optional[np.ndarray] = None,
+    eval_size: int = IG_EVAL_SIZE,
+    random_seed: int = RANDOM_SEED + 1,
     analysis_label: str = "output",
     output_tag: str = "output",
 ) -> Dict[str, Any]:
@@ -802,9 +820,10 @@ def run_integrated_gradients(
     wrapper = _IGWrapper(model, target_output_index).to(device)
     wrapper.eval()
 
-    x_tensor = torch.from_numpy(np.asarray(x_eval, dtype=np.float32)).to(device)
+    x_subset, n_eval = _sample_eval_subset(x_eval, eval_size, random_seed=random_seed)
+    x_tensor = torch.from_numpy(x_subset).to(device)
     if baseline is None:
-        baseline = np.zeros((1, x_eval.shape[1]), dtype=np.float32)
+        baseline = np.zeros((1, x_subset.shape[1]), dtype=np.float32)
     baseline_tensor = torch.from_numpy(np.asarray(baseline, dtype=np.float32)).to(device)
 
     ig = IntegratedGradients(wrapper)
@@ -833,6 +852,7 @@ def run_integrated_gradients(
         "attributions": attr_np,
         "mean_abs_attribution": mean_abs_attr,
         "convergence_delta_mean_abs": float(np.mean(np.abs(convergence_delta.detach().cpu().numpy()))),
+        "num_eval": n_eval,
     }
 
 
@@ -845,6 +865,7 @@ def run_integrated_gradients_trace(
     baseline: Optional[np.ndarray] = None,
     steps: int = 24,
     eval_size: int = 64,
+    random_seed: int = RANDOM_SEED + 1,
     batch_chunk: int = 8,
     output_chunk: int = 256,
     return_full_attr: bool = False,
@@ -857,7 +878,7 @@ def run_integrated_gradients_trace(
     batch_chunk = max(1, int(batch_chunk))
     output_chunk = max(1, int(output_chunk))
 
-    x_subset = np.asarray(x_eval, dtype=np.float32)[: min(eval_size, x_eval.shape[0])]
+    x_subset, n_eval = _sample_eval_subset(x_eval, eval_size, random_seed=random_seed)
     x_tensor = torch.from_numpy(x_subset).to(device)
     if baseline is None:
         baseline_np = np.zeros((x_tensor.shape[1],), dtype=np.float32)
@@ -981,7 +1002,8 @@ def run_integrated_gradients_trace(
         "mean_abs_attribution_feature_crank": mean_abs_feature_crank,
         "crank_angles_deg": crank_angles.astype(np.float32, copy=False),
         "plotted_crank_angles_deg": crank_angles_plot.astype(np.float32, copy=False),
-        "num_eval": int(n_processed),
+        "num_eval": int(n_eval),
+        "num_processed": int(n_processed),
         "steps": steps,
         "mode": "jacfwd_vmap" if using_forward_mode else "autograd_jacobian_fallback",
     }
@@ -1467,6 +1489,7 @@ def main() -> Dict[str, Any]:
                         device=device,
                         target_output_index=TARGET_OUTPUT_INDEX,
                         baseline=np.mean(bundle.x_train, axis=0, keepdims=True).astype(np.float32),
+                        eval_size=IG_EVAL_SIZE,
                         analysis_label=target_display,
                         output_tag=output_tag,
                     )

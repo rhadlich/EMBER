@@ -42,59 +42,38 @@ class EngineContinuousAdapter(EnvAdapter):
             "Injection duration before IVC (ID1), k-1",
             "Start of injection after IVC (SOI2), k-1",
             "Injection duration after IVC (ID2), k-1",
-            # 'Pressure intake @ IVC, k-1',
-            # 'CA50, k-1',
-            # 'CA10 to CA90, k-1',
-            # 'Net heat release, k-1',
-            # 'Pressure max, k-1',
-            # 'MPRR, k-1',
-            # 'Moving average IMEP (20 cycles), k-1',
-            # 'Skewness of moving averate IMEP (20 cycles), k-1',
+            'Pressure intake @ IVC, k-1',
+            'CA50, k-1',
+            'CA10 to CA90, k-1',
+            'Net heat release, k-1',
+            'Pressure max, k-1',
+            'MPRR, k-1',
+            'Moving average IMEP (20 cycles), k-1',
+            'Skewness of moving averate IMEP (20 cycles), k-1',
         ]
 
     def get_actor_obs_bounds(self, *, env: gym.Env) -> tuple[np.ndarray, np.ndarray]:
-        return (
-            np.array(
-                [
-                    env.imep_env_limits[0],
-                    env.imep_env_limits[0],
-                    env.imep_env_limits[0],
-                    env.ID1_lims[0],
-                    env.ID1_lims[0],
-                    env.SOI2_lims[0],
-                    env.ID2_lims[0],
-                ],
-                dtype=np.float32,
-            ),
-            np.array(
-                [
-                    env.imep_env_limits[1],
-                    env.imep_env_limits[1],
-                    env.imep_env_limits[1],
-                    env.ID1_lims[1],
-                    env.ID1_lims[1],
-                    env.SOI2_lims[1],
-                    env.ID2_lims[1],
-                ],
-                dtype=np.float32,
-            ),
-        )
+        if not hasattr(env, "get_actor_obs_bounds"):
+            raise TypeError(
+                "EngineContinuousAdapter expects env to provide get_actor_obs_bounds()."
+            )
+        return env.get_actor_obs_bounds()
 
     def get_filter_state_features(self) -> list[str]:
         return [
             "IMEP actual, k-1",
             "Injection duration before IVC (ID1), k",
             "Injection duration before IVC (ID1), k-1",
-            "Start of injection after IVC (SOI2), k-1",
             "Injection duration after IVC (ID2), k-1",
-            # 'Pressure intake @ IVC, k-1',
-            # 'CA50, k-1',
-            # 'CA10 to CA90, k-1',
-            # 'Net heat release, k-1',
-            # 'Pressure max, k-1',
-            # 'Moving average IMEP (20 cycles), k-1',
-            # 'Skewness of moving averate IMEP (20 cycles), k-1',
-            'MPRR, k-1',    # keep it last for easier extraction in SafetyFilter
+            "Start of injection after IVC (SOI2), k-1",
+            'Pressure intake @ IVC, k-1',
+            'CA50, k-1',
+            'Net heat release, k-1',
+            'Pressure max, k-1',
+            'CA10 to CA90, k-1',
+            'MPRR, k-1',
+            'Moving average IMEP (20 cycles), k-1',
+            'Skewness of moving averate IMEP (20 cycles), k-1',
         ]
 
     def get_filter_output_features(self) -> list[str]:
@@ -187,6 +166,14 @@ class EngineContinuousAdapter(EnvAdapter):
                 history["previous ID1"],
                 history["previous SOI2"],
                 history["previous ID2"],
+                obs["achieved_Pint"],
+                obs["achieved_CA50"],
+                obs["achieved_CA10_CA90"],
+                obs["achieved_net_heat_release"],
+                obs["achieved_pressure_max"],
+                obs["achieved_mprr"],
+                obs["achieved_imep_moving_average"],
+                obs["achieved_skewness_moving_average"],
             ],
             dtype=np.float32,
         )
@@ -208,9 +195,16 @@ class EngineContinuousAdapter(EnvAdapter):
                 obs["achieved_imep"],
                 history["current ID1"],
                 history["previous ID1"],
-                history["previous SOI2"],
                 history["previous ID2"],
+                history["previous SOI2"],
+                obs["achieved_Pint"],
+                obs["achieved_CA50"],
+                obs["achieved_net_heat_release"],
+                obs["achieved_pressure_max"],
+                obs["achieved_CA10_CA90"],
                 obs["achieved_mprr"],
+                obs["achieved_imep_moving_average"],
+                obs["achieved_skewness_moving_average"],
             ],
             dtype=np.float32,
         )
@@ -244,7 +238,23 @@ class EngineContinuousAdapter(EnvAdapter):
                 f"got shape {action.shape}."
             )
         history = runtime_state.history
-        return np.array([history["current ID1"], action[0], action[1]], dtype=np.float32)
+        return np.array([
+            obs["achieved_imep"],
+            obs["achieved_CA50"],
+            obs["achieved_Pint"],
+            obs["achieved_net_heat_release"],
+            obs["achieved_pressure_max"],
+            obs["achieved_mprr"],
+            obs["achieved_CA10_CA90"],
+            obs["achieved_imep_moving_average"],
+            obs["achieved_skewness_moving_average"],
+            action[0],  # SOI2
+            history["current ID1"],
+            action[1],  # ID2
+            history["previous ID1"],
+            history["previous ID2"],
+            history["previous SOI2"],
+        ])
 
     def update_history(
         self,

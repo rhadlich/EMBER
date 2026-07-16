@@ -24,6 +24,24 @@ FALLBACK_PREDICTOR_CONFIG = {
     "dropout": 0.1,
 }
 
+ENGINE_OBS_FEATURE_LIMIT_ATTRS = [
+    "imep_env_limits",          # desired_imep
+    "imep_env_limits",          # previous desired_imep
+    "imep_env_limits",          # achieved_imep
+    "ID1_lims",                 # current ID1
+    "ID1_lims",                 # previous ID1
+    "SOI2_lims",                # previous SOI2
+    "ID2_lims",                 # previous ID2
+    "Pint_lims",                # achieved Pint
+    "CA50_lims",                # achieved CA50
+    "CA10_to_CA90_lims",        # achieved CA10-CA90
+    "Net_heat_release_lims",    # achieved net heat release
+    "Pressure_max_lims",        # achieved pressure max
+    "mprr_env_limits",          # achieved mprr
+    "imep_env_limits",          # achieved imep moving average
+    "skewness_lims",            # achieved skewness moving average
+]
+
 
 def _resolve_sample_hdf5_path(sample_data_dir: Union[str, Path, None]) -> str:
     if sample_data_dir is None:
@@ -107,13 +125,23 @@ class EngineEnvContinuous(gym.Env):
                  predictor_weights_path: Union[str, Path, None] = None,
                  sample_data_dir: Union[str, Path, None] = None,
                  ):
+        self.ID1_lims = [0.6, 0.9]
+        self.ID2_lims = [0.0, 1.0]
+        self.SOI2_lims = [-140, -30]
+        self.imep_sample_lims = [1.0, 4.8]
+        self.mprr_sample_lims = [1, 8]
+        self.imep_env_limits = [-1.5, 6.0]
+        self.mprr_env_limits = [0, 15]
+        self.Pint_lims = [0.9, 1.2]
+        self.CA50_lims = [0.0, 4000.0]
+        self.CA10_to_CA90_lims = [0.0, 150.0]
+        self.Net_heat_release_lims = [-100.0, 500.0]
+        self.Pressure_max_lims = [0.0, 100.0]
+        self.skewness_lims = [-1.0, 1.0]
 
         if action_space is not None:
             self.action_space = action_space
         else:
-            self.ID1_lims = [0.6, 0.9]
-            self.ID2_lims = [0.0, 1.0]
-            self.SOI2_lims = [-140, -10]
             self.action_space = spaces.Box(
                 low=np.array([self.ID1_lims[0], self.SOI2_lims[0], self.ID2_lims[0]], dtype=np.float32),
                 high=np.array([self.ID1_lims[1], self.SOI2_lims[1], self.ID2_lims[1]], dtype=np.float32),
@@ -122,59 +150,10 @@ class EngineEnvContinuous(gym.Env):
         if observation_space is not None:
             self.observation_space = observation_space
         else:
-            self.imep_sample_lims = [1.0, 4.8]
-            self.mprr_sample_lims = [1, 8]
-            self.imep_env_limits = [-1.5, 6.0]
-            self.mprr_env_limits = [0, 15]
-
-            # Other feature limits
-            self.Pint_lims = [0.9, 1.2]
-            self.CA50_lims = [0.0, 4000.0]
-            self.CA10_to_CA90_lims = [0.0, 150.0]
-            self.Net_heat_release_lims = [-100.0, 500.0]
-            self.Pressure_max_lims = [0.0, 100.0]
-            self.skewness_lims = [-1.0, 1.0]
-
-            # Define observation space
+            obs_low, obs_high = self._build_bounds(ENGINE_OBS_FEATURE_LIMIT_ATTRS)
             self.observation_space = spaces.Box(
-                low=np.array([
-                    self.imep_env_limits[0],
-                    self.imep_env_limits[0],
-                    self.imep_env_limits[0],
-                    self.ID1_lims[0],
-                    self.ID1_lims[0],
-                    self.SOI2_lims[0],
-                    self.ID2_lims[0],
-                    # self.Pint_lims[0],
-                    # self.CA50_lims[0],
-                    # self.CA10_to_CA90_lims[0],
-                    # self.Net_heat_release_lims[0],
-                    # self.Pressure_max_lims[0],
-                    # self.mprr_env_limits[0],
-                    # self.imep_env_limits[0],
-                    # self.skewness_lims[0],
-                ],
-                    dtype=np.float32
-                    ),
-                high=np.array([
-                    self.imep_env_limits[1],
-                    self.imep_env_limits[1],
-                    self.imep_env_limits[1],
-                    self.ID1_lims[1],
-                    self.ID1_lims[1],
-                    self.SOI2_lims[1],
-                    self.ID2_lims[1],
-                    # self.Pint_lims[1],
-                    # self.CA50_lims[1],
-                    # self.CA10_to_CA90_lims[1],
-                    # self.Net_heat_release_lims[1],
-                    # self.Pressure_max_lims[1],
-                    # self.mprr_env_limits[1],
-                    # self.imep_env_limits[1],
-                    # self.skewness_lims[1],
-                ],
-                    dtype=np.float32
-                    ),
+                low=obs_low,
+                high=obs_high,
                 dtype=np.float32
             )
         self.reward = reward
@@ -195,6 +174,14 @@ class EngineEnvContinuous(gym.Env):
         self.predictor = _build_predictor_from_checkpoint(predictor_weights, sample_data_dir)
 
         self.logger = logging.getLogger("MyRLApp.Environment")
+
+    def _build_bounds(self, limit_attr_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        low = np.array([getattr(self, attr_name)[0] for attr_name in limit_attr_names], dtype=np.float32)
+        high = np.array([getattr(self, attr_name)[1] for attr_name in limit_attr_names], dtype=np.float32)
+        return low, high
+
+    def get_actor_obs_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._build_bounds(ENGINE_OBS_FEATURE_LIMIT_ATTRS)
 
     def reset(
             self,
@@ -236,6 +223,12 @@ class EngineEnvContinuous(gym.Env):
                 filtered_action_vals,
                 noise_in_percent=predictor_noise,
             ))
+        
+        # extract injection duration
+        id1 = filtered_action_vals[-5]
+        id2 = filtered_action_vals[-4]
+        injection_durations = np.array([id1, id2])
+   
 
         self._current_imep = float(output["imep"])
         self._current_mprr = float(output["mprr"])
@@ -252,12 +245,13 @@ class EngineEnvContinuous(gym.Env):
             "current imep": self._current_imep,
             "mprr": self._current_mprr,
             "filtered action": filtered_action_vals,
-            "nominal action": nominal_action_vals
+            "nominal action": nominal_action_vals,
+            "injection_durations": injection_durations,
             }
 
         # calculate reward
-        reward_vec = self.reward(reward_inputs)
-        reward = (np.sum(reward_vec) + 0.0) * 0.1
+        reward_vec= self.reward(reward_inputs)
+        reward = (np.sum(reward_vec) + 0.0) * 0.5
 
         # clip observation values to make sure it is within the expected space  
         self._current_imep = float(np.clip(self._current_imep, self.imep_env_limits[0], self.imep_env_limits[1]))
@@ -293,8 +287,14 @@ class EngineEnvContinuous(gym.Env):
 
 
 def reward_fn(inputs):
-    load_tracking = np.abs(inputs["current imep"] - inputs["target"]) * -5.0
+    load_tracking_weight = 5.0
+    safety_weight = 0.0
+    efficiency_weight = 0.0
+    filter_interference_weight = 0.0
+    weight_sum = load_tracking_weight + safety_weight + efficiency_weight + filter_interference_weight
+    load_tracking = np.abs(inputs["current imep"] - inputs["target"]) * -load_tracking_weight / weight_sum
     # load_tracking += np.int16((np.abs(inputs["current imep"] - inputs["target"]) - 0.05*inputs["target"]) < 0.0) * 4.0
-    safety = (max(0, inputs["mprr"]-7)**2) * -0.0
-    filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -0.0
-    return np.array([load_tracking, safety, filter_interference])
+    safety = (max(0, inputs["mprr"]-7)**2) * -safety_weight / weight_sum
+    efficiency = np.sum(inputs["injection_durations"]) * -efficiency_weight / weight_sum
+    filter_interference = (np.linalg.norm(inputs["filtered action"] - inputs["nominal action"])**2) * -filter_interference_weight / weight_sum
+    return np.array([load_tracking, safety, efficiency, filter_interference])

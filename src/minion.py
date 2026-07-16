@@ -347,6 +347,16 @@ class Minion:
                     output_names=self.filter_output_names,
                     sample_data_dir=filter_sample_data_dir,
                 )
+                self.safety_filter.set_action_clip_bounds(
+                    np.array(
+                        [self.env.SOI2_lims[0], self.env.ID2_lims[0]],
+                        dtype=np.float32,
+                    ),
+                    np.array(
+                        [self.env.SOI2_lims[1], self.env.ID2_lims[1]],
+                        dtype=np.float32,
+                    ),
+                )
                 self.model_error = 0.0  # Initial model error, will be updated from shared memory (float, not torch tensor)
             except Exception as e:
                 self.logger.error(f"Minion: Could not initialize SafetyFilter: {e}")
@@ -1010,9 +1020,9 @@ class Minion:
                 # self.logger.debug(f"Minion: Got filtered action: action_filtered={action_filtered}")
             except Exception as e:
                 self.logger.debug(f"Minion: Safety filter failed: {e}, using original action")
-                action_filtered = action_from_actor_for_filter_nominal
+                action_filtered = copy.deepcopy(action_from_actor_for_filter_nominal)
         else:
-            action_filtered = action_from_actor_for_filter_nominal
+            action_filtered = copy.deepcopy(action_from_actor_for_filter_nominal)
 
         try:
             # Format action for environment

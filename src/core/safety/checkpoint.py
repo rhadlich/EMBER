@@ -12,6 +12,15 @@ FILTER_SPEC_BASENAME = "filter_spec.json"
 LEGACY_WEIGHTS_GLOB = "model_weights_filter*.pth"
 
 
+def _adapt_state_dict_for_predictor(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Normalize legacy key layouts to StatePredictor.load_state_dict format."""
+    if any(k.startswith("predictor.") for k in state_dict):
+        return {k.removeprefix("predictor."): v for k, v in state_dict.items()}
+    return state_dict
+
+
 def model_config_to_filter_spec(model_config: dict[str, Any]) -> dict[str, Any]:
     return {
         "filter_state_dim": int(model_config["state_dim"]),
@@ -182,5 +191,6 @@ def load_filter_checkpoint(
 
     if not isinstance(state_dict, dict):
         raise ValueError(f"Unsupported filter checkpoint format at {weights_path}")
+    state_dict = _adapt_state_dict_for_predictor(state_dict)
 
     return state_dict, filter_spec, weights_path

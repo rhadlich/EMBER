@@ -19,9 +19,9 @@ from core.safety.safety_filter import StatePredictor
 # Interactive configuration
 # =========================
 DEFAULT_TEST_DIR = Path(
-    '/Users/rodrigohadlich/Documents/Lab Documents/Methanol/Training Dataset/New Training/filter_processed_data/hdf5_data_filter/test'
+    '/Users/rodrigohadlich/Documents/Lab Documents/Thesis Material/Methanol DL Modeling/Dataset v3/Filter/Dataset/hdf5_filter_data/test'
 )
-DEFAULT_MODEL_DIR = Path("/Users/rodrigohadlich/EMBER/src/core/safety/run_logs")
+DEFAULT_MODEL_DIR = Path("/Users/rodrigohadlich/EMBER/src/core/safety/models")
 SEED_PROGRESSION_DIR = Path("/Users/rodrigohadlich/EMBER/src/core/safety/run_logs/seed_progression_safety_filter.parquet")
 
 # Set to a filename inside MODEL_DIR, e.g. "model_weights_filter_new.pth".
@@ -64,6 +64,8 @@ SEED_PROGRESSION_MAE_YLIM = (0.28, 0.45)
 # Main paths used by the run cell below
 MODEL_DIR = DEFAULT_MODEL_DIR
 TEST_DIR = DEFAULT_TEST_DIR
+
+ACTION_COLUMN_NAMES: tuple[str, str] = ("SOI2", "ID2")
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -181,12 +183,14 @@ def evaluate_test_metrics(
     model: StatePredictor,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[float, float, float, np.ndarray]:
+) -> tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
     mse_sum = 0.0
     mae_sum = 0.0
     total_elements = 0
     sample_mae: list[float] = []
+    predicted_mprr: list[float] = []
+    actual_mprr: list[float] = []
 
     with torch.no_grad():
         for (states, actions), targets in loader:
@@ -195,20 +199,39 @@ def evaluate_test_metrics(
             targets = targets.to(device=device, dtype=torch.float32)
 
             preds, _, _ = model(states, actions)
+            if preds.ndim != 2 or targets.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D preds/targets, got preds={tuple(preds.shape)} "
+                    f"targets={tuple(targets.shape)}."
+                )
+            if preds.shape[1] < 1 or targets.shape[1] < 1:
+                raise ValueError(
+                    f"Expected at least one output dimension for MPRR, got "
+                    f"preds={tuple(preds.shape)} targets={tuple(targets.shape)}."
+                )
             diff = preds - targets
             mse_sum += torch.sum(diff**2).item()
             mae_sum += torch.sum(torch.abs(diff)).item()
             total_elements += diff.numel()
             sample_mae.extend(torch.mean(torch.abs(diff), dim=1).detach().cpu().tolist())
+            predicted_mprr.extend(preds[:, 0].detach().cpu().tolist())
+            actual_mprr.extend(targets[:, 0].detach().cpu().tolist())
 
     mse = mse_sum / total_elements
     rmse = float(np.sqrt(mse))
     mae = mae_sum / total_elements
-    return mse, rmse, mae, np.asarray(sample_mae, dtype=np.float64)
+    return (
+        mse,
+        rmse,
+        mae,
+        np.asarray(sample_mae, dtype=np.float64),
+        np.asarray(predicted_mprr, dtype=np.float64),
+        np.asarray(actual_mprr, dtype=np.float64),
+    )
 
 
 def load_raw_inspection_arrays(data_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load raw actions (ID1, SOI2, ID2) and IMEP from HDF5 test files."""
+    """Load raw actions (SOI2, ID2) and IMEP from HDF5 test files."""
     action_blocks: list[np.ndarray] = []
     imep_blocks: list[np.ndarray] = []
 
@@ -220,10 +243,13 @@ def load_raw_inspection_arrays(data_dir: Path) -> tuple[np.ndarray, np.ndarray]:
             raise ValueError(f"Expected 2D arrays in {filename}, got states={states.shape}, actions={actions.shape}")
         if states.shape[0] != actions.shape[0]:
             raise ValueError(f"Row mismatch in {filename}: states={states.shape}, actions={actions.shape}")
-        if actions.shape[1] < 3:
-            raise ValueError(f"Expected at least 3 action columns in {filename}, got {actions.shape[1]}")
+        if actions.shape[1] < len(ACTION_COLUMN_NAMES):
+            raise ValueError(
+                f"Expected at least {len(ACTION_COLUMN_NAMES)} action columns in {filename}, "
+                f"got {actions.shape[1]}"
+            )
 
-        action_blocks.append(actions[:, :3].astype(np.float64, copy=False))
+        action_blocks.append(actions[:, : len(ACTION_COLUMN_NAMES)].astype(np.float64, copy=False))
         imep_blocks.append(states[:, 0].astype(np.float64, copy=False))
 
     return np.concatenate(action_blocks, axis=0), np.concatenate(imep_blocks, axis=0)
@@ -252,20 +278,34 @@ def build_inspection_dataframe(
     actions: np.ndarray,
     imep: np.ndarray,
     sample_mae: np.ndarray,
+    predicted_mprr: np.ndarray,
+    actual_mprr: np.ndarray,
 ) -> pd.DataFrame:
-    if actions.shape[0] != imep.shape[0] or actions.shape[0] != sample_mae.shape[0]:
-        raise ValueError("actions, imep, and sample_mae must have the same number of rows after alignment.")
-    if actions.shape[1] != 3:
-        raise ValueError(f"Expected 3 action columns (ID1, SOI2, ID2), got {actions.shape[1]}.")
+    if (
+        actions.shape[0] != imep.shape[0]
+        or actions.shape[0] != sample_mae.shape[0]
+        or actions.shape[0] != predicted_mprr.shape[0]
+        or actions.shape[0] != actual_mprr.shape[0]
+    ):
+        raise ValueError(
+            "actions, imep, sample_mae, predicted_mprr, and actual_mprr must have "
+            "the same number of rows after alignment."
+        )
+    if actions.shape[1] != len(ACTION_COLUMN_NAMES):
+        raise ValueError(
+            f"Expected {len(ACTION_COLUMN_NAMES)} action columns ({', '.join(ACTION_COLUMN_NAMES)}), "
+            f"got {actions.shape[1]}."
+        )
 
     return pd.DataFrame(
         {
             "sample_idx": np.arange(actions.shape[0]),
             "prediction_mae": sample_mae,
+            "predicted_mprr": predicted_mprr,
+            "actual_mprr": actual_mprr,
             "imep": imep,
-            "ID1": actions[:, 0],
-            "SOI2": actions[:, 1],
-            "ID2": actions[:, 2],
+            ACTION_COLUMN_NAMES[0]: actions[:, 0],
+            ACTION_COLUMN_NAMES[1]: actions[:, 1],
         }
     )
 
@@ -286,13 +326,20 @@ def build_worst_predictions_dataframe(
 
 
 def print_worst_mae_cases(worst_df: pd.DataFrame, num_cases_to_print: int) -> None:
-    required_cols = ["sample_idx", "prediction_mae", "imep", "ID1", "SOI2", "ID2"]
+    required_cols = [
+        "sample_idx",
+        "prediction_mae",
+        "predicted_mprr",
+        "actual_mprr",
+        "imep",
+        *ACTION_COLUMN_NAMES,
+    ]
     missing_cols = [c for c in required_cols if c not in worst_df.columns]
     if missing_cols:
         raise KeyError(f"Missing required columns in worst dataframe: {missing_cols}")
 
     top_n = max(1, min(num_cases_to_print, len(worst_df)))
-    print(f"Worst {top_n} cases (by per-example MAE) - actions and IMEP:")
+    print(f"Worst {top_n} cases (by per-example MAE) - predicted/actual MPRR, actions, and IMEP:")
     print(
         worst_df.loc[:, required_cols]
         .head(top_n)
@@ -359,16 +406,12 @@ def plot_joint_scatter(
 
 
 def plot_joint_scatter_error_map(full_df: pd.DataFrame) -> list:
-    required_cols = ["ID1", "ID2", "SOI2", "prediction_mae"]
+    required_cols = [*ACTION_COLUMN_NAMES, "prediction_mae"]
     missing_cols = [c for c in required_cols if c not in full_df.columns]
     if missing_cols:
         raise KeyError(f"Missing required columns for joint scatter plots: {missing_cols}")
 
-    plot_specs = [
-        ("ID1", "ID2"),
-        ("ID1", "SOI2"),
-        ("ID2", "SOI2"),
-    ]
+    plot_specs = [ACTION_COLUMN_NAMES]
     grids = []
     for x_col, y_col in plot_specs:
         g, _ = plot_joint_scatter(
@@ -773,23 +816,37 @@ def run_evaluation(
         num_workers=num_workers,
     )
 
-    mse, rmse, mae, sample_mae = evaluate_test_metrics(model=model, loader=test_loader, device=device)
+    mse, rmse, mae, sample_mae, predicted_mprr, actual_mprr = evaluate_test_metrics(
+        model=model,
+        loader=test_loader,
+        device=device,
+    )
     print(f"Test rows: {len(test_dataset)}")
     print(f"MSE : {mse:.6f}")
     print(f"RMSE: {rmse:.6f}")
     print(f"MAE : {mae:.6f}")
 
     raw_actions, raw_imep = load_raw_inspection_arrays(test_dir)
-    if raw_actions.shape[0] != sample_mae.shape[0] or raw_imep.shape[0] != sample_mae.shape[0]:
+    if (
+        raw_actions.shape[0] != sample_mae.shape[0]
+        or raw_imep.shape[0] != sample_mae.shape[0]
+        or predicted_mprr.shape[0] != sample_mae.shape[0]
+        or actual_mprr.shape[0] != sample_mae.shape[0]
+    ):
         raise ValueError(
             "Row count mismatch between HDF5 inspection arrays and model evaluation: "
-            f"actions={raw_actions.shape[0]}, imep={raw_imep.shape[0]}, sample_mae={sample_mae.shape[0]}"
+            f"actions={raw_actions.shape[0]}, imep={raw_imep.shape[0]}, sample_mae={sample_mae.shape[0]}, "
+            f"predicted_mprr={predicted_mprr.shape[0]}, actual_mprr={actual_mprr.shape[0]}"
         )
 
-    aligned_imep, aligned_actions, aligned_sample_mae = align_imep_with_predictions(
+    aligned_imep, aligned_actions, aligned_sample_mae, aligned_predicted_mprr, aligned_actual_mprr = (
+        align_imep_with_predictions(
         raw_imep,
         raw_actions,
         sample_mae,
+        predicted_mprr,
+        actual_mprr,
+    )
     )
     dropped_rows = len(sample_mae) - len(aligned_sample_mae)
     print(
@@ -800,6 +857,8 @@ def run_evaluation(
         actions=aligned_actions,
         imep=aligned_imep,
         sample_mae=aligned_sample_mae,
+        predicted_mprr=aligned_predicted_mprr,
+        actual_mprr=aligned_actual_mprr,
     )
     print_mae_quartiles(full_inspection_df)
     worst_predictions_df = build_worst_predictions_dataframe(
